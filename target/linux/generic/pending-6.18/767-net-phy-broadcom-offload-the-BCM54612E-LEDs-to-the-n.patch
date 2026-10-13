@@ -1,0 +1,156 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] net: phy: broadcom: offload the BCM54612E LEDs to the netdev trigger
+
+Let the netdev LED trigger drive the LEDs of the BCM54612E.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/net/phy/broadcom.c | 102 +++++++++++++++++++++++++++++++++++++-
+ include/linux/brcmphy.h    |   3 +
+ 2 files changed, 103 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/phy/broadcom.c
++++ b/drivers/net/phy/broadcom.c
+@@ -22,6 +22,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/gpio/consumer.h>
++#include <linux/leds.h>
+ 
+ #define BRCM_PHY_REV(phydev) \
+ 	((phydev)->drv->phy_id & ~((phydev)->drv->phy_id_mask))
+@@ -455,6 +456,98 @@ static int bcm54811_config_init(struct p
+ 	return bcm5481x_set_brrmode(phydev, priv->brr_mode);
+ }
+ 
++/* LED sources the netdev trigger can hand to the PHY */
++static int bcm54xx_led_src(unsigned long rules)
++{
++	switch (rules) {
++	case BIT(TRIGGER_NETDEV_LINK_1000):
++		return BCM_LED_SRC_LINKSPD1;
++	case BIT(TRIGGER_NETDEV_RX) | BIT(TRIGGER_NETDEV_TX):
++	case BIT(TRIGGER_NETDEV_LINK) | BIT(TRIGGER_NETDEV_RX) |
++	     BIT(TRIGGER_NETDEV_TX):
++		return BCM_LED_SRC_ACTIVITYLED;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int bcm54xx_led_hw_is_supported(struct phy_device *phydev, u8 index,
++				       unsigned long rules)
++{
++	if (index >= 4)
++		return -EINVAL;
++
++	return bcm54xx_led_src(rules) < 0 ? -EOPNOTSUPP : 0;
++}
++
++static int bcm54xx_led_hw_control_set(struct phy_device *phydev, u8 index,
++				      unsigned long rules)
++{
++	u16 reg = index >= 2 ? BCM54XX_SHD_LEDS2 : BCM54XX_SHD_LEDS1;
++	unsigned int shift = BCM54XX_SHD_LEDS_SHIFT(index % 2);
++	int src, val, ret;
++
++	if (index >= 4)
++		return -EINVAL;
++
++	src = bcm54xx_led_src(rules);
++	if (src < 0)
++		return src;
++
++	/* One setting for the PHY: it applies to every activity LED */
++	if (src == BCM_LED_SRC_ACTIVITYLED) {
++		val = bcm_phy_read_shadow(phydev, BCM54XX_SHD_LEDCTL);
++		if (val < 0)
++			return val;
++		if (rules & BIT(TRIGGER_NETDEV_LINK))
++			val |= BCM54XX_SHD_LEDCTL_ACTLINK;
++		else
++			val &= ~BCM54XX_SHD_LEDCTL_ACTLINK;
++		ret = bcm_phy_write_shadow(phydev, BCM54XX_SHD_LEDCTL, val);
++		if (ret)
++			return ret;
++	}
++
++	val = bcm_phy_read_shadow(phydev, reg);
++	if (val < 0)
++		return val;
++	val &= ~(BCM_LED_SRC_MASK << shift);
++	val |= src << shift;
++
++	return bcm_phy_write_shadow(phydev, reg, val);
++}
++
++static int bcm54xx_led_hw_control_get(struct phy_device *phydev, u8 index,
++				      unsigned long *rules)
++{
++	u16 reg = index >= 2 ? BCM54XX_SHD_LEDS2 : BCM54XX_SHD_LEDS1;
++	unsigned int shift = BCM54XX_SHD_LEDS_SHIFT(index % 2);
++	int val;
++
++	if (index >= 4)
++		return -EINVAL;
++
++	val = bcm_phy_read_shadow(phydev, reg);
++	if (val < 0)
++		return val;
++
++	switch ((val >> shift) & BCM_LED_SRC_MASK) {
++	case BCM_LED_SRC_LINKSPD1:
++		*rules = BIT(TRIGGER_NETDEV_LINK_1000);
++		return 0;
++	case BCM_LED_SRC_ACTIVITYLED:
++		val = bcm_phy_read_shadow(phydev, BCM54XX_SHD_LEDCTL);
++		if (val < 0)
++			return val;
++		*rules = BIT(TRIGGER_NETDEV_RX) | BIT(TRIGGER_NETDEV_TX);
++		if (val & BCM54XX_SHD_LEDCTL_ACTLINK)
++			*rules |= BIT(TRIGGER_NETDEV_LINK);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
+ static int bcm54xx_config_init(struct phy_device *phydev)
+ {
+ 	int reg, err, val;
+@@ -522,9 +615,11 @@ static int bcm54xx_config_init(struct ph
+ 	 * them for MULTICOLOR and encoding link/activity into them.
+ 	 * Don't do this for devices on an SFP module, since some of these
+ 	 * use the LED outputs to control the SFP LOS signal, and changing
+-	 * these settings will cause LOS to malfunction.
++	 * these settings will cause LOS to malfunction. Leave the LEDs alone
++	 * as well when the firmware describes them: their wiring may not
++	 * suit this encoding, and the LED class drives them.
+ 	 */
+-	if (!phy_on_sfp(phydev)) {
++	if (!phy_on_sfp(phydev) && list_empty(&phydev->leds)) {
+ 		val = BCM54XX_SHD_LEDS1_LED1(BCM_LED_SRC_MULTICOLOR1) |
+ 			BCM54XX_SHD_LEDS1_LED3(BCM_LED_SRC_MULTICOLOR1);
+ 		bcm_phy_write_shadow(phydev, BCM54XX_SHD_LEDS1, val);
+@@ -1521,6 +1616,9 @@ static struct phy_driver broadcom_driver
+ 	.handle_interrupt = bcm_phy_handle_interrupt,
+ 	.link_change_notify	= bcm54xx_link_change_notify,
+ 	.led_brightness_set	= bcm_phy_led_brightness_set,
++	.led_hw_is_supported	= bcm54xx_led_hw_is_supported,
++	.led_hw_control_set	= bcm54xx_led_hw_control_set,
++	.led_hw_control_get	= bcm54xx_led_hw_control_get,
+ 	.suspend	= bcm54xx_suspend,
+ 	.resume		= bcm54xx_resume,
+ }, {
+--- a/include/linux/brcmphy.h
++++ b/include/linux/brcmphy.h
+@@ -216,6 +216,9 @@
+ #define  BCM_NO_ANEG_APD_EN		0x0060 /* bits 5 & 6 */
+ #define  BCM_APD_SINGLELP_EN	0x0100 /* Bit 8 */
+ 
++#define BCM54XX_SHD_LEDCTL	0x09	/* 01001: LED Control */
++#define  BCM54XX_SHD_LEDCTL_ACTLINK	0x0010	/* Activity LED also shows link */
++
+ #define BCM54XX_SHD_LEDS1	0x0d	/* 01101: LED Selector 1 */
+ 					/* LED3 / ~LINKSPD[2] selector */
+ #define BCM54XX_SHD_LEDS_SHIFT(led)	(4 * (led))
