@@ -1,0 +1,60 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] nvmem: core: add the offset to binary mac-base cells of fixed layouts
+
+The fixed-cell binding allows a "mac-base" cell with one argument, an
+offset to add to the base MAC address, but only a few providers and
+layouts implement it (u-boot-env, onie-tlv, sl28vpd): on any other
+provider, such as an MTD partition, the offset is ignored and every
+consumer gets the base address. Add the offset in the core for binary
+cells (6 bytes) when the provider set no post-processing of its own.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/nvmem/core.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+--- a/drivers/nvmem/core.c
++++ b/drivers/nvmem/core.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/device.h>
++#include <linux/etherdevice.h>
+ #include <linux/export.h>
+ #include <linux/fs.h>
+ #include <linux/idr.h>
+@@ -786,6 +787,22 @@ static int nvmem_validate_keepouts(struc
+ 	return 0;
+ }
+ 
++/*
++ * Binary "mac-base" cell of a fixed layout (bindings/nvmem/layouts/fixed-cell.yaml):
++ * the base address plus the offset the consumer gives as cell argument.
++ */
++static int nvmem_mac_base_raw_read(void *context, const char *id, int index,
++				   unsigned int offset, void *buf, size_t bytes)
++{
++	if (bytes != ETH_ALEN)
++		return -EINVAL;
++
++	if (index)
++		eth_addr_add(buf, index);
++
++	return 0;
++}
++
+ int nvmem_add_cells_from_dt(struct nvmem_device *nvmem, struct device_node *np)
+ {
+ 	struct device *dev = &nvmem->dev;
+@@ -830,6 +847,11 @@ int nvmem_add_cells_from_dt(struct nvmem
+ 		if (of_device_is_compatible(np, "fixed-layout"))
+ 			nvmem_layout_parse_mac_base(&info);
+ 
++		/* Unless the provider handles it, as u-boot-env does */
++		if (!info.read_post_process && info.bytes == ETH_ALEN &&
++		    of_device_is_compatible(child, "mac-base"))
++			info.read_post_process = nvmem_mac_base_raw_read;
++
+ 		ret = nvmem_add_one_cell(nvmem, &info);
+ 		kfree(info.name);
+ 		if (ret) {
