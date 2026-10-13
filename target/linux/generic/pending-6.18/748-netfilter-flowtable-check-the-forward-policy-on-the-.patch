@@ -1,0 +1,162 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] netfilter: flowtable: check the forward policy on the fast path
+
+Check the xfrm forward policy on the flowtable fast path (CONFIG_XFRM).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ include/net/netns/xfrm.h         |  2 +
+ net/netfilter/nf_flow_table_ip.c | 59 +++++++++++++++++++++++++++++++++
+ net/xfrm/xfrm_policy.c           |  8 ++++
+ 3 files changed, 69 insertions(+)
+
+--- a/include/net/netns/xfrm.h
++++ b/include/net/netns/xfrm.h
+@@ -54,6 +54,8 @@ struct netns_xfrm {
+ 	unsigned int		idx_generator;
+ 	struct xfrm_policy_hash	policy_bydst[XFRM_POLICY_MAX];
+ 	unsigned int		policy_count[XFRM_POLICY_MAX * 2];
++	/* policies whose selector carries an ifindex */
++	unsigned int		policy_ifsel[XFRM_POLICY_MAX * 2];
+ 	struct work_struct	policy_hash_work;
+ 	struct xfrm_policy_hthresh policy_hthresh;
+ 	struct list_head	inexact_bins;
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -10,11 +10,13 @@
+ #include <linux/etherdevice.h>
+ #include <linux/if_arp.h>
+ #include <linux/if_ether.h>
++#include <linux/inetdevice.h>
+ #include <net/gso.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+ #include <net/ip6_route.h>
+ #include <net/neighbour.h>
++#include <net/xfrm.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
+ /* For layer 4 checksum field offset. */
+@@ -260,6 +262,53 @@ static bool nf_flow_exceeds_mtu(const st
+ 	return true;
+ }
+ 
++/* Same forward policy check as ip_forward() and ip6_forward(). The ingress
++ * hook runs before routing and NAT: without a route, a selector bound to an
++ * output device cannot match, and the flow keys are the ones seen on the wire.
++ * Leave these cases, and encapsulated packets, to the slow path once a forward
++ * policy may apply.
++ *
++ * Returns 1 to go on, 0 for the slow path, -1 to drop.
++ */
++static int nf_flow_policy_check(const struct nf_flowtable_ctx *ctx,
++				const struct flow_offload *flow,
++				struct sk_buff *skb, unsigned short family)
++{
++#ifdef CONFIG_XFRM
++	struct net *net = dev_net(skb->dev);
++
++	/* No forward policy, a default that accepts and no secpath: without a
++	 * socket and a secpath, xfrm_policy_check() accepts at once, see
++	 * __xfrm_check_nopolicy(). Do not touch the packet then.
++	 */
++	if (likely(!READ_ONCE(net->xfrm.policy_count[XFRM_POLICY_FWD]) &&
++		   READ_ONCE(net->xfrm.policy_default[XFRM_POLICY_FWD]) ==
++		   XFRM_USERPOLICY_ACCEPT && !secpath_exists(skb)))
++		return 1;
++
++	if (ctx->offset ||
++	    test_bit(NF_FLOW_SNAT, &flow->flags) ||
++	    test_bit(NF_FLOW_DNAT, &flow->flags) ||
++	    READ_ONCE(net->xfrm.policy_ifsel[XFRM_POLICY_FWD]))
++		return 0;
++
++	/* The control buffer still holds what the receive path left in it. */
++	if (family == AF_INET) {
++		struct in_device *in_dev = __in_dev_get_rcu(skb->dev);
++
++		memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
++		if (in_dev && IN_DEV_ORCONF(in_dev, NOPOLICY))
++			IPCB(skb)->flags |= IPSKB_NOPOLICY;
++	} else {
++		memset(IP6CB(skb), 0, sizeof(struct inet6_skb_parm));
++	}
++
++	if (!xfrm_policy_check(NULL, XFRM_POLICY_FWD, skb, family))
++		return -1;
++#endif
++	return 1;
++}
++
+ static inline bool nf_flow_dst_check(struct flow_offload_tuple *tuple)
+ {
+ 	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH &&
+@@ -387,6 +436,7 @@ static int nf_flow_offload_forward(struc
+ 	struct flow_offload *flow;
+ 	unsigned int thoff, mtu;
+ 	struct iphdr *iph;
++	int ret;
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+@@ -405,6 +455,10 @@ static int nf_flow_offload_forward(struc
+ 		return 0;
+ 	}
+ 
++	ret = nf_flow_policy_check(ctx, flow, skb, AF_INET);
++	if (ret <= 0)
++		return ret;
++
+ 	if (skb_try_make_writable(skb, thoff + ctx->hdrsize))
+ 		return -1;
+ 
+@@ -734,6 +788,7 @@ static int nf_flow_offload_ipv6_forward(
+ 	struct flow_offload *flow;
+ 	unsigned int thoff, mtu;
+ 	struct ipv6hdr *ip6h;
++	int ret;
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+@@ -752,6 +807,10 @@ static int nf_flow_offload_ipv6_forward(
+ 		return 0;
+ 	}
+ 
++	ret = nf_flow_policy_check(ctx, flow, skb, AF_INET6);
++	if (ret <= 0)
++		return ret;
++
+ 	if (skb_try_make_writable(skb, thoff + ctx->hdrsize))
+ 		return -1;
+ 
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -2322,6 +2322,9 @@ static void __xfrm_policy_link(struct xf
+ 
+ 	list_add(&pol->walk.all, &net->xfrm.policy_all);
+ 	WRITE_ONCE(net->xfrm.policy_count[dir], net->xfrm.policy_count[dir] + 1);
++	if (pol->selector.ifindex)
++		WRITE_ONCE(net->xfrm.policy_ifsel[dir],
++			   net->xfrm.policy_ifsel[dir] + 1);
+ 	xfrm_pol_hold(pol);
+ }
+ 
+@@ -2341,6 +2344,9 @@ static struct xfrm_policy *__xfrm_policy
+ 
+ 	list_del_init(&pol->walk.all);
+ 	WRITE_ONCE(net->xfrm.policy_count[dir], net->xfrm.policy_count[dir] - 1);
++	if (pol->selector.ifindex)
++		WRITE_ONCE(net->xfrm.policy_ifsel[dir],
++			   net->xfrm.policy_ifsel[dir] - 1);
+ 
+ 	return pol;
+ }
+@@ -4234,6 +4240,8 @@ static int __net_init xfrm_policy_init(s
+ 
+ 		net->xfrm.policy_count[dir] = 0;
+ 		net->xfrm.policy_count[XFRM_POLICY_MAX + dir] = 0;
++		net->xfrm.policy_ifsel[dir] = 0;
++		net->xfrm.policy_ifsel[XFRM_POLICY_MAX + dir] = 0;
+ 
+ 		htab = &net->xfrm.policy_bydst[dir];
+ 		htab->table = xfrm_hash_alloc(sz);
