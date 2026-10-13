@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+fortinet,fg60d|\
+fortinet,fg60e)
+	# No DHCP or RA server in these images: the internal ports are bridged
+	# to a static LAN only, dmz and wan2 are left unconfigured.
+	# As usual in OpenWrt, all seven internal ports are bridged: before
+	# cabling several of them to the same switch (link aggregation on the
+	# other side, for instance), take them out of br-lan, or a loop may
+	# form. Bonds of internal ports are best declared through netifd
+	# (proto-bonding), so that firewall4 puts them in its flow table.
+	ucidef_set_interfaces_lan_wan \
+		"internal1 internal2 internal3 internal4 internal5 internal6 internal7" \
+		"wan1"
+	ucidef_set_interface "dmz" device "dmz" protocol "none"
+	ucidef_set_interface "wan2" device "wan2" protocol "none"
+	;;
+fortinet,fg90d)
+	# The fourteen internal ports form one DSA tree over the two
+	# BCM53128 (internal1-7 on the switch of link 2 of the network
+	# processor, internal8-14 on the switch of link 3, joined by a
+	# cascade), so one br-lan spans both switches, in hardware. wan2 is
+	# left unconfigured. Link aggregation is left to the user: a bond of
+	# ports of one switch (offloaded to its trunk) may be bridged; a
+	# bond of ports of both switches may only be routed, never bridged:
+	# the cascade would close a loop.
+	ucidef_set_interfaces_lan_wan \
+		"internal1 internal2 internal3 internal4 internal5 internal6 internal7 internal8 internal9 internal10 internal11 internal12 internal13 internal14" \
+		"wan1"
+	ucidef_set_interface "wan2" device "wan2" protocol "none"
+	;;
+esac
+
+board_config_flush
+
+exit 0

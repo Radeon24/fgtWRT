@@ -1,0 +1,35 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Read only version of sysfixtime: the clock of these appliances is battery
+# backed and shared with the boot loader and the stock firmware. It is
+# read at boot, never written back.
+
+START=00
+
+RTC_DEV=/dev/rtc0
+HWCLOCK=/sbin/hwclock
+
+boot() {
+	hwclock_load
+	local maxtime="$(find_max_time)"
+	local curtime="$(date +%s)"
+	[ $curtime -lt $maxtime ] && date -s @$maxtime
+}
+
+start() {
+	hwclock_load
+}
+
+hwclock_load() {
+	[ -e "$RTC_DEV" ] && [ -e "$HWCLOCK" ] && $HWCLOCK -s -u -f $RTC_DEV
+}
+
+find_max_time() {
+	local file newest
+
+	for file in $( find /etc -type f ) ; do
+		[ -z "$newest" -o "$newest" -ot "$file" ] && newest=$file
+	done
+	[ "$newest" ] && date -r "$newest" +%s
+}
