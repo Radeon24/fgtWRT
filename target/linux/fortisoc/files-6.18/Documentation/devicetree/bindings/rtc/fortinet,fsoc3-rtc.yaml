@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/rtc/fortinet,fsoc3-rtc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 real-time clock
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  The battery-backed internal real-time clock of the Fortinet FortiSOC3.
+  Its registers are bytes 4 bytes apart; the time and the date are BCD
+  registers from offset 0x4c (seconds) to offset 0x64 (year, two digits),
+  with a status register at offset 0x08 whose bit 1 is set while the
+  counters are updated. No interrupt is known.
+
+allOf:
+  - $ref: rtc.yaml#
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-rtc
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    rtc@fc700000 {
+        compatible = "fortinet,fsoc3-rtc";
+        reg = <0xfc700000 0x100>;
+    };

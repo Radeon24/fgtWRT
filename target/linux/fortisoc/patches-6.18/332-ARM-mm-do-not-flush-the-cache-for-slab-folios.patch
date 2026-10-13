@@ -1,0 +1,31 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: mm: do not flush the cache for slab folios
+
+flush_dcache_folio() cleans and invalidates a whole slab folio on every
+flush_dcache_page() of kmalloc memory; slab memory has no mapping and
+is never mapped to user space, so skip it.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/mm/flush.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+--- a/arch/arm/mm/flush.c
++++ b/arch/arm/mm/flush.c
+@@ -350,6 +350,16 @@ void flush_dcache_folio(struct folio *fo
+ 		return;
+ 	}
+ 
++	/*
++	 * Slab memory is not page cache and is not mapped to user space by
++	 * the kernel: only its linear mapping can hold dirty lines, and DMA
++	 * coherency is handled by the DMA API. Skip the clean of the whole
++	 * folio (32 KiB for kmalloc-4k) that flush_dcache_page() callers
++	 * such as memcpy_to_sglist() would trigger on every skb head.
++	 */
++	if (folio_test_slab(folio))
++		return;
++
+ 	mapping = folio_flush_mapping(folio);
+ 
+ 	if (!cache_ops_need_broadcast() &&

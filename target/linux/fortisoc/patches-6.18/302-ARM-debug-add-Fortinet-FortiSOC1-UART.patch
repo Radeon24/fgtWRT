@@ -1,0 +1,55 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: debug: add Fortinet FortiSOC1 UART
+
+Add the low-level debug UART of the FortiSOC1.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/Kconfig.debug | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+--- a/arch/arm/Kconfig.debug
++++ b/arch/arm/Kconfig.debug
+@@ -354,6 +354,17 @@ choice
+ 		  Say Y here if you want the debug print routines to direct
+ 		  their output to the 8250 at PCI COM1.
+ 
++	config DEBUG_FSOC1_UART
++		bool "Kernel low-level debugging messages via Fortinet FortiSOC1 UART0"
++		depends on ARCH_FSOC1
++		select DEBUG_UART_8250
++		help
++		  Say Y here if you want kernel low-level debugging support
++		  on Fortinet FortiSOC1 based platforms, such as the
++		  FortiGate 60C. Output goes to UART0, the FTUART010 wired to
++		  the console port of the appliance. Its registers are 32 bits
++		  apart and need 32-bit accesses.
++
+ 	config DEBUG_GEMINI
+ 		bool "Kernel low-level debugging messages via Cortina Systems Gemini UART"
+ 		depends on ARCH_GEMINI
+@@ -1621,6 +1632,7 @@ config DEBUG_UART_PHYS
+ 	default 0xe0064200 if DEBUG_AT91_LAN966_FLEXCOM
+ 	default 0xe1824200 if DEBUG_AT91_SAMA7G5_FLEXCOM3
+ 	default 0xe4007000 if DEBUG_HIP04_UART
++	default 0xe4100000 if DEBUG_FSOC1_UART
+ 	default 0xe6c40000 if DEBUG_RMOBILE_SCIFA0
+ 	default 0xe6c50000 if DEBUG_RMOBILE_SCIFA1
+ 	default 0xe6c60000 if DEBUG_RCAR_GEN2_SCIFA2
+@@ -1740,6 +1752,7 @@ config DEBUG_UART_VIRT
+ 	default 0xfe100000 if DEBUG_IMX23_UART || DEBUG_IMX28_UART
+ 	default 0xfe300000 if DEBUG_BCM_KONA_UART
+ 	default 0xfe300640 if DEBUG_BCMBCA
++	default 0xfe410000 if DEBUG_FSOC1_UART
+ 	default 0xfeb00000 if DEBUG_HI3620_UART || DEBUG_HIX5HD2_UART
+ 	default 0xfeb24000 if DEBUG_RK3X_UART0
+ 	default 0xfeb26000 if DEBUG_RK3X_UART1
+@@ -1794,7 +1807,7 @@ config DEBUG_UART_8250_WORD
+ 		DEBUG_KEYSTONE_UART1 || DEBUG_ALPINE_UART0 || \
+ 		DEBUG_DAVINCI_DA8XX_UART1 || DEBUG_DAVINCI_DA8XX_UART2 || \
+ 		DEBUG_BCM_IPROC_UART3 || DEBUG_BCM_KONA_UART || \
+-		DEBUG_RK32_UART2
++		DEBUG_RK32_UART2 || DEBUG_FSOC1_UART
+ 
+ config DEBUG_UART_8250_PALMCHIP
+ 	bool "8250 UART is Palmchip BK-310x"

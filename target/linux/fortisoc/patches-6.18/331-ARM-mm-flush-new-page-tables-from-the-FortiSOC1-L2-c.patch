@@ -1,0 +1,76 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: mm: flush new page tables from the FortiSOC1 L2 cache
+
+Add OUTER_CACHE_PGTABLES: flush newly allocated page tables from the
+outer cache too: only the L1 data cache is cleaned otherwise.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/include/asm/pgalloc.h | 14 ++++++++++++++
+ arch/arm/mm/Kconfig            | 11 +++++++++++
+ arch/arm/mm/pgd.c              |  1 +
+ 3 files changed, 26 insertions(+)
+
+--- a/arch/arm/include/asm/pgalloc.h
++++ b/arch/arm/include/asm/pgalloc.h
+@@ -47,9 +47,23 @@ static inline void pud_populate(struct m
+ extern pgd_t *pgd_alloc(struct mm_struct *mm);
+ extern void pgd_free(struct mm_struct *mm, pgd_t *pgd);
+ 
++/*
++ * Push a new page table out of the outer cache too, for outer caches that
++ * ask for it (OUTER_CACHE_PGTABLES): only the L1 is cleaned otherwise.
++ */
++static inline void outer_flush_pgtable(void *table, size_t size)
++{
++	if (IS_ENABLED(CONFIG_OUTER_CACHE_PGTABLES)) {
++		phys_addr_t pa = __pa(table);
++
++		outer_flush_range(pa, pa + size);
++	}
++}
++
+ static inline void clean_pte_table(pte_t *pte)
+ {
+ 	clean_dcache_area(pte + PTE_HWTABLE_PTRS, PTE_HWTABLE_SIZE);
++	outer_flush_pgtable(pte + PTE_HWTABLE_PTRS, PTE_HWTABLE_SIZE);
+ }
+ 
+ /*
+--- a/arch/arm/mm/Kconfig
++++ b/arch/arm/mm/Kconfig
+@@ -958,6 +958,14 @@ config VDSO
+ config OUTER_CACHE
+ 	bool
+ 
++config OUTER_CACHE_PGTABLES
++	bool
++	depends on OUTER_CACHE
++	help
++	  The outer cache is flushed over every newly allocated page table,
++	  after the table is cleaned from the L1 data cache (L2 cache of the
++	  Fortinet FortiSOC1).
++
+ config OUTER_CACHE_SYNC
+ 	bool
+ 	select ARM_HEAVY_MB
+@@ -992,6 +1000,9 @@ config CACHE_FSOC1_L2
+ 	bool "Enable the Fortinet FortiSOC1 and FortiSOC2 L2 cache controllers"
+ 	depends on ARCH_FSOC1 || ARCH_FSOC2
+ 	select OUTER_CACHE
++	# New page tables are flushed from the L2 cache on the FortiSOC1 only;
++	# no L2 maintenance of page tables is done on the FortiSOC2.
++	select OUTER_CACHE_PGTABLES if ARCH_FSOC1
+ 	help
+ 	  This option enables the 256 KiB L2 cache controller of the
+ 	  Fortinet FortiSOC1, found in the FortiGate 60C, and of the
+--- a/arch/arm/mm/pgd.c
++++ b/arch/arm/mm/pgd.c
+@@ -47,6 +47,7 @@ pgd_t *pgd_alloc(struct mm_struct *mm)
+ 		       (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
+ 
+ 	clean_dcache_area(new_pgd, PTRS_PER_PGD * sizeof(pgd_t));
++	outer_flush_pgtable(new_pgd, PTRS_PER_PGD * sizeof(pgd_t));
+ 
+ #ifdef CONFIG_ARM_LPAE
+ 	/*

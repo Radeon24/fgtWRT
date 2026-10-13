@@ -1,0 +1,211 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] block: write windows for one USB disk, armed at run time
+
+Optional (BLK_WRITE_WINDOWS, default n): sd guards the one disk
+it finds behind usb-storage with the SCSI vendor and model given by a
+fortinet,usb-disk-write-windows device tree node (optionally its exact
+size). The disk is flagged
+(GD_WRITE_WINDOWS) before device_add_disk(), and submit_bio_noacct()
+refuses, after the partition remap, every bio that may change its
+medium, except plain REQ_OP_WRITE bios lying entirely inside one of the
+windows given by that node (absolute 512-byte sectors), while armed.
+A write starting at sector 0 may only change the bytes of sector 0
+listed by that node, compared with a copy read at arming time.
+
+The windows are disarmed at boot, armed once per boot for 600 s by
+writing "arm" to /sys/module/block/parameters/write_windows, and
+off until the next boot after "off", the end of the armed time, the
+removal of the disk, a second matching disk, a logical block size other
+than 512, an unexpected size or a bad configuration. Without the node,
+no disk is guarded. Discard, secure
+erase, write zeroes and zone operations are always refused on the
+guarded disk, and so are SCSI pass-through (sd_ioctl: SG_IO,
+SCSI_IOCTL_SEND_COMMAND...) and PERSISTENT RESERVE OUT (IOC_PR_*).
+Other disks are not affected. Defaults: no window, no byte of sector 0
+may change: every write to the guarded disk is refused.
+
+For an installer writing the second firmware slot of an internal USB
+boot disk (enabled in OpenWrt images; off in our own kernels). The code
+lives in block/blk-write-windows.c (our files); this patch hooks it up.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ block/blk-core.c       |  5 ++++
+ block/Kconfig          | 21 ++++++++++++++++
+ block/Makefile         |  1 +
+ drivers/scsi/sd.c      | 55 +++++++++++++++++++++++++++++++++++++++++++
+ include/linux/blkdev.h |  1 +
+ 5 files changed, 83 insertions(+)
+
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -44,6 +44,7 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/block.h>
+ 
++#include <linux/blk-write-windows.h>
+ #include "blk.h"
+ #include "blk-mq-sched.h"
+ #include "blk-pm.h"
+@@ -802,6 +803,10 @@ void submit_bio_noacct(struct bio *bio)
+ 		    unlikely(blk_partition_remap(bio)))
+ 			goto end_io;
+ 	}
++	/* Write windows of one guarded USB disk (absolute sectors) */
++	if (unlikely(blk_wrwin_guarded(bdev->bd_disk)) &&
++	    blk_wrwin_refuse(bio))
++		goto end_io;
+ 
+ 	/*
+ 	 * Filter flush bio's early so that bio based drivers without flush
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@ -227,6 +227,27 @@ config BLOCK_HOLDER_DEPRECATED
+ config BLK_MQ_STACKING
+ 	bool
+ 
++config BLK_WRITE_WINDOWS
++	bool "Write windows for one USB disk (dual-slot boot disk installer)"
++	depends on BLK_DEV_SD=y && USB_STORAGE
++	default n
++	help
++	  Guard the one disk matched by sd (usb-storage transport, SCSI
++	  vendor and model given by the device tree node
++	  "fortinet,usb-disk-write-windows", optionally its exact size):
++	  every bio that may change its medium is refused, except plain
++	  writes lying entirely inside one of the windows of that node
++	  while they are armed. A write starting at sector 0 may only
++	  change the bytes of sector 0 listed in the node. The windows are
++	  disarmed at boot and armed once per boot, for 10 minutes at most,
++	  by writing "arm" to /sys/module/block/parameters/write_windows
++	  ("off" ends them). SCSI pass-through to the guarded disk is
++	  refused. Other disks are not affected. Without the node, no disk
++	  is guarded.
++
++	  For an installer writing the second firmware slot of the internal
++	  USB boot disk of an appliance. Say N.
++
+ source "block/Kconfig.iosched"
+ 
+ endif # BLOCK
+--- a/block/Makefile
++++ b/block/Makefile
+@@ -29,6 +29,7 @@ obj-$(CONFIG_BLK_DEV_INTEGRITY) += bio-i
+ 				   bio-integrity-auto.o
+ obj-$(CONFIG_BLK_DEV_ZONED)	+= blk-zoned.o
+ obj-$(CONFIG_BLK_WBT)		+= blk-wbt.o
++obj-$(CONFIG_BLK_WRITE_WINDOWS) += blk-write-windows.o
+ obj-$(CONFIG_BLK_DEBUG_FS)	+= blk-mq-debugfs.o
+ obj-$(CONFIG_BLK_SED_OPAL)	+= sed-opal.o
+ obj-$(CONFIG_BLK_PM)		+= blk-pm.o
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -68,6 +68,8 @@
+ #include <scsi/scsi_eh.h>
+ #include <scsi/scsi_host.h>
+ #include <scsi/scsi_ioctl.h>
++#include <scsi/sg.h>
++#include <linux/blk-write-windows.h>
+ #include <scsi/scsicam.h>
+ #include <scsi/scsi_common.h>
+ 
+@@ -1624,6 +1626,44 @@ static int sd_getgeo(struct gendisk *dis
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_BLK_WRITE_WINDOWS
++/* Lengths of the INQUIRY fields, from scsi_common.h of later kernels */
++#ifndef INQUIRY_VENDOR_LEN
++#define INQUIRY_VENDOR_LEN	8
++#define INQUIRY_MODEL_LEN	16
++#endif
++
++/* The disk guarded by the write windows (block/blk-write-windows.c) */
++static bool sd_wrwin_match(struct scsi_device *sdp)
++{
++	const char *t = sdp->host->hostt->proc_name;
++
++	return t && !strcmp(t, "usb-storage") &&
++	       blk_wrwin_match(sdp->vendor, INQUIRY_VENDOR_LEN,
++			       sdp->model, INQUIRY_MODEL_LEN);
++}
++
++/* Guarded disk: only the ioctls that send no command to the medium */
++static bool sd_wrwin_ioctl_ok(unsigned int cmd)
++{
++	switch (cmd) {
++	case SG_GET_VERSION_NUM:
++	case SG_GET_TIMEOUT:
++	case SG_GET_RESERVED_SIZE:
++	case SG_EMULATED_HOST:
++	case SCSI_IOCTL_GET_IDLUN:
++	case SCSI_IOCTL_GET_BUS_NUMBER:
++	case SCSI_IOCTL_PROBE_HOST:
++		return true;
++	default:
++		return false;
++	}
++}
++#else
++static inline bool sd_wrwin_match(struct scsi_device *sdp) { return false; }
++static inline bool sd_wrwin_ioctl_ok(unsigned int cmd) { return true; }
++#endif
++
+ /**
+  *	sd_ioctl - process an ioctl
+  *	@bdev: target block device
+@@ -1664,6 +1704,10 @@ static int sd_ioctl(struct block_device
+ 	if (error)
+ 		return error;
+ 
++	/* Write windows: no SCSI pass-through to the guarded disk */
++	if (blk_wrwin_guarded(disk) && !sd_wrwin_ioctl_ok(cmd))
++		return -EPERM;
++
+ 	if (is_sed_ioctl(cmd))
+ 		return sed_ioctl(sdkp->opal_dev, cmd, p);
+ 	return scsi_ioctl(sdp, mode & BLK_OPEN_WRITE, cmd, p);
+@@ -2058,6 +2102,10 @@ static int sd_pr_out_command(struct bloc
+ 	u8 cmd[16] = { 0, };
+ 	u8 data[24] = { 0, };
+ 
++	/* Write windows: no PERSISTENT RESERVE OUT to the guarded disk */
++	if (blk_wrwin_guarded(bdev->bd_disk))
++		return -EPERM;
++
+ 	cmd[0] = PERSISTENT_RESERVE_OUT;
+ 	cmd[1] = sa;
+ 	cmd[2] = type;
+@@ -4017,8 +4065,13 @@ static int sd_probe(struct device *dev)
+ 			sdp->host->rpm_autosuspend_delay);
+ 	}
+ 
++	/* Write windows: guard the matching disk before any I/O */
++	if (sd_wrwin_match(sdp))
++		blk_wrwin_register(gd);
++
+ 	error = device_add_disk(dev, gd, NULL);
+ 	if (error) {
++		blk_wrwin_unregister(gd);
+ 		device_unregister(&sdkp->disk_dev);
+ 		put_disk(gd);
+ 		goto out;
+@@ -4064,6 +4117,8 @@ static int sd_remove(struct device *dev)
+ 
+ 	scsi_autopm_get_device(sdkp->device);
+ 
++	/* Write windows: off for good once the guarded disk goes away */
++	blk_wrwin_unregister(sdkp->disk);
+ 	device_del(&sdkp->disk_dev);
+ 	del_gendisk(sdkp->disk);
+ 	if (!sdkp->suspended)
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -174,6 +174,7 @@ struct gendisk {
+ #define GD_ADDED			4
+ #define GD_SUPPRESS_PART_SCAN		5
+ #define GD_OWNS_QUEUE			6
++#define GD_WRITE_WINDOWS		7	/* CONFIG_BLK_WRITE_WINDOWS */
+ 
+ 	struct mutex open_mutex;	/* open/close mutex */
+ 	unsigned open_partitions;	/* number of open partitions */

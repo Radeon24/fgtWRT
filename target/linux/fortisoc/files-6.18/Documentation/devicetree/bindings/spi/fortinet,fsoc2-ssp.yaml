@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/spi/fortinet,fsoc2-ssp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC2 boot flash controller
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description: |
+  The Fortinet FortiSOC2 reaches the SPI NOR flash that holds its boot
+  loader and factory data through the first of its Faraday FTSSP010
+  synchronous serial ports, set up by the boot loader. The chip select of
+  the flash is not one of the port: it is a line of a GPIO block, driven
+  through the data set and data clear registers of that block.
+
+  This description is for read accesses to that flash only: the node
+  covers the registers of the port up to its data register, and the data
+  set and data clear registers of the GPIO block, 8 bytes, nothing else of
+  that block.
+
+  "fortinet,fsoc2-ssp-bus" is another FTSSP010 port carrying regular
+  SPI messages (the switches of the FortiGate 90D). Its chip select is
+  another line of the same GPIO block: the driver refuses a port whose
+  registers or chip select line are those of a flash port. Its optional
+  third register is the pad control register of the system control unit
+  (0xe5100328), whose bit 31 the driver sets before driving the line.
+
+allOf:
+  - $ref: spi-controller.yaml#
+
+properties:
+  compatible:
+    enum:
+      - fortinet,fsoc2-ssp
+      - fortinet,fsoc2-ssp-bus
+
+  reg:
+    minItems: 2
+    items:
+      - description: FTSSP010 registers, up to the data register
+      - description: Data set and data clear registers of the GPIO block
+          that drives the chip select
+      - description: Pad control register of the system control unit
+          (fortinet,fsoc2-ssp-bus only)
+
+  reg-names:
+    minItems: 2
+    items:
+      - const: ssp
+      - const: cs
+      - const: pad
+
+  fortinet,cs-line:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 31
+    description: Line of the GPIO block wired to the chip select (active low).
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - fortinet,cs-line
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    spi@e4500000 {
+        compatible = "fortinet,fsoc2-ssp";
+        reg = <0xe4500000 0x1c>, <0xe4c00010 0x8>;
+        reg-names = "ssp", "cs";
+        fortinet,cs-line = <15>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        flash@0 {
+            compatible = "jedec,spi-nor";
+            reg = <0>;
+        };
+    };

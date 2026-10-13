@@ -1,0 +1,38 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] gpio: hook up the Fortinet FortiSOC3 GPIO driver
+
+Build gpio-fsoc3 (GPIO_FSOC3).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/gpio/Kconfig  | 8 ++++++++
+ drivers/gpio/Makefile | 1 +
+ 2 files changed, 9 insertions(+)
+
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -327,6 +327,14 @@ config GPIO_GE_FPGA
+ 	  and write pin state) for GPIO implemented in a number of GE single
+ 	  board computers.
+ 
++config GPIO_FSOC3
++	bool "Fortinet FortiSOC3 GPIO (read-only)"
++	depends on OF && (ARCH_FSOC3 || COMPILE_TEST)
++	help
++	  Read-only driver for the 32 GPIO lines of the Fortinet FortiSOC3
++	  network processor block (FortiGate 60E/100E): directions and levels
++	  are read, nothing is ever written.
++
+ config GPIO_FTGPIO010
+ 	bool "Faraday FTGPIO010 GPIO"
+ 	depends on OF_GPIO
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -69,6 +69,7 @@ obj-$(CONFIG_GPIO_EN7523)		+= gpio-en752
+ obj-$(CONFIG_GPIO_EP93XX)		+= gpio-ep93xx.o
+ obj-$(CONFIG_GPIO_EXAR)			+= gpio-exar.o
+ obj-$(CONFIG_GPIO_F7188X)		+= gpio-f7188x.o
++obj-$(CONFIG_GPIO_FSOC3)		+= gpio-fsoc3.o
+ obj-$(CONFIG_GPIO_FTGPIO010)		+= gpio-ftgpio010.o
+ obj-$(CONFIG_GPIO_FXL6408)		+= gpio-fxl6408.o
+ obj-$(CONFIG_GPIO_GE_FPGA)		+= gpio-ge.o

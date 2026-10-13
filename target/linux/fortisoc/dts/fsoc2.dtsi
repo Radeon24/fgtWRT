@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Fortinet FortiSOC2
+ *
+ * A Faraday FA726TE core with stock Faraday peripherals and the Fortinet
+ * network processor (NP4Lite).
+ */
+
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "fortinet,fsoc2";
+	interrupt-parent = <&intc>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "faraday,fa726te";
+			reg = <0>;
+			next-level-cache = <&l2>;
+		};
+	};
+
+	/*
+	 * No clock controller is known: the rates are fixed. The rate of
+	 * PCLK is not known: the counters of the timer run from its
+	 * external clock.
+	 */
+	pclk: clock-pclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <62500000>;
+	};
+
+	extclk: clock-timer {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <15625000>;
+	};
+
+	uartclk: clock-uart {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <62500000>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Network processor: 4 RGMII ports; its second register
+		 * block routes its interrupt sources to line 20.
+		 */
+		np: ethernet@e3f00000 {
+			compatible = "fortinet,fsoc2-np";
+			reg = <0xe3f00000 0x1000>, <0xe3f01e00 0x100>;
+			reg-names = "np", "irq-map";
+			interrupts = <20 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+
+			np_mdio: mdio {
+				#address-cells = <1>;
+				#size-cells = <0>;
+			};
+
+			ethernet-ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				np_port0: ethernet-port@0 {
+					reg = <0>;
+					status = "disabled";
+				};
+
+				np_port1: ethernet-port@1 {
+					reg = <1>;
+					status = "disabled";
+				};
+
+				np_port2: ethernet-port@2 {
+					reg = <2>;
+					status = "disabled";
+				};
+
+				np_port3: ethernet-port@3 {
+					reg = <3>;
+					status = "disabled";
+				};
+			};
+		};
+
+		/*
+		 * Crypto engine, inside the window of the network processor
+		 * (four rings of 0x40 bytes; PKCE2 at 0xe3f01800 and the RNG
+		 * at 0xe3f01b80 are left out). Its interrupt, source 8 of the
+		 * NP interrupt map, reaches line 8 once the NP driver has
+		 * routed it.
+		 */
+		crypto@e3f01900 {
+			compatible = "fortinet,fsoc2-crypto";
+			reg = <0xe3f01900 0x100>;
+			interrupts = <8 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		uart0: serial@e4100000 {
+			compatible = "ns16550a";
+			reg = <0xe4100000 0x20>;
+			interrupts = <32 IRQ_TYPE_LEVEL_HIGH>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			clocks = <&uartclk>;
+			status = "disabled";
+		};
+
+		uart1: serial@e4200000 {
+			compatible = "ns16550a";
+			reg = <0xe4200000 0x20>;
+			interrupts = <33 IRQ_TYPE_LEVEL_HIGH>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			clocks = <&uartclk>;
+			status = "disabled";
+		};
+
+		uart2: serial@e4300000 {
+			compatible = "ns16550a";
+			reg = <0xe4300000 0x20>;
+			interrupts = <34 IRQ_TYPE_LEVEL_HIGH>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			clocks = <&uartclk>;
+			status = "disabled";
+		};
+
+		/*
+		 * First FTSSP010 port, to the SPI NOR flash of the boot loader.
+		 * Its chip select is line 15 of the GPIO block at 0xe4c00000 (a
+		 * second FTGPIO010, not gpio1 below, whose reserved lines do not
+		 * concern it), of which only the data set and data clear
+		 * registers are mapped.
+		 * Read accesses only, with the port as the boot loader sets it
+		 * up; no interrupt is used.
+		 */
+		ssp0: spi@e4500000 {
+			compatible = "fortinet,fsoc2-ssp";
+			reg = <0xe4500000 0x1c>, <0xe4c00010 0x8>;
+			reg-names = "ssp", "cs";
+			fortinet,cs-line = <15>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/* Timer of core 0 */
+		timer@e4700000 {
+			compatible = "faraday,fttmr010";
+			reg = <0xe4700000 0x1000>;
+			interrupts = <0 IRQ_TYPE_EDGE_RISING>;
+			clocks = <&pclk>, <&extclk>;
+			clock-names = "PCLK", "EXTCLK";
+		};
+
+		watchdog@e4900000 {
+			compatible = "faraday,ftwdt010";
+			reg = <0xe4900000 0x100>;
+			clocks = <&pclk>;
+			clock-names = "PCLK";
+		};
+
+		/*
+		 * Register layout of its own (not the FortiSOC1 one). Keep it
+		 * off until its use with the DMA masters and the table walker
+		 * is validated: a board variant enables it.
+		 */
+		l2: cache-controller@e4b00000 {
+			compatible = "fortinet,fsoc2-l2cc";
+			reg = <0xe4b00000 0x1000>;
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <262144>;
+			cache-sets = <1024>;
+			cache-line-size = <32>;
+			status = "disabled";
+		};
+
+		/*
+		 * Battery-backed clock: registers 0x200 to 0x210 of the system
+		 * control unit only. The register at 0x20c holds the console baud
+		 * rate of the boot loader.
+		 */
+		rtc@e5100200 {
+			compatible = "fortinet,fsoc2-rtc";
+			reg = <0xe5100200 0x14>;
+		};
+
+		/*
+		 * Board GPIO block. Its interrupt line is not known.
+		 */
+		gpio1: gpio@e5300000 {
+			compatible = "faraday,ftgpio010";
+			reg = <0xe5300000 0x1000>;
+			clocks = <&pclk>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			status = "disabled";
+		};
+
+		/*
+		 * Two host-only Faraday FUSBH200 USB 2.0 controllers: EHCI
+		 * with the port register at 0x30 and a bus monitor at 0x40
+		 * (FOTG210 family). Level interrupts, active low. No clock
+		 * or reset control is known: the boot loader, which boots
+		 * from USB, leaves them clocked and halted.
+		 */
+		usb0: usb@f0100000 {
+			compatible = "faraday,fusbh200";
+			reg = <0xf0100000 0x1000>;
+			interrupts = <27 IRQ_TYPE_LEVEL_LOW>;
+			clocks = <&pclk>;
+			clock-names = "PCLK";
+			dr_mode = "host";
+			status = "disabled";
+		};
+
+		usb1: usb@f0200000 {
+			compatible = "faraday,fusbh200";
+			reg = <0xf0200000 0x1000>;
+			interrupts = <28 IRQ_TYPE_LEVEL_LOW>;
+			clocks = <&pclk>;
+			clock-names = "PCLK";
+			dr_mode = "host";
+			status = "disabled";
+		};
+
+		/*
+		 * Faraday FOTG2xx dual-role controller, wired for the device
+		 * side.
+		 * Level interrupt, active high.
+		 */
+		udc: usb@f0300000 {
+			compatible = "faraday,fotg210";
+			reg = <0xf0300000 0x1000>;
+			interrupts = <29 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&pclk>;
+			clock-names = "PCLK";
+			dr_mode = "peripheral";
+			status = "disabled";
+		};
+
+		/* Interrupt controller of core 0 */
+		intc: interrupt-controller@f0400000 {
+			compatible = "fortinet,fsoc2-intc", "faraday,ftintc010";
+			reg = <0xf0400000 0x1000>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
+	};
+};

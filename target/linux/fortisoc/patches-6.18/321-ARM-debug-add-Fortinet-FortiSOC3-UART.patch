@@ -1,0 +1,72 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: debug: add Fortinet FortiSOC3 UART
+
+Add the low-level debug UART of the FortiSOC3
+(arch/arm/include/debug/fsoc3.S).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/Kconfig.debug | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+--- a/arch/arm/Kconfig.debug
++++ b/arch/arm/Kconfig.debug
+@@ -366,6 +366,16 @@ choice
+ 		  same address on both SoCs. Its registers are 32 bits apart
+ 		  and need 32-bit accesses.
+ 
++	config DEBUG_FSOC3_UART
++		bool "Kernel low-level debugging messages via FortiSOC3 UART"
++		depends on ARCH_FSOC3
++		help
++		  Say Y here if you want kernel low-level debugging support
++		  on Fortinet FortiSOC3 based platforms, such as the FortiGate
++		  60E. Output goes to the console UART at 0xfb000000, an Emma
++		  Mobile compatible 8250 whose registers are 32 bits apart and
++		  whose line status register sits at 0x18 instead of 0x14.
++
+ 	config DEBUG_GEMINI
+ 		bool "Kernel low-level debugging messages via Cortina Systems Gemini UART"
+ 		depends on ARCH_GEMINI
+@@ -1498,6 +1508,7 @@ config DEBUG_LL_INCLUDE
+ 	default "debug/asm9260.S" if DEBUG_ASM9260_UART
+ 	default "debug/clps711x.S" if DEBUG_CLPS711X_UART1 || DEBUG_CLPS711X_UART2
+ 	default "debug/dc21285.S" if DEBUG_DC21285_PORT
++	default "debug/fsoc3.S" if DEBUG_FSOC3_UART
+ 	default "debug/meson.S" if DEBUG_MESON_UARTAO
+ 	default "debug/pl01x.S" if DEBUG_LL_UART_PL01X || DEBUG_UART_PL01X
+ 	default "debug/exynos.S" if DEBUG_EXYNOS_UART
+@@ -1651,6 +1662,7 @@ config DEBUG_UART_PHYS
+ 	default 0xf8020000 if DEBUG_AT91_SAMA5D2_UART1
+ 	default 0xf8b00000 if DEBUG_HIX5HD2_UART
+ 	default 0xf991e000 if DEBUG_QCOM_UARTDM
++	default 0xfb000000 if DEBUG_FSOC3_UART
+ 	default 0xfc00c000 if DEBUG_AT91_SAMA5D4_USART3
+ 	default 0xfcb00000 if DEBUG_HI3620_UART
+ 	default 0xfd883000 if DEBUG_ALPINE_UART0
+@@ -1683,7 +1695,7 @@ config DEBUG_UART_PHYS
+ 		DEBUG_RMOBILE_SCIFA4 || \
+ 		DEBUG_S3C64XX_UART || \
+ 		DEBUG_BCM63XX_UART || DEBUG_BCMBCA || DEBUG_ASM9260_UART || \
+-		DEBUG_DIGICOLOR_UA0 || \
++		DEBUG_DIGICOLOR_UA0 || DEBUG_FSOC3_UART || \
+ 		DEBUG_AT91_UART || DEBUG_STM32_UART || \
+ 		DEBUG_STIH41X_ASC2 || DEBUG_STIH41X_SBC_ASC1 || \
+ 		DEBUG_STIH418_SBC_ASC0
+@@ -1773,6 +1785,7 @@ config DEBUG_UART_VIRT
+ 	default 0xfedc0000 if DEBUG_EP93XX
+ 	default 0xfee003f8 if DEBUG_FOOTBRIDGE_COM1
+ 	default 0xfee20000 if DEBUG_NSPIRE_CLASSIC_UART || DEBUG_NSPIRE_CX_UART
++	default 0xfeb00000 if DEBUG_FSOC3_UART
+ 	default 0xfec00000 if ARCH_IXP4XX && !CPU_BIG_ENDIAN
+ 	default 0xfec00003 if ARCH_IXP4XX && CPU_BIG_ENDIAN
+ 	default 0xfef36000 if DEBUG_HIGHBANK_UART
+@@ -1786,7 +1799,7 @@ config DEBUG_UART_VIRT
+ 		DEBUG_QCOM_UARTDM || \
+ 		DEBUG_S3C64XX_UART || \
+ 		DEBUG_BCM63XX_UART || DEBUG_BCMBCA || DEBUG_ASM9260_UART || \
+-		DEBUG_DIGICOLOR_UA0 || \
++		DEBUG_DIGICOLOR_UA0 || DEBUG_FSOC3_UART || \
+ 		DEBUG_AT91_UART || DEBUG_STM32_UART || \
+ 		DEBUG_STIH41X_ASC2 || DEBUG_STIH41X_SBC_ASC1 || \
+ 		DEBUG_STIH418_SBC_ASC0

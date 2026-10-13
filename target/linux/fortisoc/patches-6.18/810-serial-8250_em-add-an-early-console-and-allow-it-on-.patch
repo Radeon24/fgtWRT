@@ -1,0 +1,69 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] serial: 8250_em: add an early console and allow it on the FortiSOC3
+
+Add an early console to 8250_em and allow the driver on ARCH_FSOC3.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/tty/serial/8250/8250_em.c | 33 ++++++++++++++++++++++++++++++++
+ drivers/tty/serial/8250/Kconfig   |  5 +++--
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+--- a/drivers/tty/serial/8250/8250_em.c
++++ b/drivers/tty/serial/8250/8250_em.c
+@@ -150,6 +150,39 @@ static void serial8250_em_serial_dl_writ
+ 	serial_out(up, UART_DLM_EM, value >> 8 & 0xff);
+ }
+ 
++#if defined(CONFIG_SERIAL_EARLYCON) && !defined(MODULE)
++/*
++ * Early console: the boot loader has set the line up, only the transmit
++ * holding register (byte access at 0x00) and the line status register
++ * (word access at 0x18, not 0x14 as in a standard 8250) are used.
++ */
++static void serial8250_em_early_putc(struct uart_port *port, unsigned char c)
++{
++	while (!(readl(port->membase + ((UART_LSR + 1) << 2)) & UART_LSR_THRE))
++		cpu_relax();
++	writeb(c, port->membase);
++}
++
++static void serial8250_em_early_write(struct console *con, const char *s,
++				      unsigned int n)
++{
++	struct earlycon_device *dev = con->data;
++
++	uart_console_write(&dev->port, s, n, serial8250_em_early_putc);
++}
++
++static int __init serial8250_em_early_setup(struct earlycon_device *dev,
++					    const char *opt)
++{
++	if (!dev->port.membase)
++		return -ENODEV;
++
++	dev->con->write = serial8250_em_early_write;
++	return 0;
++}
++OF_EARLYCON_DECLARE(em_uart, "renesas,em-uart", serial8250_em_early_setup);
++#endif
++
+ static int serial8250_em_probe(struct platform_device *pdev)
+ {
+ 	struct serial8250_em_priv *priv;
+--- a/drivers/tty/serial/8250/Kconfig
++++ b/drivers/tty/serial/8250/Kconfig
+@@ -412,10 +412,11 @@ config SERIAL_8250_DW
+ config SERIAL_8250_EM
+ 	tristate "Support for Emma Mobile integrated serial port"
+ 	depends on SERIAL_8250 && HAVE_CLK
+-	depends on ARCH_RENESAS || COMPILE_TEST
++	depends on ARCH_RENESAS || ARCH_FSOC3 || COMPILE_TEST
+ 	help
+ 	  Selecting this option will add support for the integrated serial
+-	  port hardware found on the Emma Mobile line of processors.
++	  port hardware found on the Emma Mobile line of processors, and on
++	  the Fortinet FortiSOC3.
+ 	  If unsure, say N.
+ 
+ config SERIAL_8250_IOC3

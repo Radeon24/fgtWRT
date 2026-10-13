@@ -1,0 +1,261 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] usb: fotg210: support the host-only FUSBH200 on the FortiSOC1
+
+Document and support the host-only FUSBH200, and allow it on ARCH_FSOC1.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ ...on/devicetree/bindings/usb/faraday,fotg210.yaml |  1 +
+ drivers/usb/fotg210/Kconfig                        |  4 +-
+ drivers/usb/fotg210/fotg210-core.c                 | 25 ++++++
+ drivers/usb/fotg210/fotg210-hcd.c                  | 59 +++++++++++++--
+ drivers/usb/fotg210/fotg210-hcd.h                  | 17 ++++
+ drivers/usb/fotg210/fotg210.h                      |  7 ++
+ 6 files changed, 106 insertions(+), 7 deletions(-)
+
+--- a/Documentation/devicetree/bindings/usb/faraday,fotg210.yaml
++++ b/Documentation/devicetree/bindings/usb/faraday,fotg210.yaml
+@@ -19,6 +19,7 @@ properties:
+     oneOf:
+       - const: faraday,fotg200
+       - const: faraday,fotg210
++      - const: faraday,fusbh200
+       - items:
+           - const: cortina,gemini-usb
+           - const: faraday,fotg200
+--- a/drivers/usb/fotg210/Kconfig
++++ b/drivers/usb/fotg210/Kconfig
+@@ -4,12 +4,14 @@ config USB_FOTG210
+ 	tristate "Faraday FOTG210 USB2 Dual Role controller"
+ 	depends on USB || USB_GADGET
+ 	depends on HAS_DMA && HAS_IOMEM
+-	depends on ARCH_GEMINI || COMPILE_TEST
++	depends on ARCH_GEMINI || ARCH_FSOC1 || ARCH_FSOC2 || COMPILE_TEST
+ 	default ARCH_GEMINI
+ 	select MFD_SYSCON
+ 	help
+ 	  Faraday FOTG210 is a dual-mode USB controller that can act
+ 	  in both host controller and peripheral controller mode.
++	  The host-only FUSBH200 of the Fortinet FortiSOC1 and FortiSOC2
++	  is handled by the same host driver.
+ 
+ if USB_FOTG210
+ 
+--- a/drivers/usb/fotg210/fotg210-core.c
++++ b/drivers/usb/fotg210/fotg210-core.c
+@@ -147,6 +147,18 @@ static int fotg210_probe(struct platform
+ 
+ 	mode = usb_get_dr_mode(dev);
+ 
++	/*
++	 * The FUSBH200 is a host-only controller: it has no role register,
++	 * and its register at 0x80 is not one.
++	 */
++	if (of_device_is_compatible(dev->of_node, "faraday,fusbh200")) {
++		if (mode == USB_DR_MODE_PERIPHERAL)
++			return dev_err_probe(dev, -EINVAL,
++					     "FUSBH200 is host only\n");
++		fotg->fusbh200 = true;
++		return fotg210_hcd_probe(pdev, fotg);
++	}
++
+ 	if (of_device_is_compatible(dev->of_node, "cortina,gemini-usb")) {
+ 		ret = fotg210_gemini_init(fotg, fotg->res, mode);
+ 		if (ret)
+@@ -180,10 +192,22 @@ static void fotg210_remove(struct platfo
+ 		fotg210_hcd_remove(pdev);
+ }
+ 
++/*
++ * The FUSBH200 keeps walking its periodic and asynchronous schedules,
++ * which live in kernel RAM, until RUN is cleared: stop it before a reboot
++ * so that the boot loader does not find it DMAing into reused memory.
++ */
++static void fotg210_shutdown(struct platform_device *pdev)
++{
++	if (of_device_is_compatible(pdev->dev.of_node, "faraday,fusbh200"))
++		fotg210_hcd_shutdown(pdev);
++}
++
+ #ifdef CONFIG_OF
+ static const struct of_device_id fotg210_of_match[] = {
+ 	{ .compatible = "faraday,fotg200" },
+ 	{ .compatible = "faraday,fotg210" },
++	{ .compatible = "faraday,fusbh200" },
+ 	/* TODO: can we also handle FUSB220? */
+ 	{},
+ };
+@@ -197,6 +221,7 @@ static struct platform_driver fotg210_dr
+ 	},
+ 	.probe  = fotg210_probe,
+ 	.remove = fotg210_remove,
++	.shutdown = fotg210_shutdown,
+ };
+ 
+ static int __init fotg210_init(void)
+--- a/drivers/usb/fotg210/fotg210-hcd.c
++++ b/drivers/usb/fotg210/fotg210-hcd.c
+@@ -78,6 +78,20 @@ MODULE_PARM_DESC(hird, "host initiated r
+ 
+ #include "fotg210-hcd.h"
+ 
++/* Over-current status: OTGISR on the FOTG210, BMISR on the FUSBH200 */
++static inline __u32 __iomem *fotg210_ovc_reg(struct fotg210_hcd *fotg210)
++{
++	if (fotg210->fotg->fusbh200)
++		return (__u32 __iomem *)((void __iomem *)fotg210->caps +
++					 FUSBH200_BMISR);
++	return &fotg210->regs->otgisr;
++}
++
++static inline u32 fotg210_ovc_bit(struct fotg210_hcd *fotg210)
++{
++	return fotg210->fotg->fusbh200 ? BMISR_OVC : OTGISR_OVC;
++}
++
+ #define fotg210_dbg(fotg210, fmt, args...) \
+ 	dev_dbg(fotg210_to_hcd(fotg210)->self.controller, fmt, ## args)
+ #define fotg210_err(fotg210, fmt, args...) \
+@@ -1520,8 +1534,13 @@ static int fotg210_hub_control(struct us
+ 			fotg210_writel(fotg210, temp | PORT_CSC, status_reg);
+ 			break;
+ 		case USB_PORT_FEAT_C_OVER_CURRENT:
+-			fotg210_writel(fotg210, temp | OTGISR_OVC,
+-					&fotg210->regs->otgisr);
++			/* BMISR is write-1-to-clear: only its OVC bit */
++			if (fotg210->fotg->fusbh200)
++				fotg210_writel(fotg210, BMISR_OVC,
++					       fotg210_ovc_reg(fotg210));
++			else
++				fotg210_writel(fotg210, temp | OTGISR_OVC,
++					       &fotg210->regs->otgisr);
+ 			break;
+ 		case USB_PORT_FEAT_C_RESET:
+ 			/* GetPortStatus clears reset */
+@@ -1553,8 +1572,8 @@ static int fotg210_hub_control(struct us
+ 		if (temp & PORT_PEC)
+ 			status |= USB_PORT_STAT_C_ENABLE << 16;
+ 
+-		temp1 = fotg210_readl(fotg210, &fotg210->regs->otgisr);
+-		if (temp1 & OTGISR_OVC)
++		temp1 = fotg210_readl(fotg210, fotg210_ovc_reg(fotg210));
++		if (temp1 & fotg210_ovc_bit(fotg210))
+ 			status |= USB_PORT_STAT_C_OVERCURRENT << 16;
+ 
+ 		/* whoever resumes must GetPortStatus to complete it!! */
+@@ -1665,8 +1684,8 @@ static int fotg210_hub_control(struct us
+ 				set_bit(wIndex, &fotg210->port_c_suspend);
+ 		}
+ 
+-		temp1 = fotg210_readl(fotg210, &fotg210->regs->otgisr);
+-		if (temp1 & OTGISR_OVC)
++		temp1 = fotg210_readl(fotg210, fotg210_ovc_reg(fotg210));
++		if (temp1 & fotg210_ovc_bit(fotg210))
+ 			status |= USB_PORT_STAT_OVERCURRENT;
+ 		if (temp & PORT_RESET)
+ 			status |= USB_PORT_STAT_RESET;
+@@ -5533,6 +5552,23 @@ static void fotg210_init(struct fotg210_
+ {
+ 	u32 value;
+ 
++	/*
++	 * FUSBH200: only what the vendor driver does. The interrupt
++	 * polarity and the bus monitor are left as the boot loader set
++	 * them (active low interrupt on the FortiSOC2, high on the
++	 * FortiSOC1).
++	 */
++	if (fotg210->fotg->fusbh200) {
++		void __iomem *reg = (void __iomem *)fotg210->caps +
++				    FUSBH200_VENDOR_CTRL;
++
++		value = ioread32(reg);
++		value &= ~BIT(5);
++		value |= BIT(4);
++		iowrite32(value, reg);
++		return;
++	}
++
+ 	iowrite32(GMIR_MDEV_INT | GMIR_MOTG_INT | GMIR_INT_POLARITY,
+ 			&fotg210->regs->gmir);
+ 
+@@ -5622,6 +5658,17 @@ int fotg210_hcd_remove(struct platform_d
+ 	return 0;
+ }
+ 
++/*
++ * fotg210_hcd_shutdown - halt the controller (RUN cleared, HCHalted awaited
++ * for at most 2 ms by fotg210_halt()) and turn its ports off
++ * @pdev: USB Host Controller being shut down
++ */
++void fotg210_hcd_shutdown(struct platform_device *pdev)
++{
++	if (platform_get_drvdata(pdev))
++		usb_hcd_platform_shutdown(pdev);
++}
++
+ int __init fotg210_hcd_init(void)
+ {
+ 	if (usb_disabled())
+--- a/drivers/usb/fotg210/fotg210-hcd.h
++++ b/drivers/usb/fotg210/fotg210-hcd.h
+@@ -303,6 +303,20 @@ struct fotg210_regs {
+ #define GMIR_MDEV_INT	(1 << 0)
+ };
+ 
++/*
++ * FUSBH200: the host-only relative of the FOTG210. The EHCI registers are
++ * the same, but a "bus monitor" block replaces the OTG registers. Offsets
++ * from the base of the controller (the capability registers). Only the
++ * registers the vendor drivers of the FortiSOC1 and FortiSOC2 access are
++ * used: BMISR, and the register at 0x80, which they update at probe time
++ * (bit 5 cleared, bit 4 set, like A_BUS_DROP and A_BUS_REQ of OTGCSR on
++ * the FOTG210, at the same place) and which reads the port speed in bits
++ * 23:22, as OTGCSR does (2, high speed, with a device attached).
++ */
++#define FUSBH200_BMISR		0x44
++#define BMISR_OVC		BIT(1)
++#define FUSBH200_VENDOR_CTRL	0x80
++
+ /*-------------------------------------------------------------------------*/
+ 
+ #define	QTD_NEXT(fotg210, dma)	cpu_to_hc32(fotg210, (u32)dma)
+@@ -610,6 +624,9 @@ struct fotg210_fstn {
+ static inline unsigned int
+ fotg210_get_speed(struct fotg210_hcd *fotg210, unsigned int portsc)
+ {
++	if (fotg210->fotg->fusbh200)
++		return (readl((void __iomem *)fotg210->caps +
++			      FUSBH200_VENDOR_CTRL) & OTGCSR_HOST_SPD_TYP) >> 22;
+ 	return (readl(&fotg210->regs->otgcsr)
+ 		& OTGCSR_HOST_SPD_TYP) >> 22;
+ }
+--- a/drivers/usb/fotg210/fotg210.h
++++ b/drivers/usb/fotg210/fotg210.h
+@@ -15,6 +15,7 @@ struct fotg210 {
+ 	struct clk *pclk;
+ 	struct regmap *map;
+ 	enum gemini_port port;
++	bool fusbh200;		/* host-only FUSBH200 register layout */
+ };
+ 
+ void fotg210_vbus(struct fotg210 *fotg, bool enable);
+@@ -22,6 +23,7 @@ void fotg210_vbus(struct fotg210 *fotg,
+ #ifdef CONFIG_USB_FOTG210_HCD
+ int fotg210_hcd_probe(struct platform_device *pdev, struct fotg210 *fotg);
+ int fotg210_hcd_remove(struct platform_device *pdev);
++void fotg210_hcd_shutdown(struct platform_device *pdev);
+ int fotg210_hcd_init(void);
+ void fotg210_hcd_cleanup(void);
+ #else
+@@ -34,6 +36,11 @@ static inline int fotg210_hcd_remove(str
+ {
+ 	return 0;
+ }
++
++static inline void fotg210_hcd_shutdown(struct platform_device *pdev)
++{
++}
++
+ static inline int fotg210_hcd_init(void)
+ {
+ 	return 0;

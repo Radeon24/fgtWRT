@@ -1,0 +1,40 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] power: reset: hook up the Fortinet FortiSOC3 restart driver
+
+Build fsoc3-reboot (POWER_RESET_FSOC3).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/power/reset/Kconfig  | 10 ++++++++++
+ drivers/power/reset/Makefile |  1 +
+ 2 files changed, 11 insertions(+)
+
+--- a/drivers/power/reset/Kconfig
++++ b/drivers/power/reset/Kconfig
+@@ -86,6 +86,16 @@ config POWER_RESET_EP93XX
+ 	  Say Y here if you have a Cirrus EP93XX SoC and you wish
+ 	  to have restart support.
+ 
++config POWER_RESET_FSOC3
++	bool "Fortinet FortiSOC3 restart driver"
++	depends on ARCH_FSOC3 || COMPILE_TEST
++	depends on OF && HAS_IOMEM
++	select MFD_SYSCON
++	help
++	  Restart support for the Fortinet FortiSOC3 (FortiGate 60E and
++	  100E). The SoC is reset by a rising edge of bit 1 of the system
++	  manager register at offset 0x68; no other register is written.
++
+ config POWER_RESET_GEMINI_POWEROFF
+ 	bool "Cortina Gemini power-off driver"
+ 	depends on ARCH_GEMINI || COMPILE_TEST
+--- a/drivers/power/reset/Makefile
++++ b/drivers/power/reset/Makefile
+@@ -8,6 +8,7 @@ obj-$(CONFIG_POWER_RESET_AXXIA) += axxia
+ obj-$(CONFIG_POWER_RESET_BRCMKONA) += brcm-kona-reset.o
+ obj-$(CONFIG_POWER_RESET_BRCMSTB) += brcmstb-reboot.o
+ obj-$(CONFIG_POWER_RESET_EP93XX) += ep93xx-restart.o
++obj-$(CONFIG_POWER_RESET_FSOC3) += fsoc3-reboot.o
+ obj-$(CONFIG_POWER_RESET_GEMINI_POWEROFF) += gemini-poweroff.o
+ obj-$(CONFIG_POWER_RESET_GPIO) += gpio-poweroff.o
+ obj-$(CONFIG_POWER_RESET_GPIO_RESTART) += gpio-restart.o

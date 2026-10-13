@@ -1,0 +1,48 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] usb: fotg210-udc: add a pullup operation
+
+Without .pullup no gadget can be bound.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/usb/fotg210/fotg210-udc.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+--- a/drivers/usb/fotg210/fotg210-udc.c
++++ b/drivers/usb/fotg210/fotg210-udc.c
+@@ -1108,9 +1108,35 @@ static int fotg210_vbus_session(struct u
+ 	return 0;
+ }
+ 
++/**
++ * fotg210_pullup - Connect or disconnect the device from the bus
++ * @g: usb gadget
++ * @is_on: 1 to connect (D+ pull-up enabled), 0 to disconnect
++ *
++ * Returns: %0
++ */
++static int fotg210_pullup(struct usb_gadget *g, int is_on)
++{
++	struct fotg210_udc *fotg210 = gadget_to_fotg210(g);
++	unsigned long flags;
++	u32 reg;
++
++	spin_lock_irqsave(&fotg210->lock, flags);
++	reg = ioread32(fotg210->reg + FOTG210_PHYTMSR);
++	if (is_on)
++		reg &= ~PHYTMSR_UNPLUG;
++	else
++		reg |= PHYTMSR_UNPLUG;
++	iowrite32(reg, fotg210->reg + FOTG210_PHYTMSR);
++	spin_unlock_irqrestore(&fotg210->lock, flags);
++
++	return 0;
++}
++
+ static const struct usb_gadget_ops fotg210_gadget_ops = {
+ 	.udc_start		= fotg210_udc_start,
+ 	.udc_stop		= fotg210_udc_stop,
++	.pullup			= fotg210_pullup,
+ 	.vbus_session		= fotg210_vbus_session,
+ };
+ 

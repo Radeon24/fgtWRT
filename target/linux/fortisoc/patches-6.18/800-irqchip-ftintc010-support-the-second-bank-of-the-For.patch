@@ -1,0 +1,214 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] irqchip/ftintc010: support the second bank of the FortiSOC2
+
+Support the second interrupt bank of the FortiSOC2 and document it in
+the binding.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ ...ngs/interrupt-controller/faraday,ftintc010.yaml |  6 +
+ drivers/irqchip/irq-ftintc010.c                    | 98 ++++++++++-----
+ 2 files changed, 73 insertions(+), 31 deletions(-)
+
+--- a/Documentation/devicetree/bindings/interrupt-controller/faraday,ftintc010.yaml
++++ b/Documentation/devicetree/bindings/interrupt-controller/faraday,ftintc010.yaml
+@@ -18,6 +18,12 @@ properties:
+       - items:
+           - const: moxa,moxart-ic
+           - const: faraday,ftintc010
++      - description:
++          Instance of the Fortinet FortiSOC2, with a second bank of 32
++          interrupt lines 0x60 bytes above the first one
++        items:
++          - const: fortinet,fsoc2-intc
++          - const: faraday,ftintc010
+       - enum:
+           - faraday,ftintc010
+           - cortina,gemini-interrupt-controller
+--- a/drivers/irqchip/irq-ftintc010.c
++++ b/drivers/irqchip/irq-ftintc010.c
+@@ -22,6 +22,12 @@
+ #include <asm/mach/irq.h>
+ 
+ #define FT010_NUM_IRQS 32
++/*
++ * Some instances have a second bank of 32 lines, with the same registers
++ * 0x60 bytes above the first bank.
++ */
++#define FT010_MAX_BANKS 2
++#define FT010_BANK_STRIDE 0x60
+ 
+ #define FT010_IRQ_SOURCE(base_addr)	(base_addr + 0x00)
+ #define FT010_IRQ_MASK(base_addr)	(base_addr + 0x04)
+@@ -43,73 +49,88 @@
+  * @base: memory offset in virtual memory
+  * @chip: chip container for this instance
+  * @domain: IRQ domain for this instance
++ * @nr_banks: number of banks of 32 lines
+  */
+ struct ft010_irq_data {
+ 	void __iomem *base;
+ 	struct irq_chip chip;
+ 	struct irq_domain *domain;
++	unsigned int nr_banks;
+ };
+ 
+-static void ft010_irq_mask(struct irq_data *d)
++/* Registers of the bank of a line */
++static void __iomem *ft010_bank_base(struct irq_data *d)
+ {
+ 	struct ft010_irq_data *f = irq_data_get_irq_chip_data(d);
++
++	return f->base + irqd_to_hwirq(d) / FT010_NUM_IRQS * FT010_BANK_STRIDE;
++}
++
++/* Bit of a line in the registers of its bank */
++static u32 ft010_bit(struct irq_data *d)
++{
++	return BIT(irqd_to_hwirq(d) % FT010_NUM_IRQS);
++}
++
++static void ft010_irq_mask(struct irq_data *d)
++{
++	void __iomem *base = ft010_bank_base(d);
+ 	unsigned int mask;
+ 
+-	mask = readl(FT010_IRQ_MASK(f->base));
+-	mask &= ~BIT(irqd_to_hwirq(d));
+-	writel(mask, FT010_IRQ_MASK(f->base));
++	mask = readl(FT010_IRQ_MASK(base));
++	mask &= ~ft010_bit(d);
++	writel(mask, FT010_IRQ_MASK(base));
+ }
+ 
+ static void ft010_irq_unmask(struct irq_data *d)
+ {
+-	struct ft010_irq_data *f = irq_data_get_irq_chip_data(d);
++	void __iomem *base = ft010_bank_base(d);
+ 	unsigned int mask;
+ 
+-	mask = readl(FT010_IRQ_MASK(f->base));
+-	mask |= BIT(irqd_to_hwirq(d));
+-	writel(mask, FT010_IRQ_MASK(f->base));
++	mask = readl(FT010_IRQ_MASK(base));
++	mask |= ft010_bit(d);
++	writel(mask, FT010_IRQ_MASK(base));
+ }
+ 
+ static void ft010_irq_ack(struct irq_data *d)
+ {
+-	struct ft010_irq_data *f = irq_data_get_irq_chip_data(d);
+-
+-	writel(BIT(irqd_to_hwirq(d)), FT010_IRQ_CLEAR(f->base));
++	writel(ft010_bit(d), FT010_IRQ_CLEAR(ft010_bank_base(d)));
+ }
+ 
+ static int ft010_irq_set_type(struct irq_data *d, unsigned int trigger)
+ {
+-	struct ft010_irq_data *f = irq_data_get_irq_chip_data(d);
++	void __iomem *base = ft010_bank_base(d);
+ 	int offset = irqd_to_hwirq(d);
++	u32 bit = ft010_bit(d);
+ 	u32 mode, polarity;
+ 
+-	mode = readl(FT010_IRQ_MODE(f->base));
+-	polarity = readl(FT010_IRQ_POLARITY(f->base));
++	mode = readl(FT010_IRQ_MODE(base));
++	polarity = readl(FT010_IRQ_POLARITY(base));
+ 
+ 	if (trigger & (IRQ_TYPE_LEVEL_LOW)) {
+ 		irq_set_handler_locked(d, handle_level_irq);
+-		mode &= ~BIT(offset);
+-		polarity |= BIT(offset);
++		mode &= ~bit;
++		polarity |= bit;
+ 	} else if (trigger & (IRQ_TYPE_LEVEL_HIGH)) {
+ 		irq_set_handler_locked(d, handle_level_irq);
+-		mode &= ~BIT(offset);
+-		polarity &= ~BIT(offset);
++		mode &= ~bit;
++		polarity &= ~bit;
+ 	} else if (trigger & IRQ_TYPE_EDGE_FALLING) {
+ 		irq_set_handler_locked(d, handle_edge_irq);
+-		mode |= BIT(offset);
+-		polarity |= BIT(offset);
++		mode |= bit;
++		polarity |= bit;
+ 	} else if (trigger & IRQ_TYPE_EDGE_RISING) {
+ 		irq_set_handler_locked(d, handle_edge_irq);
+-		mode |= BIT(offset);
+-		polarity &= ~BIT(offset);
++		mode |= bit;
++		polarity &= ~bit;
+ 	} else {
+ 		irq_set_handler_locked(d, handle_bad_irq);
+ 		pr_warn("Faraday IRQ: no supported trigger selected for line %d\n",
+ 			offset);
+ 	}
+ 
+-	writel(mode, FT010_IRQ_MODE(f->base));
+-	writel(polarity, FT010_IRQ_POLARITY(f->base));
++	writel(mode, FT010_IRQ_MODE(base));
++	writel(polarity, FT010_IRQ_POLARITY(base));
+ 
+ 	return 0;
+ }
+@@ -128,12 +149,16 @@ static struct ft010_irq_data firq;
+ static void __exception_irq_entry ft010_irqchip_handle_irq(struct pt_regs *regs)
+ {
+ 	struct ft010_irq_data *f = &firq;
+-	int irq;
++	unsigned int bank;
++	void __iomem *base;
+ 	u32 status;
+ 
+-	while ((status = readl(FT010_IRQ_STATUS(f->base)))) {
+-		irq = ffs(status) - 1;
+-		generic_handle_domain_irq(f->domain, irq);
++	for (bank = 0; bank < f->nr_banks; bank++) {
++		base = f->base + bank * FT010_BANK_STRIDE;
++		while ((status = readl(FT010_IRQ_STATUS(base))))
++			generic_handle_domain_irq(f->domain,
++						  bank * FT010_NUM_IRQS +
++						  ffs(status) - 1);
+ 	}
+ }
+ 
+@@ -166,6 +191,7 @@ static int __init ft010_of_init_irq(stru
+ 			      struct device_node *parent)
+ {
+ 	struct ft010_irq_data *f = &firq;
++	unsigned int bank;
+ 
+ 	/*
+ 	 * Disable the idle handler by default since it is buggy
+@@ -176,12 +202,20 @@ static int __init ft010_of_init_irq(stru
+ 	f->base = of_iomap(node, 0);
+ 	WARN(!f->base, "unable to map gemini irq registers\n");
+ 
+-	/* Disable all interrupts */
+-	writel(0, FT010_IRQ_MASK(f->base));
++	f->nr_banks = 1;
++	if (of_device_is_compatible(node, "fortinet,fsoc2-intc"))
++		f->nr_banks = FT010_MAX_BANKS;
++
++	/*
++	 * Disable all interrupts. The FIQ registers are only known for the
++	 * first bank.
++	 */
++	for (bank = 0; bank < f->nr_banks; bank++)
++		writel(0, FT010_IRQ_MASK(f->base + bank * FT010_BANK_STRIDE));
+ 	writel(0, FT010_FIQ_MASK(f->base));
+ 
+ 	f->domain = irq_domain_create_simple(of_fwnode_handle(node),
+-					     FT010_NUM_IRQS, 0,
++					     f->nr_banks * FT010_NUM_IRQS, 0,
+ 					     &ft010_irqdomain_ops, f);
+ 	set_handle_irq(ft010_irqchip_handle_irq);
+ 
+@@ -193,3 +227,5 @@ IRQCHIP_DECLARE(gemini, "cortina,gemini-
+ 		ft010_of_init_irq);
+ IRQCHIP_DECLARE(moxa, "moxa,moxart-ic",
+ 		ft010_of_init_irq);
++IRQCHIP_DECLARE(fsoc2, "fortinet,fsoc2-intc",
++		ft010_of_init_irq);

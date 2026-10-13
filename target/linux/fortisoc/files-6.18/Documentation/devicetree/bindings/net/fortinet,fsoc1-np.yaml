@@ -1,0 +1,273 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/fortinet,fsoc1-np.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC1 and FortiSOC2 network processors
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description: |
+  The network processor (NP) of the Fortinet FortiSOC1 has four RGMII
+  capable Ethernet ports and exchanges frames with the host through a
+  single pair of DMA descriptor rings (the host interface). It also
+  contains the MDIO controller the external PHYs and switch are attached
+  to.
+
+  The NP of the FortiSOC2 (NP4Lite) keeps the same layout, with a second
+  register block that routes its interrupt sources to the SoC interrupt
+  controller. It sits in the second 4 KiB page of the NP window, the rest
+  of which belongs to other blocks.
+
+  The NP needs a packet buffer of its own in system memory, outside of
+  the memory used by the operating system. Its flow engine, which forwards
+  known flows between the ports without the host, keeps its tables in
+  system memory too, as well as its command and message queues.
+
+properties:
+  compatible:
+    enum:
+      - fortinet,fsoc1-np
+      - fortinet,fsoc2-np
+
+  reg:
+    minItems: 1
+    items:
+      - description: NP registers, the first 4 KiB page of its window
+      - description:
+          Interrupt routing (FortiSOC2 only), 256 bytes at 0x1e00 into the
+          NP window
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: np
+      - const: irq-map
+
+  interrupts:
+    maxItems: 1
+
+  memory-region:
+    minItems: 1
+    items:
+      - description:
+          Private packet buffer of the NP, 8 MiB (FortiSOC1) or 16 MiB
+          (FortiSOC2), aligned on 64 KiB.
+      - description:
+          Memory the boot loader leaves the NP DMA engine working in (its
+          descriptor rings and buffers). It must stay untouched until the
+          driver has taken the host interface over.
+      - description:
+          Flow tables of the NP flow engine, 56 MiB aligned on 4 MiB and
+          below 1 GiB, outside of the memory used by the operating system.
+          Without it, the NP does not offload flows.
+      - description:
+          FortiSOC1, command ring and message queue of the NP flow engine,
+          160 KiB at least, aligned on 4 KiB and below 4 GiB, outside of
+          the memory used by the operating system. Needed for flow offload
+          too; the FortiSOC2 engine has neither. FortiSOC2, security
+          association area of the NP IPsec engine, 4 MiB outside of the
+          memory used by the operating system.
+
+  nvmem-cells:
+    maxItems: 1
+    description:
+      Base MAC address of the ports, a "mac-base" cell (port n gets the
+      base + n). Without it, the base is taken from the logical interface
+      table the boot loader leaves.
+
+  nvmem-cell-names:
+    const: mac-base
+
+  post-init-providers:
+    description:
+      The node of the "mac-base" cell, which never becomes a device. The
+      driver waits for the cell until the end of the boot, then falls back
+      to the logical interface table, instead of a probe held forever.
+
+  fortinet,reset-pins:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      GPIO pins of the NP holding a PHY or the switch in reset when low.
+      The driver pulses them low, then leaves them outputs at 1, before the
+      MDIO bus is registered.
+    items:
+      maximum: 31
+
+  mdio:
+    $ref: /schemas/net/mdio.yaml#
+    unevaluatedProperties: false
+
+  ethernet-ports:
+    type: object
+    additionalProperties: false
+
+    properties:
+      "#address-cells":
+        const: 1
+
+      "#size-cells":
+        const: 0
+
+    patternProperties:
+      "^ethernet-port@[0-3]$":
+        type: object
+        $ref: ethernet-controller.yaml#
+        unevaluatedProperties: false
+        description: One Ethernet port of the NP.
+
+        properties:
+          reg:
+            maximum: 3
+            description:
+              Port number, the link of the NP the port is wired to, which is
+              also the register bank.
+
+          fortinet,logical-interface:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            maximum: 63
+            description:
+              Logical interface (LIF), the index the NP classes the frames
+              received on the link to, and that the frames sent through the
+              port target. Defaults to the port number; set on boards whose
+              wiring numbers them apart (wan1 and wan2 on links 0 and 1 but
+              LIFs 2 and 3, for instance). Each port has a LIF of its own.
+              On a DSA conduit with fortinet,switch-logical-interfaces, the
+              LIF of the frames of the switch that the NP does not class by
+              switch port.
+
+          fortinet,switch-logical-interfaces:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            minItems: 8
+            maxItems: 8
+            items:
+              maximum: 19
+            description:
+              DSA conduit to a Broadcom switch (BCM53128, ports 0 to 7, the
+              CPU port 8), with the Broadcom tag. The LIF of each switch
+              port, by port number, 0 for none, for a network processor
+              that classes the frames of the switch by source port (the
+              FortiSOC2 does, given a LIF per port). Each LIF used once on
+              the NP, apart from the LIF of every port. The conduit may be
+              the only one of its NP, or one of several (one per link).
+              Without it, the frames of every switch port stay on the LIF
+              of the conduit.
+
+          post-init-providers: true
+
+        required:
+          - reg
+          - phy-mode
+
+    required:
+      - "#address-cells"
+      - "#size-cells"
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - memory-region
+  - ethernet-ports
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: fortinet,fsoc2-np
+    then:
+      properties:
+        reg:
+          minItems: 2
+        reg-names:
+          minItems: 2
+        memory-region:
+          maxItems: 4
+      required:
+        - reg-names
+    else:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names:
+          maxItems: 1
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    ethernet@e3f00000 {
+        compatible = "fortinet,fsoc1-np";
+        reg = <0xe3f00000 0x1000>;
+        interrupts = <26 IRQ_TYPE_LEVEL_HIGH>;
+        memory-region = <&np_pbuf>, <&np_loader>, <&np_flow>,
+                        <&np_queues>;
+
+        mdio {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            phy3: ethernet-phy@3 {
+                reg = <3>;
+            };
+        };
+
+        ethernet-ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            ethernet-port@0 {
+                reg = <0>;
+                phy-mode = "rgmii-id";
+
+                fixed-link {
+                    speed = <1000>;
+                    full-duplex;
+                };
+            };
+
+            ethernet-port@1 {
+                reg = <1>;
+                label = "wan1";
+                phy-handle = <&phy3>;
+                phy-mode = "rgmii-id";
+            };
+        };
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    ethernet@e3f00000 {
+        compatible = "fortinet,fsoc2-np";
+        reg = <0xe3f00000 0x1000>, <0xe3f01e00 0x100>;
+        reg-names = "np", "irq-map";
+        interrupts = <20 IRQ_TYPE_LEVEL_HIGH>;
+        memory-region = <&np_pbuf>, <&np_loader>, <&np_flow>, <&np_sa>;
+
+        mdio {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            phy24: ethernet-phy@18 {
+                reg = <0x18>;
+            };
+        };
+
+        ethernet-ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            ethernet-port@2 {
+                reg = <2>;
+                label = "wan1";
+                phy-handle = <&phy24>;
+                phy-mode = "rgmii-id";
+            };
+        };
+    };

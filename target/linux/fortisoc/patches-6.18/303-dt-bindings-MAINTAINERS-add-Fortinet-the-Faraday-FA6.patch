@@ -1,0 +1,88 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] dt-bindings: MAINTAINERS: add Fortinet, the Faraday FA626TE/FA726TE and the FortiSOC entries
+
+Add the Fortinet vendor prefix, the Faraday FA626TE and FA726TE CPU
+compatibles, and the MAINTAINERS entries of the FortiSOC platforms,
+bindings and drivers.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ Documentation/devicetree/bindings/arm/cpus.yaml    |  3 +
+ ...tation/devicetree/bindings/vendor-prefixes.yaml |  2 +
+ MAINTAINERS                                        | 35 +++++++++++++++
+ 3 files changed, 40 insertions(+)
+
+--- a/Documentation/devicetree/bindings/arm/cpus.yaml
++++ b/Documentation/devicetree/bindings/arm/cpus.yaml
+@@ -188,6 +188,8 @@ properties:
+       - cavium,thunder
+       - cavium,thunder2
+       - faraday,fa526
++      - faraday,fa626te
++      - faraday,fa726te
+       - intel,sa110
+       - intel,sa1100
+       - marvell,feroceon
+@@ -247,6 +249,7 @@ properties:
+           - brcm,bcm63138
+           - brcm,bcm-nsp-smp
+           - brcm,brahma-b15
++          - fortinet,fsoc3-smp
+           - marvell,armada-375-smp
+           - marvell,armada-380-smp
+           - marvell,armada-390-smp
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -578,6 +578,8 @@ patternProperties:
+     description: FocalTech Systems Co.,Ltd
+   "^forlinx,.*":
+     description: Baoding Forlinx Embedded Technology Co., Ltd.
++  "^fortinet,.*":
++    description: Fortinet, Inc.
+   "^foursemi,.*":
+     description: Shanghai FourSemi Semiconductor Co.,Ltd.
+   "^foxlink,.*":
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2695,6 +2695,41 @@ W:	http://www.armlinux.org.uk/
+ F:	arch/arm/include/asm/hardware/dec21285.h
+ F:	arch/arm/mach-footbridge/
+ 
++ARM/FORTINET FORTISOC SUPPORT
++M:	Radeon24 <Radeon24@users.noreply.github.com>
++L:	linux-arm-kernel@lists.infradead.org (moderated for non-subscribers)
++L:	linux-crypto@vger.kernel.org
++L:	netdev@vger.kernel.org
++S:	Maintained
++F:	Documentation/devicetree/bindings/arm/fortinet.yaml
++F:	Documentation/devicetree/bindings/cache/fortinet,fsoc1-l2cc.yaml
++F:	Documentation/devicetree/bindings/crypto/fortinet,fsoc1-crypto.yaml
++F:	Documentation/devicetree/bindings/gpio/fortinet,fsoc3-gpio.yaml
++F:	Documentation/devicetree/bindings/i2c/fortinet,fsoc3-i2c.yaml
++F:	Documentation/devicetree/bindings/misc/fortinet,usb-disk-write-windows.yaml
++F:	Documentation/devicetree/bindings/mmc/fortinet,fsoc3-sdhi.yaml
++F:	Documentation/devicetree/bindings/net/fortinet,fsoc1-np.yaml
++F:	Documentation/devicetree/bindings/net/fortinet,fsoc3-np6lite.yaml
++F:	Documentation/devicetree/bindings/nvmem/fortinet,fsoc3-boot-flash.yaml
++F:	Documentation/devicetree/bindings/power/reset/fortinet,fsoc3-reboot.yaml
++F:	Documentation/devicetree/bindings/rtc/fortinet,fsoc*-rtc.yaml
++F:	Documentation/devicetree/bindings/soc/fortinet/
++F:	Documentation/devicetree/bindings/spi/fortinet,fsoc2-ssp.yaml
++F:	arch/arm/boot/dts/fortinet/
++F:	arch/arm/mach-fsoc3/
++F:	arch/arm/mm/cache-fsoc1-l2.c
++F:	block/blk-write-windows.c
++F:	drivers/crypto/fortinet/
++F:	drivers/gpio/gpio-fsoc3.c
++F:	drivers/i2c/busses/i2c-fsoc3.c
++F:	drivers/net/ethernet/fortinet/
++F:	drivers/nvmem/fsoc3-boot-flash.c
++F:	drivers/power/reset/fsoc3-reboot.c
++F:	drivers/rtc/rtc-fsoc*.c
++F:	drivers/spi/spi-fsoc2-ssp.c
++F:	include/linux/blk-write-windows.h
++F:	include/linux/soc/fortinet/
++
+ ARM/FREESCALE IMX / MXC ARM ARCHITECTURE
+ M:	Shawn Guo <shawnguo@kernel.org>
+ M:	Sascha Hauer <s.hauer@pengutronix.de>

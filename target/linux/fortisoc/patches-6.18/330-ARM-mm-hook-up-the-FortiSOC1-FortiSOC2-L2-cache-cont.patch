@@ -1,0 +1,41 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: mm: hook up the FortiSOC1/FortiSOC2 L2 cache controller
+
+Build cache-fsoc1-l2 (CACHE_FSOC1_L2) on the FortiSOC1 and on the FortiSOC2.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/mm/Kconfig  | 11 +++++++++++
+ arch/arm/mm/Makefile |  1 +
+ 2 files changed, 12 insertions(+)
+
+--- a/arch/arm/mm/Kconfig
++++ b/arch/arm/mm/Kconfig
+@@ -988,6 +988,17 @@ config CACHE_FEROCEON_L2_WRITETHROUGH
+ 	  Say Y here to use the Feroceon L2 cache in writethrough mode.
+ 	  Unless you specifically require this, say N for writeback mode.
+ 
++config CACHE_FSOC1_L2
++	bool "Enable the Fortinet FortiSOC1 and FortiSOC2 L2 cache controllers"
++	depends on ARCH_FSOC1 || ARCH_FSOC2
++	select OUTER_CACHE
++	help
++	  This option enables the 256 KiB L2 cache controller of the
++	  Fortinet FortiSOC1, found in the FortiGate 60C, and of the
++	  Fortinet FortiSOC2, found in the FortiGate 60D. It is only used
++	  when its device tree node is enabled: while the node is disabled,
++	  the controller is neither mapped nor accessed.
++
+ config MIGHT_HAVE_CACHE_L2X0
+ 	bool
+ 	help
+--- a/arch/arm/mm/Makefile
++++ b/arch/arm/mm/Makefile
+@@ -94,6 +94,7 @@ obj-$(CONFIG_CFI)		+= proc.o
+ obj-$(CONFIG_OUTER_CACHE)	+= l2c-common.o
+ obj-$(CONFIG_CACHE_B15_RAC)	+= cache-b15-rac.o
+ obj-$(CONFIG_CACHE_FEROCEON_L2)	+= cache-feroceon-l2.o
++obj-$(CONFIG_CACHE_FSOC1_L2)	+= cache-fsoc1-l2.o
+ obj-$(CONFIG_CACHE_L2X0)	+= cache-l2x0.o l2c-l2x0-resume.o
+ obj-$(CONFIG_CACHE_L2X0_PMU)	+= cache-l2x0-pmu.o
+ obj-$(CONFIG_CACHE_XSC3L2)	+= cache-xsc3l2.o

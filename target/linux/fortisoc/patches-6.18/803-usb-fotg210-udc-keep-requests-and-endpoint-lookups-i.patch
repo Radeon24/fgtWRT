@@ -1,0 +1,320 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] usb: fotg210-udc: keep requests and endpoint lookups in bounds
+
+Bound the request lengths and the endpoint lookups.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/usb/fotg210/fotg210-udc.c | 162 +++++++++++++++++++++++++------
+ 1 file changed, 131 insertions(+), 31 deletions(-)
+
+--- a/drivers/usb/fotg210/fotg210-udc.c
++++ b/drivers/usb/fotg210/fotg210-udc.c
+@@ -90,6 +90,23 @@ static void fotg210_done(struct fotg210_
+ 	}
+ }
+ 
++/* Give back every request of an endpoint without touching the controller */
++static void fotg210_nuke(struct fotg210_ep *ep, int status)
++{
++	struct fotg210_request *req;
++
++	while (!list_empty(&ep->queue)) {
++		req = list_first_entry(&ep->queue, struct fotg210_request,
++				       queue);
++		list_del_init(&req->queue);
++		req->req.status = status;
++
++		spin_unlock(&ep->fotg210->lock);
++		usb_gadget_giveback_request(&ep->ep, &req->req);
++		spin_lock(&ep->fotg210->lock);
++	}
++}
++
+ static void fotg210_fifo_ep_mapping(struct fotg210_ep *ep, u32 epnum,
+ 				u32 dir_in)
+ {
+@@ -209,12 +226,13 @@ static int fotg210_ep_release(struct fot
+ {
+ 	if (!ep->epnum)
+ 		return 0;
++
++	fotg210_reset_tseq(ep->fotg210, ep->epnum);
++
+ 	ep->epnum = 0;
+ 	ep->stall = 0;
+ 	ep->wedged = 0;
+ 
+-	fotg210_reset_tseq(ep->fotg210, ep->epnum);
+-
+ 	return 0;
+ }
+ 
+@@ -338,6 +356,7 @@ static void fotg210_start_dma(struct fot
+ 			struct fotg210_request *req)
+ {
+ 	struct device *dev = &ep->fotg210->gadget.dev;
++	enum dma_data_direction dir;
+ 	dma_addr_t d;
+ 	u8 *buffer;
+ 	u32 length;
+@@ -361,8 +380,8 @@ static void fotg210_start_dma(struct fot
+ 			length = req->req.length - req->req.actual;
+ 	}
+ 
+-	d = dma_map_single(dev, buffer, length,
+-			ep->dir_in ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
++	dir = ep->dir_in ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
++	d = dma_map_single(dev, buffer, length, dir);
+ 
+ 	if (dma_mapping_error(dev, d)) {
+ 		pr_err("dma_mapping_error\n");
+@@ -379,7 +398,7 @@ static void fotg210_start_dma(struct fot
+ 	/* update actual transfer length */
+ 	req->req.actual += length;
+ 
+-	dma_unmap_single(dev, d, length, DMA_TO_DEVICE);
++	dma_unmap_single(dev, d, length, dir);
+ }
+ 
+ static void fotg210_ep0_queue(struct fotg210_ep *ep,
+@@ -415,8 +434,18 @@ static int fotg210_ep_queue(struct usb_e
+ 	if (ep->fotg210->gadget.speed == USB_SPEED_UNKNOWN)
+ 		return -ESHUTDOWN;
+ 
++	/* A disabled endpoint has epnum 0: it must not take the ep0 path */
++	if (ep != ep->fotg210->ep[0] && !ep->epnum)
++		return -ESHUTDOWN;
++
+ 	spin_lock_irqsave(&ep->fotg210->lock, flags);
+ 
++	/* Queueing a request twice would corrupt the list */
++	if (!list_empty(&req->queue)) {
++		spin_unlock_irqrestore(&ep->fotg210->lock, flags);
++		return -EBUSY;
++	}
++
+ 	if (list_empty(&ep->queue))
+ 		request = 1;
+ 
+@@ -438,18 +467,24 @@ static int fotg210_ep_queue(struct usb_e
+ static int fotg210_ep_dequeue(struct usb_ep *_ep, struct usb_request *_req)
+ {
+ 	struct fotg210_ep *ep;
+-	struct fotg210_request *req;
++	struct fotg210_request *req, *iter;
+ 	unsigned long flags;
++	int ret = -EINVAL;
+ 
+ 	ep = container_of(_ep, struct fotg210_ep, ep);
+ 	req = container_of(_req, struct fotg210_request, req);
+ 
+ 	spin_lock_irqsave(&ep->fotg210->lock, flags);
+-	if (!list_empty(&ep->queue))
+-		fotg210_done(ep, req, -ECONNRESET);
++	list_for_each_entry(iter, &ep->queue, queue) {
++		if (iter == req) {
++			fotg210_done(ep, req, -ECONNRESET);
++			ret = 0;
++			break;
++		}
++	}
+ 	spin_unlock_irqrestore(&ep->fotg210->lock, flags);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void fotg210_set_epnstall(struct fotg210_ep *ep)
+@@ -648,6 +683,23 @@ static void fotg210_set_address(struct f
+ 	}
+ }
+ 
++/* Enabled non-control endpoint named by wIndex, or NULL */
++static struct fotg210_ep *fotg210_windex_ep(struct fotg210_udc *fotg210,
++					    struct usb_ctrlrequest *ctrl)
++{
++	u8 epnum = le16_to_cpu(ctrl->wIndex) & USB_ENDPOINT_NUMBER_MASK;
++	struct fotg210_ep *ep;
++
++	if (!epnum || epnum >= FOTG210_MAX_NUM_EP)
++		return NULL;
++
++	ep = fotg210->ep[epnum];
++	if (ep->epnum != epnum)
++		return NULL;
++
++	return ep;
++}
++
+ static void fotg210_set_feature(struct fotg210_udc *fotg210,
+ 				struct usb_ctrlrequest *ctrl)
+ {
+@@ -659,12 +711,18 @@ static void fotg210_set_feature(struct f
+ 		fotg210_set_cxdone(fotg210);
+ 		break;
+ 	case USB_RECIP_ENDPOINT: {
+-		u8 epnum;
+-		epnum = le16_to_cpu(ctrl->wIndex) & USB_ENDPOINT_NUMBER_MASK;
+-		if (epnum)
+-			fotg210_set_epnstall(fotg210->ep[epnum]);
+-		else
++		struct fotg210_ep *ep;
++
++		if (le16_to_cpu(ctrl->wIndex) & USB_ENDPOINT_NUMBER_MASK) {
++			ep = fotg210_windex_ep(fotg210, ctrl);
++			if (!ep) {
++				fotg210_request_error(fotg210);
++				break;
++			}
++			fotg210_set_epnstall(ep);
++		} else {
+ 			fotg210_set_cxstall(fotg210);
++		}
+ 		fotg210_set_cxdone(fotg210);
+ 		}
+ 		break;
+@@ -677,8 +735,7 @@ static void fotg210_set_feature(struct f
+ static void fotg210_clear_feature(struct fotg210_udc *fotg210,
+ 				struct usb_ctrlrequest *ctrl)
+ {
+-	struct fotg210_ep *ep =
+-		fotg210->ep[ctrl->wIndex & USB_ENDPOINT_NUMBER_MASK];
++	struct fotg210_ep *ep;
+ 
+ 	switch (ctrl->bRequestType & USB_RECIP_MASK) {
+ 	case USB_RECIP_DEVICE:
+@@ -688,7 +745,12 @@ static void fotg210_clear_feature(struct
+ 		fotg210_set_cxdone(fotg210);
+ 		break;
+ 	case USB_RECIP_ENDPOINT:
+-		if (ctrl->wIndex & USB_ENDPOINT_NUMBER_MASK) {
++		if (le16_to_cpu(ctrl->wIndex) & USB_ENDPOINT_NUMBER_MASK) {
++			ep = fotg210_windex_ep(fotg210, ctrl);
++			if (!ep) {
++				fotg210_request_error(fotg210);
++				break;
++			}
+ 			if (ep->wedged) {
+ 				fotg210_set_cxdone(fotg210);
+ 				break;
+@@ -734,7 +796,7 @@ static void fotg210_ep0_complete(struct
+ static void fotg210_get_status(struct fotg210_udc *fotg210,
+ 				struct usb_ctrlrequest *ctrl)
+ {
+-	u8 epnum;
++	struct fotg210_ep *ep;
+ 
+ 	switch (ctrl->bRequestType & USB_RECIP_MASK) {
+ 	case USB_RECIP_DEVICE:
+@@ -744,13 +806,17 @@ static void fotg210_get_status(struct fo
+ 		fotg210->ep0_data = cpu_to_le16(0);
+ 		break;
+ 	case USB_RECIP_ENDPOINT:
+-		epnum = ctrl->wIndex & USB_ENDPOINT_NUMBER_MASK;
+-		if (epnum)
+-			fotg210->ep0_data =
+-				cpu_to_le16(fotg210_is_epnstall(fotg210->ep[epnum])
+-					    << USB_ENDPOINT_HALT);
+-		else
++		if (!(le16_to_cpu(ctrl->wIndex) & USB_ENDPOINT_NUMBER_MASK)) {
++			fotg210->ep0_data = cpu_to_le16(0);
++			break;
++		}
++		ep = fotg210_windex_ep(fotg210, ctrl);
++		if (!ep) {
+ 			fotg210_request_error(fotg210);
++			return;		/* exit */
++		}
++		fotg210->ep0_data =
++			cpu_to_le16(fotg210_is_epnstall(ep) << USB_ENDPOINT_HALT);
+ 		break;
+ 
+ 	default:
+@@ -854,8 +920,13 @@ static void fotg210_ep0in(struct fotg210
+ 
+ static void fotg210_in_fifo_handler(struct fotg210_ep *ep)
+ {
+-	struct fotg210_request *req = list_entry(ep->queue.next,
+-					struct fotg210_request, queue);
++	struct fotg210_request *req;
++
++	if (list_empty(&ep->queue)) {
++		fotg210_disable_fifo_int(ep);
++		return;
++	}
++	req = list_first_entry(&ep->queue, struct fotg210_request, queue);
+ 
+ 	if (req->req.length)
+ 		fotg210_start_dma(ep, req);
+@@ -864,9 +935,15 @@ static void fotg210_in_fifo_handler(stru
+ 
+ static void fotg210_out_fifo_handler(struct fotg210_ep *ep)
+ {
+-	struct fotg210_request *req = list_entry(ep->queue.next,
+-						 struct fotg210_request, queue);
+-	int disgr1 = ioread32(ep->fotg210->reg + FOTG210_DISGR1);
++	struct fotg210_request *req;
++	int disgr1;
++
++	if (list_empty(&ep->queue)) {
++		fotg210_disable_fifo_int(ep);
++		return;
++	}
++	req = list_first_entry(&ep->queue, struct fotg210_request, queue);
++	disgr1 = ioread32(ep->fotg210->reg + FOTG210_DISGR1);
+ 
+ 	fotg210_start_dma(ep, req);
+ 
+@@ -897,6 +974,9 @@ static irqreturn_t fotg210_irq(int irq,
+ 		int_grp2 &= ~int_msk2;
+ 
+ 		if (int_grp2 & DISGR2_USBRST_INT) {
++			/* a reset ends any control transfer */
++			fotg210->gadget.speed = USB_SPEED_UNKNOWN;
++			fotg210_nuke(fotg210->ep[0], -ESHUTDOWN);
+ 			usb_gadget_udc_reset(&fotg210->gadget,
+ 					     fotg210->driver);
+ 			fotg210_ack_int(fotg210, FOTG210_DISGR2, DISGR2_USBRST_INT);
+@@ -948,6 +1028,8 @@ static irqreturn_t fotg210_irq(int irq,
+ 		}
+ 
+ 		if (int_grp0 & DISGR0_CX_SETUP_INT) {
++			/* a new SETUP aborts the previous control transfer */
++			fotg210_nuke(fotg210->ep[0], -ECONNRESET);
+ 			if (fotg210_setup_packet(fotg210, &ctrl)) {
+ 				spin_unlock(&fotg210->lock);
+ 				if (fotg210->driver->setup(&fotg210->gadget,
+@@ -980,12 +1062,30 @@ static irqreturn_t fotg210_irq(int irq,
+ 		int_grp1 &= ~int_msk1;
+ 
+ 		for (fifo = 0; fifo < FOTG210_MAX_FIFO_NUM; fifo++) {
++			struct fotg210_ep *ep = fotg210->ep[fifo + 1];
++			u32 mask = DISGR1_IN_INT(fifo) | DISGR1_OUT_INT(fifo) |
++				   DISGR1_SPK_INT(fifo);
++
++			if (!(int_grp1 & mask))
++				continue;
++
++			/* FIFO of a disabled endpoint: mask it and move on */
++			if (ep->epnum != fifo + 1) {
++				u32 value = ioread32(fotg210->reg +
++						     FOTG210_DMISGR1);
++
++				value |= DMISGR1_MF_IN_INT(fifo) |
++					 DMISGR1_MF_OUTSPK_INT(fifo);
++				iowrite32(value, fotg210->reg + FOTG210_DMISGR1);
++				continue;
++			}
++
+ 			if (int_grp1 & DISGR1_IN_INT(fifo))
+-				fotg210_in_fifo_handler(fotg210->ep[fifo + 1]);
++				fotg210_in_fifo_handler(ep);
+ 
+ 			if ((int_grp1 & DISGR1_OUT_INT(fifo)) ||
+ 			    (int_grp1 & DISGR1_SPK_INT(fifo)))
+-				fotg210_out_fifo_handler(fotg210->ep[fifo + 1]);
++				fotg210_out_fifo_handler(ep);
+ 		}
+ 	}
+ 

@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/rtc/fortinet,fsoc2-rtc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC2 real-time clock
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  The battery-backed real-time clock of the Fortinet FortiSOC2, three
+  registers of its system control unit (time, date, control) at offsets
+  0x200, 0x204 and 0x210 of the unit. The node covers these registers
+  only, from the time to the control register.
+
+allOf:
+  - $ref: rtc.yaml#
+
+properties:
+  compatible:
+    const: fortinet,fsoc2-rtc
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    rtc@e5100200 {
+        compatible = "fortinet,fsoc2-rtc";
+        reg = <0xe5100200 0x14>;
+    };

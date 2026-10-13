@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/fortinet/fortinet,fsoc3-acp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 accelerator coherency port profiles
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  Block of eleven profiles, 0x20 bytes apart, in front of the accelerator
+  coherency port (ACP) of the Cortex-A9 MPCore of the Fortinet FortiSOC3.
+  Each profile holds an address range and attributes for the masters that
+  reach the memory through the ACP, such as the NP6Lite network processor.
+  The boot loader leaves most of them unset; the operating system programs
+  them early, before the masters that rely on the ACP (marked dma-coherent)
+  are used. The meaning of the fields is not publicly documented.
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-acp
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    acp@fb400000 {
+        compatible = "fortinet,fsoc3-acp";
+        reg = <0xfb400000 0x1000>;
+    };

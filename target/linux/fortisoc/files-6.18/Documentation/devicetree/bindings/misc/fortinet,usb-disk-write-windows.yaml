@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/fortinet,usb-disk-write-windows.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Write windows of an internal dual-slot USB boot disk
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description: |
+  Some appliances boot from an internal USB mass storage disk holding two
+  firmware slots and a data partition, behind a boot sector that names the
+  image of each slot. This node describes that disk and the parts of it an
+  installer running on the appliance may write, so that the operating
+  system can guard the disk: every write is refused, except plain writes
+  lying entirely inside one of the windows while they are armed from user
+  space. A write starting at sector 0 may only change the listed bytes of
+  that sector.
+
+  The node is not a device. The disk is the one USB mass storage disk whose
+  SCSI vendor and model match; without the node, no disk is guarded.
+
+properties:
+  compatible:
+    const: fortinet,usb-disk-write-windows
+
+  fortinet,disk-vendor:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^.{1,8}$"
+    description:
+      Vendor identification of the disk, as its SCSI INQUIRY data gives it,
+      without the trailing spaces.
+
+  fortinet,disk-model:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^.{1,16}$"
+    description:
+      Product identification of the disk, as its SCSI INQUIRY data gives
+      it, without the trailing spaces.
+
+  fortinet,disk-sectors:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    minimum: 1
+    description:
+      Exact size of the disk, in 512-byte sectors. A disk of another size
+      matching the vendor and model is guarded with no window. Without it,
+      the size is not checked.
+
+  fortinet,write-windows:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    maxItems: 4
+    items:
+      items:
+        - description: First 512-byte sector of the window, on the whole disk
+        - description: Number of sectors of the window
+          minimum: 1
+    description:
+      Parts of the disk an installer may write once the windows are armed.
+      Without it, every write to the disk is refused.
+
+  fortinet,sector0-bytes:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    maxItems: 8
+    items:
+      items:
+        - description: Offset of the bytes in sector 0
+          maximum: 511
+        - description: Number of bytes
+          minimum: 1
+          maximum: 512
+    description:
+      Bytes of sector 0 a write to a window starting at sector 0 may
+      change, compared with the content of the sector when the windows are
+      armed. Without it, such a write may not change sector 0 at all.
+
+required:
+  - compatible
+  - fortinet,disk-vendor
+  - fortinet,disk-model
+
+additionalProperties: false
+
+examples:
+  - |
+    write-windows {
+        compatible = "fortinet,usb-disk-write-windows";
+        fortinet,disk-vendor = "VENDOR";
+        fortinet,disk-model = "BOOT_DISK";
+        fortinet,disk-sectors = /bits/ 64 <7913472>;
+        fortinet,write-windows = <0 1>, <1 524288>;
+        fortinet,sector0-bytes = <0x10 32>, <0x128 4>;
+    };

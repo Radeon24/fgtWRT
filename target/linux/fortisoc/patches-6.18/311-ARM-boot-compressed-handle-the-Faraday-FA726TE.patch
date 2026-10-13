@@ -1,0 +1,70 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: boot: compressed: handle the Faraday FA726TE
+
+Let the decompressor recognise the Faraday FA726TE.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/boot/compressed/head.S | 37 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+--- a/arch/arm/boot/compressed/head.S
++++ b/arch/arm/boot/compressed/head.S
+@@ -1034,6 +1034,13 @@ proc_types:
+ 		W(b)	__armv4_mmu_cache_off
+ 		W(b)	__armv5tej_mmu_cache_flush
+ 
++		@ FA726TE: part number 0x726 would match the ARM7 IDs entry below
++		.word	0x66017261		@ FA726TE (ARM926 caches)
++		.word	0xff01fff1
++		W(b)	__arm926ejs_mmu_cache_on
++		W(b)	__fa726_mmu_cache_off
++		W(b)	__fa726_mmu_cache_flush
++
+ 		.word	0x00007000		@ ARM7 IDs
+ 		.word	0x0000f000
+ 		mov	pc, lr
+@@ -1185,6 +1192,26 @@ __armv4_mmu_cache_off:
+ #endif
+ 		mov	pc, lr
+ 
++/*
++ * FA726TE: ARM926-style caches plus a branch target buffer. The decompressor
++ * ran from the very addresses the kernel is inflated to, so stale BTB entries
++ * must go, and prediction (Z, bit 11) is left off as the Fortinet kernel does.
++ */
++__fa726_mmu_cache_off:
++#ifdef CONFIG_MMU
++		mrc	p15, 0, r0, c1, c0
++		bic	r0, r0, #0x000d
++		bic	r0, r0, #0x0800		@ Z: branch prediction off
++		bic	r0, r0, #0x1000		@ I-cache off too
++		mcr	p15, 0, r0, c1, c0	@ turn MMU and cache off
++		mov	r0, #0
++		mcr	p15, 0, r0, c7, c7	@ invalidate whole cache v4
++		mcr	p15, 0, r0, c7, c5, 0	@ invalidate I cache
++		mcr	p15, 0, r0, c7, c5, 6	@ invalidate BTB
++		mcr	p15, 0, r0, c8, c7	@ invalidate whole TLB v4
++#endif
++		mov	pc, lr
++
+ __armv7_mmu_cache_off:
+ 		mrc	p15, 0, r0, c1, c0
+ #ifdef CONFIG_MMU
+@@ -1293,6 +1320,16 @@ __armv5tej_mmu_cache_flush:
+ 		mcr	p15, 0, r0, c7, c10, 4	@ drain WB
+ 		mov	pc, lr
+ 
++__fa726_mmu_cache_flush:
++		tst	r4, #1
++		movne	pc, lr
++1:		mrc	p15, 0, APSR_nzcv, c7, c14, 3	@ test,clean,invalidate D cache
++		bne	1b
++		mcr	p15, 0, r0, c7, c5, 0	@ flush I cache
++		mcr	p15, 0, r0, c7, c5, 6	@ invalidate BTB
++		mcr	p15, 0, r0, c7, c10, 4	@ drain WB
++		mov	pc, lr
++
+ __armv4_mmu_cache_flush:
+ 		tst	r4, #1
+ 		movne	pc, lr

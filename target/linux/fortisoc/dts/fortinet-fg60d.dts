@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/dts-v1/;
+
+#include "fsoc2.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "Fortinet FortiGate 60D";
+	compatible = "fortinet,fg60d", "fortinet,fsoc2";
+
+	aliases {
+		serial0 = &uart0;
+		led-boot = &led_status_orange;
+		led-failsafe = &led_status_orange;
+		led-running = &led_status_green;
+		led-upgrade = &led_status_orange;
+	};
+
+	chosen {
+		stdout-path = "serial0:9600n8";
+	};
+
+	/* Front panel reset button, pressed low */
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
+
+		button-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&gpio1 8 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/*
+	 * STATUS and HA front panel LEDs: one bicolour LED each, one line per
+	 * colour, lit low. Their state is kept as the boot loader left it
+	 * (all off). The led-* aliases (STATUS orange while booting, green
+	 * once running) are read by user space only, the kernel ignores them.
+	 */
+	leds {
+		compatible = "gpio-leds";
+
+		led_status_orange: led-status-orange {
+			color = <LED_COLOR_ID_ORANGE>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&gpio1 10 GPIO_ACTIVE_LOW>;
+			default-state = "keep";
+		};
+
+		led_status_green: led-status-green {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
+			default-state = "keep";
+		};
+
+		led-ha-orange {
+			color = <LED_COLOR_ID_ORANGE>;
+			function = "ha";
+			gpios = <&gpio1 18 GPIO_ACTIVE_LOW>;
+			default-state = "keep";
+		};
+
+		led-ha-green {
+			color = <LED_COLOR_ID_GREEN>;
+			function = "ha";
+			gpios = <&gpio1 19 GPIO_ACTIVE_LOW>;
+			default-state = "keep";
+		};
+	};
+
+	/*
+	 * 2 GiB of RAM; the top 128 MiB are reserved below.
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x78000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Descriptor rings the boot loader leaves the network
+		 * processor running on, until its driver takes over: RX at
+		 * 0x9a00000 with its buffers up to 0x9a20000, TX at 0x9a20420
+		 * with its buffer at 0x9a205c0.
+		 */
+		np_loader: np-loader@9a00000 {
+			reg = <0x09a00000 0x00200000>;
+			no-map;
+		};
+
+		/*
+		 * Packet buffer of the network processor, 0x100 blocks of
+		 * 64 KiB: where the boot loader puts it, so that it finds it
+		 * there again after a reboot.
+		 */
+		np_pbuf: np-pbuf@9c00000 {
+			reg = <0x09c00000 0x01000000>;
+			no-map;
+		};
+
+		/*
+		 * Flow tables of the network processor (hash table, then
+		 * overflow table).
+		 */
+		np_flow: np-flow@3c000000 {
+			reg = <0x3c000000 0x03800000>;
+			no-map;
+		};
+
+		/*
+		 * Security associations of the IPsec engine of the network
+		 * processor (they survive a reboot). Not used by the driver yet, only kept out of the
+		 * memory of the kernel.
+		 */
+		np_sa: np-sa@3fc00000 {
+			reg = <0x3fc00000 0x00400000>;
+			no-map;
+		};
+
+		/*
+		 * Top 128 MiB, kept out of the memory of the kernel, in case the boot loader passes a memory
+		 * size that covers them, which would replace the one above.
+		 */
+		vendor_reserved: memory@78000000 {
+			reg = <0x78000000 0x08000000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * Internal 4 GB USB boot disk: write windows of its installer, armed
+	 * from user space (sector 0, where only the name and build number of
+	 * image 0 may change, and partition 1, the slot of image 0).
+	 */
+	write-windows {
+		compatible = "fortinet,usb-disk-write-windows";
+		fortinet,disk-vendor = "FORTINET";
+		fortinet,disk-model = "S01_V140320_004";
+		fortinet,disk-sectors = /bits/ 64 <7913472>;
+		fortinet,write-windows = <0 1>, <1 524288>;
+		fortinet,sector0-bytes = <0x10 32>, <0x128 4>;
+	};
+};
+
+/*
+ * Only the lines of the button (8) and of the LEDs (10, 11, 18, 19) are
+ * usable. Lines 6, 7, 9 and 23 are enables and resets the boot loader
+ * drives (7, 9 and 23 pulsed low, probably the PHYs and the switch), line
+ * 14 is found high, lines 12, 13, 16 and 17 are found as outputs, all for
+ * an unknown purpose; the other lines up to 19 and 20 to 31 are not
+ * known: all are reserved, never touched.
+ */
+&gpio1 {
+	gpio-reserved-ranges = <0 8>, <9 1>, <12 6>, <20 12>;
+	status = "okay";
+};
+
+/*
+ * The boot loader leaves the L2 cache off; the driver turns it on.
+ */
+&l2 {
+	status = "okay";
+};
+
+/*
+ * The base MAC address comes from the boot flash (mac_base below). Not a
+ * device, the cell would hold the probe of the network processor forever
+ * if the flash failed: the driver waits for it until the end of the boot,
+ * then takes the base from the logical interface table.
+ *
+ * Reset pins of the NP GPIO block (0 = switch link, 2 = wan1 PHY, 4 = wan2
+ * PHY, active low): the boot loader drives them high on its TFTP path only;
+ * the driver pulses them low then leaves them outputs at 1 at its probe, so
+ * that the kernel also finds its PHYs and switch when booted from the boot
+ * device.
+ */
+&np {
+	memory-region = <&np_pbuf>, <&np_loader>, <&np_flow>, <&np_sa>;
+	nvmem-cells = <&mac_base 0>;
+	nvmem-cell-names = "mac-base";
+	post-init-providers = <&mac_base>;
+	fortinet,reset-pins = <0 2 4>;
+	status = "okay";
+};
+
+/*
+ * BCM54612E PHYs of WAN1 and WAN2, and the BCM53128 switch, managed through
+ * its pseudo-PHY. The internal PHYs of the switch, at the address of their
+ * port, are reached by the switch driver.
+ */
+&np_mdio {
+	wan1_phy: ethernet-phy@18 {
+		reg = <0x18>;
+
+		leds {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* Speed: one bicolour LED between the LED1 and LED2 pins */
+			led@0 {
+				reg = <0>;
+				color = <LED_COLOR_ID_GREEN>;
+				function = LED_FUNCTION_SPEED_WAN;
+			};
+
+			led@1 {
+				reg = <1>;
+				color = <LED_COLOR_ID_ORANGE>;
+				function = LED_FUNCTION_SPEED_WAN;
+			};
+
+			/* Link and activity */
+			led@2 {
+				reg = <2>;
+				color = <LED_COLOR_ID_GREEN>;
+				function = LED_FUNCTION_WAN;
+			};
+		};
+	};
+
+	wan2_phy: ethernet-phy@19 {
+		reg = <0x19>;
+
+		leds {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* Speed: one bicolour LED between the LED1 and LED2 pins */
+			led@0 {
+				reg = <0>;
+				color = <LED_COLOR_ID_GREEN>;
+				function = LED_FUNCTION_SPEED_WAN;
+			};
+
+			led@1 {
+				reg = <1>;
+				color = <LED_COLOR_ID_ORANGE>;
+				function = LED_FUNCTION_SPEED_WAN;
+			};
+
+			/* Link and activity */
+			led@2 {
+				reg = <2>;
+				color = <LED_COLOR_ID_GREEN>;
+				function = LED_FUNCTION_WAN;
+			};
+		};
+	};
+
+	ethernet-switch@1e {
+		compatible = "brcm,bcm53128";
+		reg = <30>;
+		/*
+		 * Traffic class 7 on every user port: the network processor
+		 * classes the frames of the switch on their tag (port and
+		 * class) and never matches port 0 (dmz) in class 0.
+		 */
+		brcm,port-traffic-class = <7>;
+
+		/* Front panel ports in reverse order, DMZ on port 0 */
+		ethernet-ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ethernet-port@0 {
+				reg = <0>;
+				label = "dmz";
+			};
+
+			ethernet-port@1 {
+				reg = <1>;
+				label = "internal7";
+			};
+
+			ethernet-port@2 {
+				reg = <2>;
+				label = "internal6";
+			};
+
+			ethernet-port@3 {
+				reg = <3>;
+				label = "internal5";
+			};
+
+			ethernet-port@4 {
+				reg = <4>;
+				label = "internal4";
+			};
+
+			ethernet-port@5 {
+				reg = <5>;
+				label = "internal3";
+			};
+
+			ethernet-port@6 {
+				reg = <6>;
+				label = "internal2";
+			};
+
+			ethernet-port@7 {
+				reg = <7>;
+				label = "internal1";
+			};
+
+			/* IMP port, RGMII to link 0 of the network processor */
+			ethernet-port@8 {
+				reg = <8>;
+				ethernet = <&np_port0>;
+				/* The switch adds the RGMII delays of the link. */
+				phy-mode = "rgmii";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * RGMII link to the IMP port of the switch, DSA conduit. The network
+ * processor classes the frames of each switch port on a logical interface
+ * (LIF) of its own: dmz on LIF 1, internal7 to internal1 (ports 1 to 7) on
+ * LIFs 10 to 4; "fortinet,switch-logical-interfaces" gives the LIF of
+ * switch port 0 to 7. The conduit takes LIF 11 for the frames of the
+ * switch the network processor does not class by port. LIFs above 8 need
+ * FORTINET_NP4LITE_DSA: without it, the network processor refuses them at
+ * probe.
+ */
+&np_port0 {
+	/* No delay on this side: the switch adds them. */
+	phy-mode = "rgmii";
+	fortinet,logical-interface = <11>;
+	fortinet,switch-logical-interfaces = <1 10 9 8 7 6 5 4>;
+	status = "okay";
+	fixed-link { speed = <1000>; full-duplex; };
+};
+
+/*
+ * RGMII delays in the PHYs, as their strapping sets them (the network
+ * processor adds none).
+ */
+&np_port2 {
+	label = "wan1";
+	phy-handle = <&wan1_phy>;
+	phy-mode = "rgmii-id";
+	status = "okay";
+};
+
+&np_port3 {
+	label = "wan2";
+	phy-handle = <&wan2_phy>;
+	phy-mode = "rgmii-id";
+	status = "okay";
+};
+
+/*
+ * SPI NOR flash of the boot loader (Winbond W25X40CL, 512 KiB), read only.
+ * Only its factory data block is described, which holds the base MAC
+ * address of the appliance: 6 bytes, binary, at 0x1880 into the block; port n of the network processor gets the base + n.
+ */
+&ssp0 {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@3c000 {
+				label = "factory";
+				reg = <0x3c000 0x4000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					mac_base: mac-address@1880 {
+						compatible = "mac-base";
+						reg = <0x1880 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+/* Front panel "MGMT" port, the device side */
+&udc {
+	status = "okay";
+};
+
+/* Front panel "USB" type A port */
+&usb0 {
+	status = "okay";
+};
+
+/*
+ * The two internal USB flash drives (4 and 8 GB, usb-storage) are both
+ * behind the second controller.
+ */
+&usb1 {
+	status = "okay";
+};
