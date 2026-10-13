@@ -1,0 +1,139 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] net: dsa: mv88e6xxx: add RGMII delay support for the 88E6161
+
+Support the RGMII delays of the 88E6161.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/net/dsa/mv88e6xxx/chip.c | 13 +++++++-
+ drivers/net/dsa/mv88e6xxx/port.c | 59 +++++++++++++++++++++++++++++++++
+ drivers/net/dsa/mv88e6xxx/port.h |  7 ++++
+ 3 files changed, 78 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/dsa/mv88e6xxx/chip.c
++++ b/drivers/net/dsa/mv88e6xxx/chip.c
+@@ -543,6 +543,16 @@ static void mv88e6185_phylink_get_caps(s
+ 				   MAC_1000FD;
+ }
+ 
++static void mv88e6161_phylink_get_caps(struct mv88e6xxx_chip *chip, int port,
++				       struct phylink_config *config)
++{
++	mv88e6185_phylink_get_caps(chip, port, config);
++
++	/* Port 5 can be wired as RGMII, which its C_MODE value does not tell */
++	if (port == 5)
++		phy_interface_set_rgmii(config->supported_interfaces);
++}
++
+ static const u8 mv88e6xxx_phy_interface_modes[] = {
+ 	[MV88E6XXX_PORT_STS_CMODE_MII_PHY]	= PHY_INTERFACE_MODE_REVMII,
+ 	[MV88E6XXX_PORT_STS_CMODE_MII]		= PHY_INTERFACE_MODE_MII,
+@@ -4489,6 +4499,7 @@ static const struct mv88e6xxx_ops mv88e6
+ 	.phy_write_c45 = mv88e6xxx_g2_smi_phy_write_c45,
+ 	.port_set_link = mv88e6xxx_port_set_link,
+ 	.port_sync_link = mv88e6xxx_port_sync_link,
++	.port_set_rgmii_delay = mv88e6161_port_set_rgmii_delay,
+ 	.port_set_speed_duplex = mv88e6185_port_set_speed_duplex,
+ 	.port_tag_remap = mv88e6095_port_tag_remap,
+ 	.port_set_policy = mv88e6352_port_set_policy,
+@@ -4521,7 +4532,7 @@ static const struct mv88e6xxx_ops mv88e6
+ 	.stu_loadpurge = mv88e6352_g1_stu_loadpurge,
+ 	.avb_ops = &mv88e6165_avb_ops,
+ 	.ptp_ops = &mv88e6165_ptp_ops,
+-	.phylink_get_caps = mv88e6185_phylink_get_caps,
++	.phylink_get_caps = mv88e6161_phylink_get_caps,
+ 	.set_max_frame_size = mv88e6185_g1_set_max_frame_size,
+ };
+ 
+--- a/drivers/net/dsa/mv88e6xxx/port.c
++++ b/drivers/net/dsa/mv88e6xxx/port.c
+@@ -144,6 +144,65 @@ int mv88e6320_port_set_rgmii_delay(struc
+ 	return mv88e6xxx_port_set_rgmii_delay(chip, port, mode);
+ }
+ 
++/* The 6161 has no RGMII delay bits in its MAC control register. The clock
++ * delays of port 5, its only RGMII capable port, are in a hidden register.
++ */
++int mv88e6161_port_set_rgmii_delay(struct mv88e6xxx_chip *chip, int port,
++				   phy_interface_t mode)
++{
++	u16 reg, val;
++	int err;
++
++	if (port != 5)
++		return -EOPNOTSUPP;
++
++	switch (mode) {
++	case PHY_INTERFACE_MODE_RGMII:
++		val = 0;
++		break;
++	case PHY_INTERFACE_MODE_RGMII_RXID:
++		val = MV88E6161_HIDDEN_RGMII_TIMING_P5_RXCLK;
++		break;
++	case PHY_INTERFACE_MODE_RGMII_TXID:
++		val = MV88E6161_HIDDEN_RGMII_TIMING_P5_TXCLK;
++		break;
++	case PHY_INTERFACE_MODE_RGMII_ID:
++		val = MV88E6161_HIDDEN_RGMII_TIMING_P5_RXCLK |
++		      MV88E6161_HIDDEN_RGMII_TIMING_P5_TXCLK;
++		break;
++	default:
++		return 0;
++	}
++
++	err = mv88e6xxx_port_hidden_read(chip,
++					 MV88E6XXX_HIDDEN_RGMII_TIMING_BLOCK,
++					 MV88E6XXX_HIDDEN_RGMII_TIMING_PORT,
++					 MV88E6XXX_HIDDEN_RGMII_TIMING_REG, &reg);
++	if (err)
++		return err;
++
++	reg &= ~(MV88E6161_HIDDEN_RGMII_TIMING_P5_RXCLK |
++		 MV88E6161_HIDDEN_RGMII_TIMING_P5_TXCLK);
++	reg |= val;
++
++	err = mv88e6xxx_port_hidden_write(chip,
++					  MV88E6XXX_HIDDEN_RGMII_TIMING_BLOCK,
++					  MV88E6XXX_HIDDEN_RGMII_TIMING_PORT,
++					  MV88E6XXX_HIDDEN_RGMII_TIMING_REG, reg);
++	if (err)
++		return err;
++
++	err = mv88e6xxx_port_hidden_wait(chip);
++	if (err)
++		return err;
++
++	dev_dbg(chip->dev, "p%d: delay RXCLK %s, TXCLK %s\n", port,
++		val & MV88E6161_HIDDEN_RGMII_TIMING_P5_RXCLK ? "yes" : "no",
++		val & MV88E6161_HIDDEN_RGMII_TIMING_P5_TXCLK ? "yes" : "no");
++
++	return 0;
++}
++
+ int mv88e6xxx_port_set_link(struct mv88e6xxx_chip *chip, int port, int link)
+ {
+ 	u16 reg;
+--- a/drivers/net/dsa/mv88e6xxx/port.h
++++ b/drivers/net/dsa/mv88e6xxx/port.h
+@@ -471,6 +471,11 @@
+ #define MV88E6XXX_HIDDEN_RGMII_TIMING_BLOCK	0x0
+ #define MV88E6XXX_HIDDEN_RGMII_TIMING_PORT	0xf
+ #define MV88E6XXX_HIDDEN_RGMII_TIMING_REG	0x7
++/* 6161: RGMII clock delays of port 5. RXCLK delays the clock received from
++ * the link partner, TXCLK the clock sent to it.
++ */
++#define MV88E6161_HIDDEN_RGMII_TIMING_P5_RXCLK	0x0010
++#define MV88E6161_HIDDEN_RGMII_TIMING_P5_TXCLK	0x0008
+ 
+ int mv88e6xxx_port_read(struct mv88e6xxx_chip *chip, int port, int reg,
+ 			u16 *val);
+@@ -481,6 +486,8 @@ int mv88e6xxx_port_wait_bit(struct mv88e
+ 
+ int mv88e6185_port_set_pause(struct mv88e6xxx_chip *chip, int port,
+ 			     int pause);
++int mv88e6161_port_set_rgmii_delay(struct mv88e6xxx_chip *chip, int port,
++				   phy_interface_t mode);
+ int mv88e6320_port_set_rgmii_delay(struct mv88e6xxx_chip *chip, int port,
+ 				   phy_interface_t mode);
+ int mv88e6352_port_set_rgmii_delay(struct mv88e6xxx_chip *chip, int port,
