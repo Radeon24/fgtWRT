@@ -1,0 +1,30 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] leds: trigger: netdev: stop the software blink before offloading
+
+The trigger drives the LED in software until its mode can be offloaded:
+a blink it started, or a brightness it queued, could still run after
+the offload and overwrite the setting handed to the hardware (PHY LEDs
+of the BCM54612E left lit without activity).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/leds/trigger/ledtrig-netdev.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/drivers/leds/trigger/ledtrig-netdev.c
++++ b/drivers/leds/trigger/ledtrig-netdev.c
+@@ -85,6 +85,14 @@ static void set_baseline_state(struct le
+ 
+ 	/* Already validated, hw control is possible with the requested mode */
+ 	if (trigger_data->hw_control) {
++		/*
++		 * The LED may have been driven in software just before, with a
++		 * blink still running or a brightness still queued: stop and
++		 * flush them, or they overwrite the setting handed to the
++		 * hardware.
++		 */
++		led_stop_software_blink(led_cdev);
++		flush_work(&led_cdev->set_brightness_work);
+ 		led_cdev->hw_control_set(led_cdev, trigger_data->mode);
+ 
+ 		return;
