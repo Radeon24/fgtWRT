@@ -1,0 +1,50 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] net: dsa: b53: keep BCM53128 trunk members out of each other's masks
+
+Trunk members must not forward to each other.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/net/dsa/b53/b53_common.c |  7 +++++++
+ drivers/net/dsa/b53/b53_priv.h   | 14 ++++++++++++++
+ 2 files changed, 21 insertions(+)
+
+--- a/drivers/net/dsa/b53/b53_common.c
++++ b/drivers/net/dsa/b53/b53_common.c
+@@ -2502,6 +2502,13 @@ int b53_br_join(struct dsa_switch *ds, i
+ 		if (!dsa_port_offloads_bridge(dsa_to_port(ds, i), &bridge))
+ 			continue;
+ 
++		/* Keep the members of a trunk out of each other's egress
++		 * masks: whether the switch floods a frame back to the group
++		 * it came from is not documented.
++		 */
++		if (b53_lag_siblings(dev, port, i))
++			continue;
++
+ 		/* Add this local port to the remote port VLAN control
+ 		 * membership and update the remote port bitmask
+ 		 */
+--- a/drivers/net/dsa/b53/b53_priv.h
++++ b/drivers/net/dsa/b53/b53_priv.h
+@@ -242,6 +242,20 @@ static inline bool b53_has_trunk(struct
+ 	       dev->chip_id == BCM53128_DEVICE_ID;
+ }
+ 
++/* Two ports of the same offloaded link aggregation group */
++static inline bool b53_lag_siblings(struct b53_device *dev, int a, int b)
++{
++	struct dsa_port *dpa, *dpb;
++
++	if (!b53_has_trunk(dev) || a == b)
++		return false;
++
++	dpa = dsa_to_port(dev->ds, a);
++	dpb = dsa_to_port(dev->ds, b);
++
++	return dpa && dpb && dpa->lag && dpa->lag == dpb->lag;
++}
++
+ static inline void b53_lag_set_speed(struct b53_device *dev, int port,
+ 				     int speed)
+ {

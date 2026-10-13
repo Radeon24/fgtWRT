@@ -1,0 +1,249 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] net: dsa: b53: add an optional port-based traffic class for the BCM53128
+
+Read the optional brcm,port-traffic-class property (0 to 7, default 0,
+BCM53128 only): the traffic class given to frames received on the user
+ports, which a network processor behind the CPU port may use to classify
+them.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ ...ation/devicetree/bindings/net/dsa/brcm,b53.yaml | 25 ++++
+ drivers/net/dsa/b53/b53_common.c                   | 93 ++++++++++++++-
+ drivers/net/dsa/b53/b53_priv.h                     |  1 +
+ drivers/net/dsa/b53/b53_regs.h                     |  2 +
+ 4 files changed, 117 insertions(+), 4 deletions(-)
+
+--- a/Documentation/devicetree/bindings/net/dsa/brcm,b53.yaml
++++ b/Documentation/devicetree/bindings/net/dsa/brcm,b53.yaml
+@@ -72,6 +72,21 @@ properties:
+       which contains phy control registers
+     $ref: /schemas/types.yaml#/definitions/phandle
+ 
++  brcm,port-traffic-class:
++    description:
++      Traffic class given to every frame entering the switch through a
++      user port, whatever its 802.1p priority or DSCP (port-based QoS,
++      with this value as the priority of the default 802.1Q tag of each
++      user port). The switch reports that class in the tag of the frames
++      it sends to the CPU, which a conduit classifying frames on it may
++      need. The switch also puts this value in the PCP of the 802.1Q tags
++      it adds to untagged frames; the egress queues are unchanged. 0 (the
++      default) leaves port-based QoS off.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 0
++    maximum: 7
++    default: 0
++
+ required:
+   - compatible
+   - reg
+@@ -95,6 +110,16 @@ allOf:
+     then:
+       $ref: /schemas/spi/spi-peripheral-props.yaml
+ 
++  - if:
++      properties:
++        compatible:
++          not:
++            contains:
++              const: brcm,bcm53128
++    then:
++      properties:
++        brcm,port-traffic-class: false
++
+     # BCM585xx/586xx/88312 SoCs
+   - if:
+       properties:
+--- a/drivers/net/dsa/b53/b53_common.c
++++ b/drivers/net/dsa/b53/b53_common.c
+@@ -17,6 +17,7 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/delay.h>
+ #include <linux/export.h>
+ #include <linux/gpio.h>
+@@ -25,6 +26,7 @@
+ #include <linux/minmax.h>
+ #include <linux/module.h>
+ #include <linux/platform_data/b53.h>
++#include <linux/property.h>
+ #include <linux/phy.h>
+ #include <linux/phylink.h>
+ #include <linux/etherdevice.h>
+@@ -945,6 +947,81 @@ static u16 b53_default_pvid(struct b53_d
+ 	return 0;
+ }
+ 
++/* Port-based traffic class ("brcm,port-traffic-class", BCM53128 only):
++ * with PORT_QOS_EN set in the QoS global control register, the switch
++ * gives every frame entering a port the priority field of that port's
++ * default tag as its traffic class, 802.1p and DSCP ignored (datasheet
++ * 53128-DS07-R, QoS and pages 30h, 34h), and reports it in the tag of the
++ * frames it sends to the IMP. Every write of a default tag goes through
++ * b53_def_tag(), so that no VLAN operation puts the priority back to 0.
++ *
++ * User ports only: the class of a frame sent to the CPU is the one of
++ * its input port, and frames from the CPU come with a tag of their own
++ * (opcode 1, class from the tag); the IMP keeps its reset priority.
++ * 0 (the default, or no property) leaves both registers untouched.
++ */
++static void b53_port_tc_init(struct b53_device *dev)
++{
++	u32 tc = 0;
++
++	dev->port_tc = 0;
++	if (device_property_read_u32(dev->dev, "brcm,port-traffic-class", &tc))
++		return;
++	if (dev->chip_id != BCM53128_DEVICE_ID) {
++		dev_warn(dev->dev, "brcm,port-traffic-class ignored, BCM53128 only\n");
++		return;
++	}
++	if (tc > FIELD_MAX(B53_DEF_TAG_PRI)) {
++		dev_err(dev->dev, "brcm,port-traffic-class %u out of range\n",
++			tc);
++		return;
++	}
++	dev->port_tc = tc;
++}
++
++static u16 b53_def_tag(struct b53_device *dev, int port, u16 vid)
++{
++	if (!dev->port_tc || !dsa_is_user_port(dev->ds, port))
++		return vid;
++
++	return vid | FIELD_PREP(B53_DEF_TAG_PRI, dev->port_tc);
++}
++
++/* Read-modify-write of PORT_QOS_EN alone: the aggregation mode (bit 7,
++ * COS of the IMP by reason, not by class) and the QoS layer select
++ * (bits 3:2) keep their value. Nothing else of page 30h is written.
++ */
++static void b53_port_tc_setup(struct b53_device *dev)
++{
++	u8 old = 0, new = 0;
++
++	if (!dev->port_tc)
++		return;
++
++	b53_read8(dev, B53_QOS_PAGE, B53_QOS_GLOBAL_CTL, &old);
++	b53_write8(dev, B53_QOS_PAGE, B53_QOS_GLOBAL_CTL,
++		   old | B53_QOS_PORT_QOS_EN);
++	b53_read8(dev, B53_QOS_PAGE, B53_QOS_GLOBAL_CTL, &new);
++	dev_info(dev->dev, "port-based traffic class %u: QoS global control %#04x -> %#04x\n",
++		 dev->port_tc, old, new);
++}
++
++static void b53_port_tc_show(struct b53_device *dev)
++{
++	unsigned int port;
++	u16 tag;
++
++	if (!dev->port_tc)
++		return;
++
++	b53_for_each_port(dev, port) {
++		tag = 0;
++		b53_read16(dev, B53_VLAN_PAGE, B53_VLAN_PORT_DEF_TAG(port),
++			   &tag);
++		dev_info(dev->dev, "port %u default tag %#06x\n", port, tag);
++	}
++}
++
+ static bool b53_vlan_port_needs_forced_tagged(struct dsa_switch *ds, int port)
+ {
+ 	struct b53_device *dev = ds->priv;
+@@ -1003,7 +1080,7 @@ int b53_configure_vlan(struct dsa_switch
+ 		if (!b53_vlan_port_needs_forced_tagged(ds, i))
+ 			vl.untag = vl.members;
+ 		b53_write16(dev, B53_VLAN_PAGE, B53_VLAN_PORT_DEF_TAG(i),
+-			    def_vid);
++			    b53_def_tag(dev, i, def_vid));
+ 	}
+ 	b53_set_vlan_entry(dev, def_vid, &vl);
+ 
+@@ -1025,7 +1102,8 @@ int b53_configure_vlan(struct dsa_switch
+ 			if (!dsa_is_cpu_port(ds, i))
+ 				b53_write16(dev, B53_VLAN_PAGE,
+ 					    B53_VLAN_PORT_DEF_TAG(i),
+-					    dev->ports[i].pvid);
++					    b53_def_tag(dev, i,
++							dev->ports[i].pvid));
+ 		}
+ 	}
+ 
+@@ -1575,6 +1653,8 @@ static int b53_setup(struct dsa_switch *
+ 		ds->ageing_time_max = AGE_TIME_MAX * 1000;
+ 	}
+ 
++	b53_port_tc_init(dev);
++
+ 	ret = b53_reset_switch(dev);
+ 	if (ret) {
+ 		dev_err(ds->dev, "failed to reset switch\n");
+@@ -1592,12 +1672,16 @@ static int b53_setup(struct dsa_switch *
+ 
+ 	b53_reset_mib(dev);
+ 
++	b53_port_tc_setup(dev);
++
+ 	ret = b53_apply_config(dev);
+ 	if (ret) {
+ 		dev_err(ds->dev, "failed to apply configuration\n");
+ 		return ret;
+ 	}
+ 
++	b53_port_tc_show(dev);
++
+ 	if (b53_has_trunk(dev)) {
+ 		b53_lag_clear(dev, true);
+ 		ds->num_lag_ids = B53_NUM_TRUNKS;
+@@ -2047,7 +2131,7 @@ int b53_vlan_add(struct dsa_switch *ds,
+ 
+ 	if (!dsa_is_cpu_port(ds, port) && new_pvid != old_pvid) {
+ 		b53_write16(dev, B53_VLAN_PAGE, B53_VLAN_PORT_DEF_TAG(port),
+-			    new_pvid);
++			    b53_def_tag(dev, port, new_pvid));
+ 		b53_fast_age_vlan(dev, old_pvid);
+ 	}
+ 
+@@ -2085,7 +2169,8 @@ int b53_vlan_del(struct dsa_switch *ds,
+ 	b53_set_vlan_entry(dev, vlan->vid, vl);
+ 	b53_fast_age_vlan(dev, vlan->vid);
+ 
+-	b53_write16(dev, B53_VLAN_PAGE, B53_VLAN_PORT_DEF_TAG(port), pvid);
++	b53_write16(dev, B53_VLAN_PAGE, B53_VLAN_PORT_DEF_TAG(port),
++		    b53_def_tag(dev, port, pvid));
+ 	b53_fast_age_vlan(dev, pvid);
+ 
+ 	return 0;
+--- a/drivers/net/dsa/b53/b53_priv.h
++++ b/drivers/net/dsa/b53/b53_priv.h
+@@ -172,6 +172,7 @@ struct b53_device {
+ 
+ 	/* run time configuration */
+ 	bool enable_jumbo;
++	u8 port_tc;	/* brcm,port-traffic-class, 0: off */
+ 
+ 	unsigned int num_vlans;
+ 	struct b53_vlan *vlans;
+--- a/drivers/net/dsa/b53/b53_regs.h
++++ b/drivers/net/dsa/b53/b53_regs.h
+@@ -431,6 +431,7 @@
+ 
+ /* Global QoS Control (8 bit) */
+ #define B53_QOS_GLOBAL_CTL		0x00
++#define   B53_QOS_PORT_QOS_EN		BIT(6) /* BCM53128: TC = port priority */
+ 
+ /* Enable 802.1Q for individual Ports (16 bit) */
+ #define B53_802_1P_EN			0x04
+@@ -525,6 +526,7 @@
+ 
+ /* VLAN Port Default Tag (16 bit) */
+ #define B53_VLAN_PORT_DEF_TAG(i)	(0x10 + 2 * (i))
++#define   B53_DEF_TAG_PRI		GENMASK(15, 13)
+ 
+ /*************************************************************************
+  * Jumbo Frame Page Registers

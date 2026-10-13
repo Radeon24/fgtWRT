@@ -1,0 +1,164 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] net: dsa: b53: enable a DSA link port and bridge across it
+
+The two BCM53128 of the FortiGate 90D are joined by a cascade, switch 0
+port 0 <-> switch 1 port 7. In one DSA tree this is a DSA link,
+which b53 never enables (b53_setup disables every non-CPU port and
+b53_enable_port returns early for anything but a user port).
+
+Enable it: RX/TX open, learning on, port VLAN mask = itself, the CPU port
+and the local ports of the bridge spanning the cascade. b53_br_join and
+b53_br_leave add and remove the cascade in the mask of the bridged port
+and the bridged port in the mask of the cascade; the other switch does
+the same for its own ports when they join, so no crosschip_bridge_*
+operation is needed. The egress mask of the cascade is a union: only one
+bridge may span it, a port of another bridge in the tree is refused with
+-EOPNOTSUPP (bridged in software). Nothing changes for a switch without
+a DSA link (60D, 60E).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/net/dsa/b53/b53_common.c | 84 +++++++++++++++++++++++++++++++++
+ 1 file changed, 84 insertions(+)
+
+--- a/drivers/net/dsa/b53/b53_common.c
++++ b/drivers/net/dsa/b53/b53_common.c
+@@ -764,6 +764,45 @@ static inline void b53_port_phy_power_up
+ }
+ #endif /* CONFIG_NET_DSA_B53_LAG_PHY_PDOWN */
+ 
++/* The DSA link (cascade) port of this switch, or -1 (one at most here) */
++static int b53_dsa_link_port(struct dsa_switch *ds)
++{
++	struct dsa_port *dp;
++
++	dsa_switch_for_each_port(dp, ds)
++		if (dsa_port_is_dsa(dp))
++			return dp->index;
++
++	return -1;
++}
++
++/* The cascade between two switches of one tree carries no Broadcom tag; its
++ * egress mask holds the CPU port (a frame flooded across comes back to the
++ * host on the other switch with the cascade as its source port and is
++ * dropped by the tagger) and the local ports of the bridge spanning the
++ * cascade.
++ */
++static int b53_enable_dsa_port(struct dsa_switch *ds, int port)
++{
++	struct b53_device *dev = ds->priv;
++	unsigned int cpu_port = dsa_to_port(ds, port)->cpu_dp->index;
++	u16 pvlan;
++
++	/* Clear the Rx and Tx disable bits and set to no spanning tree */
++	b53_write8(dev, B53_CTRL_PAGE, B53_PORT_CTRL(port), 0);
++
++	b53_port_set_learning(dev, port, true);
++
++	b53_read16(dev, B53_PVLAN_PAGE, B53_PVLAN_PORT_MASK(port), &pvlan);
++	pvlan &= ~0x1ff;
++	pvlan |= BIT(port) | BIT(cpu_port) | dev->ports[port].vlan_ctl_mask;
++	b53_write16(dev, B53_PVLAN_PAGE, B53_PVLAN_PORT_MASK(port), pvlan);
++
++	dev_info(ds->dev, "port %d: DSA link (cascade) enabled\n", port);
++
++	return 0;
++}
++
+ int b53_enable_port(struct dsa_switch *ds, int port, struct phy_device *phy)
+ {
+ 	struct b53_device *dev = ds->priv;
+@@ -771,6 +810,9 @@ int b53_enable_port(struct dsa_switch *d
+ 	int ret = 0;
+ 	u16 pvlan;
+ 
++	if (dsa_is_dsa_port(ds, port))
++		return b53_enable_dsa_port(ds, port);
++
+ 	if (!dsa_is_user_port(ds, port))
+ 		return 0;
+ 
+@@ -2634,12 +2676,28 @@ int b53_mdb_del(struct dsa_switch *ds, i
+ }
+ EXPORT_SYMBOL(b53_mdb_del);
+ 
++/* Only one bridge may span the cascade: the egress mask of the cascade port
++ * is a union, two bridges would leak into each other through it. A port of
++ * another bridge is refused (-EOPNOTSUPP: bridged in software instead).
++ */
++static bool b53_dsa_link_busy(struct dsa_switch *ds, struct dsa_bridge *bridge)
++{
++	struct dsa_port *dp;
++
++	dsa_tree_for_each_user_port(dp, ds->dst)
++		if (dp->bridge && dp->bridge->dev != bridge->dev)
++			return true;
++
++	return false;
++}
++
+ int b53_br_join(struct dsa_switch *ds, int port, struct dsa_bridge bridge,
+ 		bool *tx_fwd_offload, struct netlink_ext_ack *extack)
+ {
+ 	struct b53_device *dev = ds->priv;
+ 	struct b53_vlan *vl;
+ 	s8 cpu_port = dsa_to_port(ds, port)->cpu_dp->index;
++	int link = b53_dsa_link_port(ds);
+ 	u16 pvlan, reg, pvid;
+ 	unsigned int i;
+ 
+@@ -2649,6 +2707,12 @@ int b53_br_join(struct dsa_switch *ds, i
+ 	if (dev->chip_id == BCM7278_DEVICE_ID && port == 7)
+ 		return -EINVAL;
+ 
++	if (link >= 0 && b53_dsa_link_busy(ds, &bridge)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Only one bridge across the switch cascade");
++		return -EOPNOTSUPP;
++	}
++
+ 	pvid = b53_default_pvid(dev);
+ 	vl = &dev->vlans[pvid];
+ 
+@@ -2695,6 +2759,17 @@ int b53_br_join(struct dsa_switch *ds, i
+ 		pvlan |= BIT(i);
+ 	}
+ 
++	/* The bridge spans the cascade: this port and the cascade port reach
++	 * each other (the other switch adds its own ports to its side).
++	 */
++	if (link >= 0) {
++		b53_read16(dev, B53_PVLAN_PAGE, B53_PVLAN_PORT_MASK(link), &reg);
++		reg |= BIT(port);
++		b53_write16(dev, B53_PVLAN_PAGE, B53_PVLAN_PORT_MASK(link), reg);
++		dev->ports[link].vlan_ctl_mask |= BIT(port);
++		pvlan |= BIT(link);
++	}
++
+ 	/* Disable redirection of unknown SA to the CPU port */
+ 	b53_set_eap_mode(dev, port, EAP_MODE_BASIC);
+ 
+@@ -2713,6 +2788,7 @@ void b53_br_leave(struct dsa_switch *ds,
+ 	struct b53_device *dev = ds->priv;
+ 	struct b53_vlan *vl;
+ 	s8 cpu_port = dsa_to_port(ds, port)->cpu_dp->index;
++	int link = b53_dsa_link_port(ds);
+ 	unsigned int i;
+ 	u16 pvlan, reg, pvid;
+ 
+@@ -2733,6 +2809,14 @@ void b53_br_leave(struct dsa_switch *ds,
+ 			pvlan &= ~BIT(i);
+ 	}
+ 
++	if (link >= 0) {
++		b53_read16(dev, B53_PVLAN_PAGE, B53_PVLAN_PORT_MASK(link), &reg);
++		reg &= ~BIT(port);
++		b53_write16(dev, B53_PVLAN_PAGE, B53_PVLAN_PORT_MASK(link), reg);
++		dev->ports[link].vlan_ctl_mask &= ~BIT(port);
++		pvlan &= ~BIT(link);
++	}
++
+ 	/* Enable redirection of unknown SA to the CPU port */
+ 	b53_set_eap_mode(dev, port, EAP_MODE_SIMPLIFIED);
+ 

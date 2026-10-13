@@ -1,0 +1,171 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] net: dsa: b53: power the PHY of a BCM53128 user port down while it is down
+
+Add NET_DSA_B53_LAG_PHY_PDOWN so that the link partner sees the port go
+down.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/net/dsa/b53/Kconfig      | 17 ++++++
+ drivers/net/dsa/b53/b53_common.c | 90 +++++++++++++++++++++++++++++++++
+ drivers/net/dsa/b53/b53_priv.h   |  7 +++
+ 3 files changed, 114 insertions(+)
+
+--- a/drivers/net/dsa/b53/Kconfig
++++ b/drivers/net/dsa/b53/Kconfig
+@@ -26,6 +26,23 @@ config NET_DSA_B53_LAG
+ 	  Without this option, the driver never accesses the trunk
+ 	  registers. If unsure, say N.
+ 
++config NET_DSA_B53_LAG_PHY_PDOWN
++	bool "Power the PHY of a BCM53128 user port down while it is down"
++	depends on NET_DSA_B53_LAG
++	default n
++	help
++	  Power the internal PHY of a BCM53128 user port down (BMCR power
++	  down bit) while the port is administratively down, so that the
++	  link partner sees the link go down: an 802.3ad aggregate then
++	  fails over at once on "ip link set ... down", instead of at the
++	  LACP timeout of the partner. The PHY is powered up again when the
++	  port is brought up and at shutdown. PHYs with Wake-on-LAN armed
++	  are left powered.
++
++	  Without this option, a port brought down keeps its PHY powered and
++	  its link up, as with the other DSA drivers. The generic way would
++	  be .suspend/.resume callbacks in the PHY driver. If unsure, say N.
++
+ config B53_SPI_DRIVER
+ 	tristate "B53 SPI connected switch driver"
+ 	depends on B53 && SPI
+--- a/drivers/net/dsa/b53/b53_common.c
++++ b/drivers/net/dsa/b53/b53_common.c
+@@ -677,6 +677,91 @@ int b53_setup_port(struct dsa_switch *ds
+ }
+ EXPORT_SYMBOL(b53_setup_port);
+ 
++#if IS_ENABLED(CONFIG_NET_DSA_B53_LAG_PHY_PDOWN)
++/* NET_DSA_B53_LAG_PHY_PDOWN, BCM53128 only: power the internal PHY of a
++ * user port down while the port is down, so that its link partner loses
++ * the link instead of keeping it up until the LACP timeout. phy_stop()
++ * would do it through phy_suspend(), but the "Broadcom BCM53128" PHY driver
++ * has no suspend callback: set and clear BMCR_PDOWN here, through phylib
++ * like the link polling. A PHY with Wake-on-LAN armed is left powered.
++ */
++static struct phy_device *b53_user_int_phy(struct b53_device *dev, int port)
++{
++	struct dsa_port *dp = dsa_to_port(dev->ds, port);
++	struct phy_device *phydev;
++
++	if (!b53_has_trunk(dev) || !dp || !dsa_port_is_user(dp) || !dp->user)
++		return NULL;
++
++	phydev = dp->user->phydev;
++	if (!phydev || !phydev->is_internal)
++		return NULL;
++
++	return phydev;
++}
++
++/* phy_may_wakeup() (v7.0) for Linux 6.18: the internal PHYs of the
++ * BCM53128 do not use the driver model for wakeup.
++ */
++static bool b53_phy_may_wakeup(struct phy_device *phydev)
++{
++	struct ethtool_wolinfo wol = { .cmd = ETHTOOL_GWOL };
++
++	phy_ethtool_get_wol(phydev, &wol);
++
++	return wol.wolopts != 0;
++}
++
++static void b53_port_phy_power_down(struct b53_device *dev, int port)
++{
++	struct phy_device *phydev = b53_user_int_phy(dev, port);
++	int ret;
++
++	if (!phydev || b53_phy_may_wakeup(phydev) ||
++	    dsa_to_port(dev->ds, port)->user->ethtool->wol_enabled)
++		return;
++
++	ret = genphy_suspend(phydev);
++	if (ret)
++		dev_warn(dev->dev, "port %d: PHY power down failed: %d\n",
++			 port, ret);
++}
++
++static void b53_port_phy_power_up(struct b53_device *dev, int port)
++{
++	struct phy_device *phydev = b53_user_int_phy(dev, port);
++	int ret;
++
++	if (!phydev)
++		return;
++
++	ret = genphy_resume(phydev);
++	if (ret)
++		dev_warn(dev->dev, "port %d: PHY power up failed: %d\n",
++			 port, ret);
++}
++
++/* Called after dsa_switch_shutdown(), which brought every port down: leave
++ * all the PHYs powered for the boot loader after a warm reset.
++ */
++void b53_lag_shutdown_phys(struct b53_device *dev)
++{
++	struct dsa_port *dp;
++
++	dsa_switch_for_each_user_port(dp, dev->ds)
++		b53_port_phy_power_up(dev, dp->index);
++}
++EXPORT_SYMBOL(b53_lag_shutdown_phys);
++#else
++static inline void b53_port_phy_power_down(struct b53_device *dev, int port)
++{
++}
++
++static inline void b53_port_phy_power_up(struct b53_device *dev, int port)
++{
++}
++#endif /* CONFIG_NET_DSA_B53_LAG_PHY_PDOWN */
++
+ int b53_enable_port(struct dsa_switch *ds, int port, struct phy_device *phy)
+ {
+ 	struct b53_device *dev = ds->priv;
+@@ -692,6 +777,9 @@ int b53_enable_port(struct dsa_switch *d
+ 	if (dev->ops->phy_enable)
+ 		dev->ops->phy_enable(dev, port);
+ 
++	/* Before phylink_start() restarts autonegotiation */
++	b53_port_phy_power_up(dev, port);
++
+ 	if (dev->ops->irq_enable)
+ 		ret = dev->ops->irq_enable(dev, port);
+ 	if (ret)
+@@ -733,6 +821,8 @@ void b53_disable_port(struct dsa_switch
+ 	if (dev->ops->phy_disable)
+ 		dev->ops->phy_disable(dev, port);
+ 
++	b53_port_phy_power_down(dev, port);
++
+ 	if (dev->ops->irq_disable)
+ 		dev->ops->irq_disable(dev, port);
+ }
+--- a/drivers/net/dsa/b53/b53_priv.h
++++ b/drivers/net/dsa/b53/b53_priv.h
+@@ -320,9 +320,16 @@ static inline void b53_switch_remove(str
+ 	dsa_unregister_switch(dev->ds);
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_DSA_B53_LAG_PHY_PDOWN)
++void b53_lag_shutdown_phys(struct b53_device *dev);
++#endif
++
+ static inline void b53_switch_shutdown(struct b53_device *dev)
+ {
+ 	dsa_switch_shutdown(dev->ds);
++#if IS_ENABLED(CONFIG_NET_DSA_B53_LAG_PHY_PDOWN)
++	b53_lag_shutdown_phys(dev);
++#endif
+ }
+ 
+ #define b53_build_op(type_op_size, val_type)				\
