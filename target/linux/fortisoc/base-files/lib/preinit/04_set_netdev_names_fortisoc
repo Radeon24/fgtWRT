@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The network processor of the FortiSOC1/FortiSOC2 registers its ports as
+# ethN and reports the marking of the front port (the "label" of its device
+# tree node) as phys_port_name. Name them after it, before anything brings
+# them up. The ports of the switch are already named by DSA, and a name
+# that is taken (by a switch port, for instance) is never reused.
+
+fortisoc_set_netdev_names() {
+	local dev name
+
+	for dev in /sys/class/net/eth*; do
+		[ -e "$dev" ] || continue
+		name="$(cat "$dev/phys_port_name" 2>/dev/null)" || continue
+		case "$name" in
+		wan1|wan2|dmz)
+			[ -e "/sys/class/net/$name" ] && continue
+			ip link set dev "${dev##*/}" name "$name"
+			;;
+		esac
+	done
+}
+
+boot_hook_add preinit_main fortisoc_set_netdev_names
