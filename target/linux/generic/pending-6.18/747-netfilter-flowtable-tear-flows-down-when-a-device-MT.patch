@@ -1,0 +1,24 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] netfilter: flowtable: tear flows down when a device MTU changes
+
+Tear down the offloaded flows of a device whose MTU changes.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ net/netfilter/nf_flow_table_core.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -824,7 +824,10 @@ static int nf_flow_table_netdev_event(st
+ {
+ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+-	if (event != NETDEV_DOWN)
++	/* A flow carries the MTU of its path from its creation on: tear it
++	 * down so that it is set up again with the new one.
++	 */
++	if (event != NETDEV_DOWN && event != NETDEV_CHANGEMTU)
+ 		return NOTIFY_DONE;
+ 
+ 	nf_flow_table_cleanup(dev);

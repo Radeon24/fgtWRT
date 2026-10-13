@@ -1,0 +1,339 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] netfilter: flowtable: offload the directions sent through xfrm packet offload
+
+Add NF_FLOW_TABLE_XFRM_OFFLOAD: offload the flow directions sent
+through an xfrm state in packet offload mode.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ include/net/flow_offload.h            |   2 +
+ net/netfilter/Kconfig                 |  12 ++
+ net/netfilter/nf_flow_table_offload.c | 133 ++++++++++++++++++++++++---
+ net/netfilter/nf_flow_table_path.c    |  55 +++++++++++
+ 4 files changed, 189 insertions(+), 13 deletions(-)
+
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -184,6 +184,7 @@ enum flow_action_id {
+ 	FLOW_ACTION_VLAN_PUSH_ETH,
+ 	FLOW_ACTION_VLAN_POP_ETH,
+ 	FLOW_ACTION_CONTINUE,
++	FLOW_ACTION_XFRM,
+ 	NUM_FLOW_ACTIONS,
+ };
+ 
+@@ -327,6 +328,7 @@ struct flow_action_entry {
+ 		struct {				/* FLOW_ACTION_PPPOE_PUSH */
+ 			u16		sid;
+ 		} pppoe;
++		struct xfrm_state	*xfrm;		/* FLOW_ACTION_XFRM */
+ 	};
+ 	struct flow_action_cookie *user_cookie; /* user defined action cookie */
+ };
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -740,6 +740,18 @@ config NF_FLOW_TABLE_PROCFS
+ 	  This option enables for the flow table offload statistics
+ 	  to be shown in procfs under net/netfilter/nf_flowtable.
+ 
++config NF_FLOW_TABLE_XFRM_OFFLOAD
++	bool "Offload the flow directions sent through xfrm packet offload"
++	depends on NF_FLOW_TABLE && XFRM_OFFLOAD
++	help
++	  This option lets the flow table offload an IPv4 flow direction
++	  sent through a single tunnel mode SA offloaded in packet mode to
++	  the output device, with a FLOW_ACTION_XFRM action giving the SA.
++	  The driver must reject the action unless it can chain the flow
++	  to the SA.
++
++	  If unsure, say N.
++
+ config NETFILTER_XTABLES
+ 	tristate "Netfilter Xtables support (required for ip_tables)"
+ 	default m if NETFILTER_ADVANCED=n
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -6,6 +6,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/tc_act/tc_csum.h>
+ #include <net/flow_offload.h>
++#include <net/xfrm.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_conntrack.h>
+@@ -232,6 +233,45 @@ flow_action_entry_next(struct nf_flow_ru
+ 	return &flow_rule->rule->action.entries[i];
+ }
+ 
++/* The SA a direction is sent through, if it is offloaded in packet mode to
++ * the output device of the route: a single IPv4 tunnel mode SA. The flow
++ * holds the route, which holds the SA, but not the offloaded state, which
++ * the driver may release at any time: the driver must check it again under
++ * its own lock.
++ */
++static struct xfrm_state *nf_flow_xfrm_offload(const struct flow_offload_tuple *tuple,
++					       struct net_device **pdev)
++{
++#if IS_ENABLED(CONFIG_NF_FLOW_TABLE_XFRM_OFFLOAD)
++	struct dst_entry *dst = tuple->dst_cache;
++	struct net_device *dev;
++	struct xfrm_state *x;
++
++	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_XFRM || !dst ||
++	    tuple->l3proto != NFPROTO_IPV4)
++		return NULL;
++
++	x = dst_xfrm(dst);
++	if (!x || xfrm_dst_child(dst)->xfrm)
++		return NULL;
++
++	dev = xfrm_dst_path(dst)->dev;
++	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET ||
++	    x->xso.dir != XFRM_DEV_OFFLOAD_OUT ||
++	    !READ_ONCE(x->xso.offload_handle) ||
++	    READ_ONCE(x->xso.dev) != dev ||
++	    x->props.mode != XFRM_MODE_TUNNEL ||
++	    x->props.family != AF_INET ||
++	    READ_ONCE(x->km.state) != XFRM_STATE_VALID)
++		return NULL;
++
++	*pdev = dev;
++	return x;
++#else
++	return NULL;
++#endif
++}
++
+ static int flow_offload_eth_src(struct net *net,
+ 				const struct flow_offload *flow,
+ 				enum flow_offload_tuple_dir dir,
+@@ -240,7 +280,7 @@ static int flow_offload_eth_src(struct n
+ 	struct flow_action_entry *entry0 = flow_action_entry_next(flow_rule);
+ 	struct flow_action_entry *entry1 = flow_action_entry_next(flow_rule);
+ 	const struct flow_offload_tuple *other_tuple, *this_tuple;
+-	struct net_device *dev = NULL;
++	struct net_device *dev = NULL, *xdev;
+ 	const unsigned char *addr;
+ 	u32 mask, val;
+ 	u16 val16;
+@@ -262,6 +302,12 @@ static int flow_offload_eth_src(struct n
+ 
+ 		addr = dev->dev_addr;
+ 		break;
++	case FLOW_OFFLOAD_XMIT_XFRM:
++		if (!nf_flow_xfrm_offload(this_tuple, &xdev))
++			return -EOPNOTSUPP;
++
++		addr = xdev->dev_addr;
++		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -282,6 +328,28 @@ static int flow_offload_eth_src(struct n
+ 	return 0;
+ }
+ 
++static int flow_offload_neigh_ha(const struct dst_entry *dst_cache,
++				 const void *daddr, unsigned char *ha)
++{
++	struct neighbour *n;
++	u8 nud_state;
++
++	n = dst_neigh_lookup(dst_cache, daddr);
++	if (!n)
++		return -ENOENT;
++
++	read_lock_bh(&n->lock);
++	nud_state = n->nud_state;
++	ether_addr_copy(ha, n->ha);
++	read_unlock_bh(&n->lock);
++	neigh_release(n);
++
++	if (!(nud_state & NUD_VALID))
++		return -ENOENT;
++
++	return 0;
++}
++
+ static int flow_offload_eth_dst(struct net *net,
+ 				const struct flow_offload *flow,
+ 				enum flow_offload_tuple_dir dir,
+@@ -292,10 +360,10 @@ static int flow_offload_eth_dst(struct n
+ 	const struct flow_offload_tuple *other_tuple, *this_tuple;
+ 	const struct dst_entry *dst_cache;
+ 	unsigned char ha[ETH_ALEN];
+-	struct neighbour *n;
++	struct net_device *xdev;
++	struct xfrm_state *x;
+ 	const void *daddr;
+ 	u32 mask, val;
+-	u8 nud_state;
+ 	u16 val16;
+ 
+ 	if (!entry0 || !entry1)
+@@ -311,17 +379,17 @@ static int flow_offload_eth_dst(struct n
+ 		other_tuple = &flow->tuplehash[!dir].tuple;
+ 		daddr = &other_tuple->src_v4;
+ 		dst_cache = this_tuple->dst_cache;
+-		n = dst_neigh_lookup(dst_cache, daddr);
+-		if (!n)
++		if (flow_offload_neigh_ha(dst_cache, daddr, ha) < 0)
+ 			return -ENOENT;
+-
+-		read_lock_bh(&n->lock);
+-		nud_state = n->nud_state;
+-		ether_addr_copy(ha, n->ha);
+-		read_unlock_bh(&n->lock);
+-		neigh_release(n);
+-
+-		if (!(nud_state & NUD_VALID))
++		break;
++	case FLOW_OFFLOAD_XMIT_XFRM:
++		x = nf_flow_xfrm_offload(this_tuple, &xdev);
++		if (!x)
++			return -EOPNOTSUPP;
++
++		/* Next hop of the route to the tunnel endpoint. */
++		dst_cache = xfrm_dst_path(this_tuple->dst_cache);
++		if (flow_offload_neigh_ha(dst_cache, &x->id.daddr.a4, ha) < 0)
+ 			return -ENOENT;
+ 		break;
+ 	default:
+@@ -605,6 +673,12 @@ static int flow_offload_redirect(struct
+ 		other_tuple = &flow->tuplehash[!dir].tuple;
+ 		ifindex = other_tuple->iifidx;
+ 		break;
++	case FLOW_OFFLOAD_XMIT_XFRM:
++		if (!nf_flow_xfrm_offload(this_tuple, &dev))
++			return -EOPNOTSUPP;
++
++		ifindex = dev->ifindex;
++		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -625,6 +699,33 @@ static int flow_offload_redirect(struct
+ 	return 0;
+ }
+ 
++static int flow_offload_xfrm(const struct flow_offload *flow,
++			     enum flow_offload_tuple_dir dir,
++			     struct nf_flow_rule *flow_rule)
++{
++	const struct flow_offload_tuple *this_tuple;
++	struct flow_action_entry *entry;
++	struct net_device *dev;
++	struct xfrm_state *x;
++
++	this_tuple = &flow->tuplehash[dir].tuple;
++	if (this_tuple->xmit_type != FLOW_OFFLOAD_XMIT_XFRM)
++		return 0;
++
++	x = nf_flow_xfrm_offload(this_tuple, &dev);
++	if (!x)
++		return -EOPNOTSUPP;
++
++	entry = flow_action_entry_next(flow_rule);
++	if (!entry)
++		return -E2BIG;
++
++	entry->id = FLOW_ACTION_XFRM;
++	entry->xfrm = x;
++
++	return 0;
++}
++
+ static int flow_offload_encap_tunnel(const struct flow_offload *flow,
+ 				     enum flow_offload_tuple_dir dir,
+ 				     struct nf_flow_rule *flow_rule)
+@@ -766,6 +867,12 @@ int nf_flow_rule_route_ipv4(struct net *
+ 		if (flow_offload_ipv4_checksum(net, flow, flow_rule) < 0)
+ 			return -1;
+ 
++	/* Before the redirect: the rule is freed without releasing its device
++	 * if an action fails after it.
++	 */
++	if (flow_offload_xfrm(flow, dir, flow_rule) < 0)
++		return -1;
++
+ 	if (flow_offload_redirect(net, flow, dir, flow_rule) < 0)
+ 		return -1;
+ 
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -9,6 +9,7 @@
+ #include <linux/netfilter/nf_tables.h>
+ #include <net/ip.h>
+ #include <net/inet_dscp.h>
++#include <net/xfrm.h>
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_tables_core.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+@@ -230,6 +231,52 @@ static int nft_dev_forward_path(struct n
+ 	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_NF_FLOW_TABLE_XFRM_OFFLOAD)
++/* Look the route of the other direction up through xfrm, as the forward
++ * path does for its packets: without it, a flow set up by a packet received
++ * through a tunnel sends the other direction out of the tunnel. Such a
++ * packet does set flows up with packet offload: the forward policy check
++ * consumes the secpath of the packets the device decrypted, so the flow
++ * offload expression does not see it. The flow
++ * keys are those of the packets of the other direction as sent, after NAT,
++ * since the forward path looks the policy up again once NAT changed them.
++ * On error, including a blocking policy, the route is released.
++ */
++static int nft_flow_route_xfrm(struct net *net, const struct nf_conn *ct,
++			       enum ip_conntrack_dir dir,
++			       const struct flowi *route_fl,
++			       struct dst_entry **dst)
++{
++	const struct nf_conntrack_tuple *t = &ct->tuplehash[dir].tuple;
++	struct dst_entry *xdst;
++	struct flowi fl;
++
++	memset(&fl, 0, sizeof(fl));
++	fl.u.ip4.saddr = t->dst.u3.ip;
++	fl.u.ip4.daddr = t->src.u3.ip;
++	fl.u.ip4.flowi4_proto = t->dst.protonum;
++	switch (t->dst.protonum) {
++	case IPPROTO_TCP:
++	case IPPROTO_UDP:
++		fl.u.ip4.fl4_sport = t->dst.u.all;
++		fl.u.ip4.fl4_dport = t->src.u.all;
++		break;
++	}
++	fl.u.ip4.flowi4_oif = (*dst)->dev->ifindex;
++	fl.u.ip4.flowi4_mark = route_fl->u.ip4.flowi4_mark;
++	fl.u.ip4.flowi4_dscp = route_fl->u.ip4.flowi4_dscp;
++
++	xdst = xfrm_lookup(net, *dst, &fl, NULL, 0);
++	if (IS_ERR(xdst)) {
++		*dst = NULL;
++		return PTR_ERR(xdst);
++	}
++
++	*dst = xdst;
++	return 0;
++}
++#endif
++
+ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
+ 		   struct nf_flow_route *route, enum ip_conntrack_dir dir,
+ 		   struct nft_flowtable *ft)
+@@ -269,6 +316,14 @@ int nft_flow_route(const struct nft_pkti
+ 		return -ENOENT;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_NF_FLOW_TABLE_XFRM_OFFLOAD)
++	if (nft_pf(pkt) == NFPROTO_IPV4 &&
++	    nft_flow_route_xfrm(nft_net(pkt), ct, dir, &fl, &other_dst) < 0) {
++		dst_release(this_dst);
++		return -ENOENT;
++	}
++#endif
++
+ 	nft_default_forward_path(route, this_dst, dir);
+ 	nft_default_forward_path(route, other_dst, !dir);
+ 

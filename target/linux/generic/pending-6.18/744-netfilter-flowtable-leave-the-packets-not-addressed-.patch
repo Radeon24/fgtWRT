@@ -1,0 +1,116 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] netfilter: flowtable: leave the packets not addressed to the host to the slow path
+
+Packets of PACKET_OTHERHOST type, received in promiscuous mode, must
+not be forwarded by the fast path.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ net/netfilter/nf_flow_table_ip.c | 67 +++++++++++++++++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -7,6 +7,8 @@
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
+ #include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/if_arp.h>
+ #include <linux/if_ether.h>
+ #include <net/gso.h>
+ #include <net/ip.h>
+@@ -423,6 +425,57 @@ static int nf_flow_offload_forward(struc
+ 	return 1;
+ }
+ 
++/* Only the packets sent to this host take the fast path. A port in
++ * promiscuous mode, a bridge port for instance, also receives the unicast
++ * frames of other hosts (PACKET_OTHERHOST): the bridge switches them, the
++ * IP layer drops them (ip_rcv_core(), ip6_rcv_core()), but the flow table
++ * would route those whose tuple matches a flow. eth_type_trans() compares
++ * the destination with the address of the port, while the hook runs on
++ * the port: a bridge or a VLAN device with an address of its own on top of
++ * it receives frames that the port sees as PACKET_OTHERHOST, and that
++ * br_handle_frame() or vlan_do_receive() only make PACKET_HOST later. Those
++ * are sent to the address of the device the other direction of the flow is
++ * routed through: its source address when sent directly (a bridge forces
++ * it, nft_dev_path_info()), the address of the device of its route when
++ * sent to a neighbour. A packet whose other direction goes through xfrm is
++ * left to the slow path: the route is a bundle, and such packets arrive
++ * from a tunnel, sent to the host.
++ */
++static bool nf_flow_skb_to_host(const struct flow_offload_tuple_rhash *tuplehash,
++				const struct net_device *in,
++				const struct sk_buff *skb)
++{
++	const struct flow_offload_tuple *other;
++	const struct flow_offload *flow;
++	const struct net_device *dev;
++	const u8 *dest;
++	int dir;
++
++	if (likely(skb->pkt_type == PACKET_HOST))
++		return true;
++	if (skb->pkt_type != PACKET_OTHERHOST || in->type != ARPHRD_ETHER)
++		return false;
++
++	dest = eth_hdr(skb)->h_dest;
++	dir = tuplehash->tuple.dir;
++	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	other = &flow->tuplehash[!dir].tuple;
++
++	switch (other->xmit_type) {
++	case FLOW_OFFLOAD_XMIT_DIRECT:
++		return ether_addr_equal(dest, other->out.h_source);
++	case FLOW_OFFLOAD_XMIT_NEIGH:
++		/* The flow holds the route until it is freed, after an RCU
++		 * grace period; its device may become a blackhole one.
++		 */
++		dev = dst_dev_rcu(other->dst_cache);
++		return dev && dev->addr_len == ETH_ALEN &&
++		       ether_addr_equal(dest, dev->dev_addr);
++	default:
++		return false;
++	}
++}
++
+ unsigned int
+ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+ 			const struct nf_hook_state *state)
+@@ -439,10 +492,17 @@ nf_flow_offload_ip_hook(void *priv, stru
+ 	struct rtable *rt;
+ 	int ret;
+ 
++	if (skb->pkt_type != PACKET_HOST &&
++	    skb->pkt_type != PACKET_OTHERHOST)
++		return NF_ACCEPT;
++
+ 	tuplehash = nf_flow_offload_lookup(&ctx, flow_table, skb);
+ 	if (!tuplehash)
+ 		return NF_ACCEPT;
+ 
++	if (!nf_flow_skb_to_host(tuplehash, ctx.in, skb))
++		return NF_ACCEPT;
++
+ 	ret = nf_flow_offload_forward(&ctx, flow_table, tuplehash, skb);
+ 	if (ret < 0)
+ 		return NF_DROP;
+@@ -744,10 +804,17 @@ nf_flow_offload_ipv6_hook(void *priv, st
+ 	struct rt6_info *rt;
+ 	int ret;
+ 
++	if (skb->pkt_type != PACKET_HOST &&
++	    skb->pkt_type != PACKET_OTHERHOST)
++		return NF_ACCEPT;
++
+ 	tuplehash = nf_flow_offload_ipv6_lookup(&ctx, flow_table, skb);
+ 	if (tuplehash == NULL)
+ 		return NF_ACCEPT;
+ 
++	if (!nf_flow_skb_to_host(tuplehash, ctx.in, skb))
++		return NF_ACCEPT;
++
+ 	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
+ 	if (ret < 0)
+ 		return NF_DROP;

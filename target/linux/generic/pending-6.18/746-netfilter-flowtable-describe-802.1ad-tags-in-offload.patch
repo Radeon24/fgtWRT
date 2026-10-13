@@ -1,0 +1,47 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] netfilter: flowtable: describe 802.1ad tags in offload rules
+
+Describe 802.1ad outer tags in the flow offload rules.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ net/netfilter/nf_flow_table_offload.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -119,7 +119,7 @@ static int nf_flow_rule_match(struct nf_
+ 	mask->meta.ingress_ifindex = 0xffffffff;
+ 
+ 	if (tuple->encap_num > 0 && !(tuple->in_vlan_ingress & BIT(0)) &&
+-	    tuple->encap[0].proto == htons(ETH_P_8021Q)) {
++	    eth_type_vlan(tuple->encap[0].proto)) {
+ 		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN, vlan);
+ 		nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+ 					tuple->encap[0].id,
+@@ -129,7 +129,7 @@ static int nf_flow_rule_match(struct nf_
+ 	}
+ 
+ 	if (tuple->encap_num > 1 && !(tuple->in_vlan_ingress & BIT(1)) &&
+-	    tuple->encap[1].proto == htons(ETH_P_8021Q)) {
++	    eth_type_vlan(tuple->encap[1].proto)) {
+ 		if (vlan_encap) {
+ 			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CVLAN,
+ 					  cvlan);
+@@ -707,7 +707,7 @@ nf_flow_rule_route_common(struct net *ne
+ 		if (tuple->in_vlan_ingress & BIT(i))
+ 			continue;
+ 
+-		if (tuple->encap[i].proto == htons(ETH_P_8021Q)) {
++		if (eth_type_vlan(tuple->encap[i].proto)) {
+ 			entry = flow_action_entry_next(flow_rule);
+ 			if (!entry)
+ 				return -1;
+@@ -733,6 +733,7 @@ nf_flow_rule_route_common(struct net *ne
+ 			entry->pppoe.sid = other_tuple->encap[i].id;
+ 			break;
+ 		case htons(ETH_P_8021Q):
++		case htons(ETH_P_8021AD):
+ 			entry->id = FLOW_ACTION_VLAN_PUSH;
+ 			entry->vlan.vid = other_tuple->encap[i].id;
+ 			entry->vlan.proto = other_tuple->encap[i].proto;
