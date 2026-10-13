@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/arm/fortinet.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC1, FortiSOC2 and FortiSOC3 based boards
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description: |
+  The FortiSOC1 is a Fortinet SoC built around a Faraday FA626TE core and
+  stock Faraday peripherals, with a Fortinet network processor. It is
+  found in the FortiGate 60C appliance.
+
+  The FortiSOC2 is its successor, built around a Faraday FA726TE core,
+  with the NP4Lite network processor. It is found in the FortiGate 60D and
+  90D appliances.
+
+  The FortiSOC3 has four Cortex-A9 MPCore cores with a PL310 L2 cache
+  controller and the NP6Lite network processor. It is found in the
+  FortiGate 60E appliance. Its secondary cores are started through its
+  system manager (fortinet,fsoc3-sysmgr): the cpus node of a FortiSOC3
+  uses the enable-method "fortinet,fsoc3-smp", under which the operating
+  system sets bit 16 + n of the system manager register at offset 0x74,
+  then writes the physical address of the entry point of core n, with
+  bit 0 set, to the register at offset 0xf0 + 4 * n.
+
+properties:
+  $nodename:
+    const: /
+  compatible:
+    oneOf:
+      - description: FortiGate 60C
+        items:
+          - const: fortinet,fg60c
+          - const: fortinet,fsoc1
+      - description: FortiSOC2 based boards
+        items:
+          - enum:
+              - fortinet,fg60d
+              - fortinet,fg90d
+          - const: fortinet,fsoc2
+      - description: FortiSOC3 based boards
+        items:
+          - const: fortinet,fg60e
+          - const: fortinet,fsoc3
+
+additionalProperties: true
+...

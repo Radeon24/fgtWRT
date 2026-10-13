@@ -1,0 +1,21 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: fsoc3: build mach-fsoc3
+
+Build arch/arm/mach-fsoc3 (SMP start through the system manager, ACP
+profiles) on ARCH_FSOC3.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/Makefile | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/arch/arm/Makefile
++++ b/arch/arm/Makefile
+@@ -189,6 +189,7 @@ machine-$(CONFIG_ARCH_CLPS711X)		+= clps
+ machine-$(CONFIG_ARCH_DAVINCI)		+= davinci
+ machine-$(CONFIG_ARCH_DIGICOLOR)	+= digicolor
+ machine-$(CONFIG_ARCH_DOVE)		+= dove
++machine-$(CONFIG_ARCH_FSOC3)		+= fsoc3
+ machine-$(CONFIG_ARCH_EXYNOS)		+= exynos
+ machine-$(CONFIG_ARCH_FOOTBRIDGE)	+= footbridge
+ machine-$(CONFIG_ARCH_GEMINI)		+= gemini

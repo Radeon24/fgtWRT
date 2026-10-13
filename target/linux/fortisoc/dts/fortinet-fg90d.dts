@@ -1,0 +1,540 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/dts-v1/;
+
+/*
+ * FortiGate 90D. Same SoC as the 60D (FortiSOC2), so the layout follows
+ * fortinet-fg60d.dts, but the system runs on core 1 (the boot loader of the
+ * 90D starts core 1 and parks core 0), hence its own interrupt controller.
+ * The two BCM53128 switches are managed through SPI, as DSA switches behind
+ * links 2 and 3 of the network processor: they form ONE DSA tree joined by
+ * their cascade, switch 0 port 0 <-> switch 1 port 7, a DSA link; each
+ * switch keeps its own CPU port (link 2 / link 3 of the NP). GPIO lines
+ * and LEDs other than the switch multiplexer are not described: their use
+ * is not known.
+ */
+
+#include "fsoc2.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "Fortinet FortiGate 90D";
+	compatible = "fortinet,fg90d", "fortinet,fsoc2";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:9600n8";
+	};
+
+	/*
+	 * 2 GiB of RAM; the top 128 MiB are reserved below, as on the 60D.
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x78000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Same regions as the 60D, not checked on the 90D (same boot
+		 * loader family). Kept reserved so that nothing the boot
+		 * loader or the network processor may use is handed to the
+		 * kernel.
+		 */
+		np_loader: np-loader@9a00000 {
+			reg = <0x09a00000 0x00200000>;
+			no-map;
+		};
+
+		np_pbuf: np-pbuf@9c00000 {
+			reg = <0x09c00000 0x01000000>;
+			no-map;
+		};
+
+		np_flow: np-flow@3c000000 {
+			reg = <0x3c000000 0x03800000>;
+			no-map;
+		};
+
+		np_sa: np-sa@3fc00000 {
+			reg = <0x3fc00000 0x00400000>;
+			no-map;
+		};
+
+		vendor_reserved: memory@78000000 {
+			reg = <0x78000000 0x08000000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * Internal 8 GB USB boot disk: write windows of its installer, armed
+	 * from user space (sector 0, where only the name and build number of
+	 * image 1 may change, and partition 2, the slot of image 1).
+	 */
+	write-windows {
+		compatible = "fortinet,usb-disk-write-windows";
+		fortinet,disk-vendor = "FORTINET";
+		fortinet,disk-model = "61_V030910_008";
+		fortinet,disk-sectors = /bits/ 64 <15654912>;
+		fortinet,write-windows = <0 1>, <524289 524288>;
+		fortinet,sector0-bytes = <0x30 32>, <0x12c 4>;
+	};
+};
+
+/*
+ * No GPIO line is known on this board: all of them are reserved, never
+ * touched. No button, no LED is described.
+ */
+&gpio1 {
+	status = "okay";
+};
+
+/*
+ * L2 cache left off for now: the auxiliary control value found on the 90D
+ * (0x12033) differs from the one the driver writes (0x12023).
+ */
+&l2 {
+	status = "disabled";
+};
+
+/*
+ * The interrupt controller of the core on the 90D is the one at
+ * 0xf0500000, not 0xf0400000 as on the 60D: the controller at 0xf0400000
+ * latches the interrupts but its output does not reach the core.
+ */
+&intc {
+	reg = <0xf0500000 0x1000>;
+};
+
+/*
+ * Network processor: base MAC address from the boot flash (mac_base below);
+ * not a device, the cell would hold the probe of the network processor
+ * forever if the flash failed, as on the 60D. Reset pins: GPIO 0, 2, 4 and
+ * 6 of the NP GPIO block, pulsed to release the PHYs and switches from
+ * reset (GPIO 6 in addition to the 60D).
+ */
+&np {
+	memory-region = <&np_pbuf>, <&np_loader>, <&np_flow>, <&np_sa>;
+	nvmem-cells = <&mac_base 0>;
+	nvmem-cell-names = "mac-base";
+	post-init-providers = <&mac_base>;
+	fortinet,reset-pins = <0 2 4 6>;
+	status = "okay";
+};
+
+/*
+ * PHYs of WAN1 and WAN2 at MDIO addresses 0x11 and 0x12 (0x18/0x19 on the
+ * 60D), without LED description.
+ */
+&np_mdio {
+	wan1_phy: ethernet-phy@11 {
+		reg = <0x11>;
+	};
+
+	wan2_phy: ethernet-phy@12 {
+		reg = <0x12>;
+	};
+};
+
+/*
+ * MAC ranks: internal1 = base + 0,
+ * wan1 = base + 1, wan2 = base + 2, internalN = base + N + 1 for N = 2 to 14
+ * (internal2 = base + 3 ... internal14 = base + 15).
+ *
+ * Links of the NP: wan1 on link 0 and wan2 on link 1, but on logical
+ * interfaces (LIFs) 2 and 3, the LIF numbers of the 60D, hence
+ * "fortinet,logical-interface". The two BCM53128 switches sit on links 2
+ * and 3 (internal1-7 and internal8-14 on LIFs 4 to 17): see the DSA
+ * conduits below.
+ */
+&np_port0 {
+	label = "wan1";
+	nvmem-cells = <&mac_base 1>;
+	nvmem-cell-names = "mac-address";
+	post-init-providers = <&mac_base>;
+	fortinet,logical-interface = <2>;
+	phy-handle = <&wan1_phy>;
+	phy-mode = "rgmii-id";
+	status = "okay";
+};
+
+&np_port1 {
+	label = "wan2";
+	nvmem-cells = <&mac_base 2>;
+	nvmem-cell-names = "mac-address";
+	post-init-providers = <&mac_base>;
+	fortinet,logical-interface = <3>;
+	phy-handle = <&wan2_phy>;
+	phy-mode = "rgmii-id";
+	status = "okay";
+};
+
+/*
+ * SPI NOR flash of the boot loader (Winbond W25X40CL, 512 KiB), read only.
+ * Only the 6 bytes of the base MAC address are described: the factory data
+ * block sits at 0x3c000 and the MAC at +0x1880 into it, as on the 60D. The
+ * partition is deliberately reduced to these 6 bytes because the factory
+ * block of the 90D also holds a device certificate and a private key, which
+ * must never be exposed.
+ */
+&ssp0 {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@3d880 {
+				label = "factory-mac";
+				reg = <0x3d880 0x6>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					mac_base: mac-address@0 {
+						compatible = "mac-base";
+						reg = <0x0 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+/* Front panel "MGMT" port, the device side */
+&udc {
+	status = "okay";
+};
+
+&usb0 {
+	status = "okay";
+};
+
+/* Internal USB flash drive, read only (see the rootfs) */
+&usb1 {
+	status = "okay";
+};
+
+/*
+ * Two BCM53128 switches on the SPI bus, the switch selected by its chip
+ * select and a board GPIO:
+ *  - second FTSSP010 port (0xe4600000, SPI mode 3, set up by the boot
+ *    loader), Broadcom SPI protocol of b53_spi;
+ *  - chip select: line 19 of the GPIO block at 0xe4c00000, never line 15,
+ *    the chip select of the boot flash;
+ *  - board GPIO 0 selects the switch: 0 the one on link 2 (internal1-7),
+ *    1 the one on link 3 (internal8-14).
+ */
+/ {
+	/* Board GPIO 0: which switch the SPI bus reaches (0: link 2, 1: link 3) */
+	switch_mux: mux-controller {
+		compatible = "gpio-mux";
+		#mux-control-cells = <0>;
+		mux-gpios = <&gpio1 0 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/*
+ * Board GPIO: line 0 only is freed, for the switch multiplexer (an output
+ * under the boot loader, DIR 0x01fe7f7f).
+ * Every other line stays reserved, never touched.
+ */
+&gpio1 {
+	gpio-reserved-ranges = <1 31>;
+};
+
+&{/soc} {
+	/*
+	 * Second FTSSP010 port, regular SPI messages (SPI_FSOC2_SSP_BUS). The
+	 * data set and data clear registers of the chip select block are
+	 * those of ssp0 (shared, mapped but not requested); the driver checks
+	 * that line 19 is not the line of any flash port before it writes
+	 * anything. "pad" = SCU+0x328, whose bit 31 the driver sets to mux
+	 * the chip-select pad to GPIO, before driving line 19 as an output.
+	 */
+	ssp1: spi@e4600000 {
+		compatible = "fortinet,fsoc2-ssp-bus";
+		reg = <0xe4600000 0x1c>, <0xe4c00010 0x8>, <0xe5100328 0x4>;
+		reg-names = "ssp", "cs", "pad";
+		fortinet,cs-line = <19>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		spi@0 {
+			compatible = "spi-mux";
+			reg = <0>;
+			/* SCLKDIV 5 of the boot loader; the port keeps its rate */
+			spi-max-frequency = <5000000>;
+			spi-cpol;
+			spi-cpha;
+			mux-controls = <&switch_mux>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/*
+			 * Front port of each switch port (LIFs 4-17 = switch
+			 * ports internal1-14), board variant 1 of two, the
+			 * variant being given by board GPIO 16: GPIO 16 reads
+			 * high on this unit, and unplugging front ports 1 and 2 dropped
+			 * ports 7 and 6. internal1-7 are on ports 7 down to 1,
+			 * internal8-14 on ports 6 down to 0 (variant 0 has
+			 * internal1-7 on ports 6, 7, 4, 5, 3, 2, 1 and internal8-14
+			 * on ports 6, 4, 5, 2, 3, 1, 0).
+			 */
+			ethernet-switch@0 {
+				compatible = "brcm,bcm53128";
+				reg = <0>;		/* mux state 0: link 2 */
+				spi-max-frequency = <5000000>;
+				spi-cpol;
+				spi-cpha;
+				dsa,member = <0 0>;
+				/*
+				 * Traffic class 7 on every user port: the
+				 * network processor classes the frames of
+				 * the switch on their tag (port and class)
+				 * and never matches port 0 in class 0.
+				 */
+				brcm,port-traffic-class = <7>;
+
+				ethernet-ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					/* Cascade to switch 1 port 7, DSA link */
+					sw0_p0: ethernet-port@0 {
+						reg = <0>;
+						link = <&sw1_p7>;
+					};
+
+					ethernet-port@1 {
+						reg = <1>;
+						label = "internal7";
+						nvmem-cells = <&mac_base 8>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@2 {
+						reg = <2>;
+						label = "internal6";
+						nvmem-cells = <&mac_base 7>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@3 {
+						reg = <3>;
+						label = "internal5";
+						nvmem-cells = <&mac_base 6>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@4 {
+						reg = <4>;
+						label = "internal4";
+						nvmem-cells = <&mac_base 5>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@5 {
+						reg = <5>;
+						label = "internal3";
+						nvmem-cells = <&mac_base 4>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@6 {
+						reg = <6>;
+						label = "internal2";
+						nvmem-cells = <&mac_base 3>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@7 {
+						reg = <7>;
+						label = "internal1";
+						nvmem-cells = <&mac_base 0>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					/* IMP port, RGMII to link 2 of the NP (assumed, as on the 60D) */
+					ethernet-port@8 {
+						reg = <8>;
+						ethernet = <&np_port2>;
+						phy-mode = "rgmii";
+
+						fixed-link {
+							speed = <1000>;
+							full-duplex;
+						};
+					};
+				};
+			};
+
+			ethernet-switch@1 {
+				compatible = "brcm,bcm53128";
+				reg = <1>;		/* mux state 1: link 3 */
+				spi-max-frequency = <5000000>;
+				spi-cpol;
+				spi-cpha;
+				dsa,member = <0 1>;
+				/*
+				 * Traffic class 7 on every user port: the
+				 * network processor classes the frames of
+				 * the switch on their tag (port and class)
+				 * and never matches port 0 in class 0.
+				 */
+				brcm,port-traffic-class = <7>;
+
+				ethernet-ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					ethernet-port@0 {
+						reg = <0>;
+						label = "internal14";
+						nvmem-cells = <&mac_base 15>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@1 {
+						reg = <1>;
+						label = "internal13";
+						nvmem-cells = <&mac_base 14>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@2 {
+						reg = <2>;
+						label = "internal12";
+						nvmem-cells = <&mac_base 13>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@3 {
+						reg = <3>;
+						label = "internal11";
+						nvmem-cells = <&mac_base 12>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@4 {
+						reg = <4>;
+						label = "internal10";
+						nvmem-cells = <&mac_base 11>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@5 {
+						reg = <5>;
+						label = "internal9";
+						nvmem-cells = <&mac_base 10>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@6 {
+						reg = <6>;
+						label = "internal8";
+						nvmem-cells = <&mac_base 9>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					/* Cascade to switch 0 port 0, DSA link */
+					sw1_p7: ethernet-port@7 {
+						reg = <7>;
+						link = <&sw0_p0>;
+					};
+
+					/* IMP port, RGMII to link 3 of the NP (assumed, as on the 60D) */
+					ethernet-port@8 {
+						reg = <8>;
+						ethernet = <&np_port3>;
+						phy-mode = "rgmii";
+
+						fixed-link {
+							speed = <1000>;
+							full-duplex;
+						};
+					};
+				};
+			};
+		};
+	};
+};
+
+/*
+ * DSA conduits. The network processor classes the frames of each switch
+ * port on a LIF of its own (FORTINET_NP4LITE_DSA, enabled in the kernel
+ * configuration): internal1 to internal7 on LIFs 4 to 10, internal8 to
+ * internal14 on LIFs 11 to 17 (internalN = LIF N + 3);
+ * "fortinet,switch-logical-interfaces" gives the LIF of switch port 0 to 7
+ * (0: no port), board variant 1 (see the switches above). The conduits
+ * take LIFs 18 (link 2) and 19 (link 3) for the switch frames the NP does
+ * not class by port; LIFs 0 and 1 (used by the boot loader) are left
+ * alone. LIFs above 8 need FORTINET_NP4LITE_DSA: without it, the NP
+ * refuses them at probe. Assumed: no delay on the NP side, the switch adds
+ * them, as on the 60D.
+ */
+&np_port2 {
+	fortinet,logical-interface = <18>;
+	fortinet,switch-logical-interfaces = <0 10 9 8 7 6 5 4>;
+	/* base + 0, the address of the conduit */
+	nvmem-cells = <&mac_base 0>;
+	nvmem-cell-names = "mac-address";
+	post-init-providers = <&mac_base>;
+	phy-mode = "rgmii";
+	status = "okay";
+
+	fixed-link {
+		speed = <1000>;
+		full-duplex;
+	};
+};
+
+&np_port3 {
+	fortinet,logical-interface = <19>;
+	fortinet,switch-logical-interfaces = <17 16 15 14 13 12 11 0>;
+	/* base + 0, the address of the conduit */
+	nvmem-cells = <&mac_base 0>;
+	nvmem-cell-names = "mac-address";
+	post-init-providers = <&mac_base>;
+	phy-mode = "rgmii";
+	status = "okay";
+
+	fixed-link {
+		speed = <1000>;
+		full-duplex;
+	};
+};

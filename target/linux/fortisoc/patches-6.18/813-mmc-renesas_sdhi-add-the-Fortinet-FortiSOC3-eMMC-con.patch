@@ -1,0 +1,161 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] mmc: renesas_sdhi: add the Fortinet FortiSOC3 eMMC controller
+
+Support the eMMC controller of the FortiSOC3.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/mmc/host/Kconfig                 |  2 +-
+ drivers/mmc/host/renesas_sdhi.h          |  3 ++
+ drivers/mmc/host/renesas_sdhi_core.c     | 44 +++++++++++++++++++++++++
+ drivers/mmc/host/renesas_sdhi_sys_dmac.c | 18 ++++++++++
+ 4 files changed, 66 insertions(+), 1 deletion(-)
+
+--- a/drivers/mmc/host/Kconfig
++++ b/drivers/mmc/host/Kconfig
+@@ -704,7 +704,7 @@ config MMC_TMIO_CORE
+ 
+ config MMC_SDHI
+ 	tristate "Renesas SDHI SD/SDIO controller support"
+-	depends on SUPERH || ARCH_RENESAS || COMPILE_TEST
++	depends on SUPERH || ARCH_RENESAS || ARCH_FSOC3 || COMPILE_TEST
+ 	depends on (RESET_CONTROLLER && REGULATOR) || !OF
+ 	select MMC_TMIO_CORE
+ 	help
+--- a/drivers/mmc/host/renesas_sdhi.h
++++ b/drivers/mmc/host/renesas_sdhi.h
+@@ -21,6 +21,8 @@ struct renesas_sdhi_scc {
+ };
+ 
+ #define SDHI_FLAG_NEED_CLKH_FALLBACK	BIT(0)
++/* Fortinet FortiSOC3: 32-bit SD buffer, controller reset sequence, no HS */
++#define SDHI_FLAG_FSOC3			BIT(1)
+ 
+ struct renesas_sdhi_of_data {
+ 	unsigned long tmio_flags;
+@@ -86,6 +88,7 @@ struct renesas_sdhi {
+ 	const u8 *adjust_hs400_calib_table;
+ 	bool needs_adjust_hs400;
+ 	bool card_is_sdio;
++	bool fsoc3;
+ 
+ 	/* Tuning values: 1 for success, 0 for failure */
+ 	DECLARE_BITMAP(taps, BITS_PER_LONG);
+--- a/drivers/mmc/host/renesas_sdhi_core.c
++++ b/drivers/mmc/host/renesas_sdhi_core.c
+@@ -64,6 +64,12 @@ static void renesas_sdhi_sdbuf_width(str
+ {
+ 	u32 val;
+ 
++	/* FortiSOC3: the SD buffer is always run in 32 bits */
++	if (host_to_priv(host)->fsoc3) {
++		sd_ctrl_write16(host, CTL_HOST_MODE, HOST_MODE_GEN3_32BIT);
++		return;
++	}
++
+ 	/*
+ 	 * see also
+ 	 *	renesas_sdhi_of_data :: dma_buswidth
+@@ -578,6 +584,22 @@ static void renesas_sdhi_scc_reset(struc
+ 		       sd_scc_read32(host, priv, SH_MOBILE_SDHI_SCC_RVSCNTL));
+ }
+ 
++/*
++ * FortiSOC3: eMMC controller reset, written after each soft reset of the
++ * controller: port select 0, every mask of the internal DMAC
++ * (DM_CM_INFO1/2_MASK) and of three controller-specific registers set. All are registers of
++ * the controller, lost at reset; nothing reaches the card.
++ */
++static void renesas_sdhi_fsoc3_reset(struct tmio_mmc_host *host)
++{
++	static const u16 masks[] = { 0x558, 0x578, 0x590, 0x848, 0x858 };
++	int i;
++
++	writel(0, host->ctl + 0x08);
++	for (i = 0; i < ARRAY_SIZE(masks); i++)
++		writel(~0U, host->ctl + masks[i]);
++}
++
+ /* only populated for TMIO_MMC_MIN_RCAR2 */
+ static void renesas_sdhi_reset(struct tmio_mmc_host *host, bool preserve)
+ {
+@@ -585,6 +607,9 @@ static void renesas_sdhi_reset(struct tm
+ 	int ret;
+ 	u16 val;
+ 
++	if (priv->fsoc3)
++		renesas_sdhi_fsoc3_reset(host);
++
+ 	if (!preserve) {
+ 		if (priv->rstc) {
+ 			u32 sd_status;
+@@ -1135,8 +1160,18 @@ int renesas_sdhi_probe(struct platform_d
+ 		if (!priv->clkh && of_data->sdhi_flags & SDHI_FLAG_NEED_CLKH_FALLBACK)
+ 			priv->clkh = clk_get_parent(clk_get_parent(priv->clk));
+ 
++		priv->fsoc3 = !!(of_data->sdhi_flags & SDHI_FLAG_FSOC3);
+ 	}
+ 
++	/* State left by the boot loader, before any write (32-bit reads) */
++	if (priv->fsoc3)
++		dev_info(&pdev->dev,
++			 "boot state: version %#x host_mode %#x sdif_mode %#x option %#x clk_ctl %#x info1 %#x info2 %#x port %#x\n",
++			 readl(host->ctl + 0x388), readl(host->ctl + 0x390),
++			 readl(host->ctl + 0x398), readl(host->ctl + 0xa0),
++			 readl(host->ctl + 0x90), readl(host->ctl + 0x70),
++			 readl(host->ctl + 0x78), readl(host->ctl + 0x08));
++
+ 	host->write16_hook = renesas_sdhi_write16_hook;
+ 	host->clk_enable = renesas_sdhi_clk_enable;
+ 	host->clk_disable = renesas_sdhi_clk_disable;
+@@ -1177,6 +1212,13 @@ int renesas_sdhi_probe(struct platform_d
+ 	mmc_data->capabilities |= MMC_CAP_MMC_HIGHSPEED;
+ 
+ 	/*
++	 * FortiSOC3: legacy timing only, no CMD6 HS_TIMING (high speed at
++	 * 45 MHz is not used; 25 MHz is enough here).
++	 */
++	if (priv->fsoc3)
++		mmc_data->capabilities &= ~MMC_CAP_MMC_HIGHSPEED;
++
++	/*
+ 	 * All SDHI blocks support 2-byte and larger block sizes in 4-bit
+ 	 * bus width mode.
+ 	 */
+@@ -1303,6 +1345,8 @@ int renesas_sdhi_probe(struct platform_d
+ 	return ret;
+ 
+ edisclk:
++	if (priv->fsoc3)
++		dev_warn(&pdev->dev, "probe failed: %d\n", ret);
+ 	renesas_sdhi_clk_disable(host);
+ 	return ret;
+ }
+--- a/drivers/mmc/host/renesas_sdhi_sys_dmac.c
++++ b/drivers/mmc/host/renesas_sdhi_sys_dmac.c
+@@ -72,7 +72,25 @@ static const struct renesas_sdhi_of_data
+ 	.max_blk_count	= UINT_MAX / TMIO_MAX_BLK_SIZE,
+ };
+ 
++/*
++ * Fortinet FortiSOC3 eMMC controller (FortiGate 60E/100E):
++ * an R-Car Gen3 style SDHI, registers 8 bytes apart, internal DMAC at +0x800
++ * left unused (PIO only), version register at +0x388.
++ */
++static const struct renesas_sdhi_of_data of_fsoc3_compatible = {
++	.tmio_flags	= TMIO_MMC_HAS_IDLE_WAIT | TMIO_MMC_CLK_ACTUAL |
++			  TMIO_MMC_HAVE_CBSY | TMIO_MMC_MIN_RCAR2 |
++			  TMIO_MMC_32BIT_DATA_PORT,
++	.capabilities	= MMC_CAP_WAIT_WHILE_BUSY,
++	.capabilities2	= MMC_CAP2_NO_WRITE_PROTECT,
++	/* no vmmc regulator described: 3.3 V card supply (tmio defers without) */
++	.tmio_ocr_mask	= MMC_VDD_32_33 | MMC_VDD_33_34,
++	.bus_shift	= 2,
++	.sdhi_flags	= SDHI_FLAG_FSOC3,
++};
++
+ static const struct of_device_id renesas_sdhi_sys_dmac_of_match[] = {
++	{ .compatible = "fortinet,fsoc3-sdhi", .data = &of_fsoc3_compatible, },
+ 	{ .compatible = "renesas,sdhi-sh73a0", .data = &of_default_cfg, },
+ 	{ .compatible = "renesas,sdhi-r8a73a4", .data = &of_default_cfg, },
+ 	{ .compatible = "renesas,sdhi-r8a7740", .data = &of_default_cfg, },

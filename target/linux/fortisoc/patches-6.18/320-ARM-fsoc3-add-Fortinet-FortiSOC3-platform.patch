@@ -1,0 +1,38 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: fsoc3: add Fortinet FortiSOC3 platform
+
+Add ARCH_FSOC3, the Fortinet FortiSOC3 (FortiGate 60E) platform.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/Kconfig.platforms | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+--- a/arch/arm/Kconfig.platforms
++++ b/arch/arm/Kconfig.platforms
+@@ -122,6 +122,25 @@ config ARCH_FSOC2
+ 	  ATAGs, so a kernel for this platform needs ARM_APPENDED_DTB and
+ 	  ARM_ATAG_DTB_COMPAT.
+ 
++config ARCH_FSOC3
++	bool "Fortinet FortiSOC3"
++	depends on ARCH_MULTI_V7
++	select ARM_GIC
++	select ARM_GLOBAL_TIMER
++	select HAVE_ARM_SCU if SMP
++	select HAVE_ARM_TWD if SMP
++	help
++	  Support for the Fortinet FortiSOC3, found in the FortiGate 60E
++	  and 100E appliances. It is built around four Cortex-A9 MPCore
++	  cores (VFPv3-D16, no NEON) with their private peripherals (GIC,
++	  SCU, global and private timers), a PL310 L2 cache controller and
++	  an Emma Mobile compatible 8250 console UART.
++
++	  The platform needs no mach- directory: the generic DT machine
++	  descriptor is enough. The stock boot loader is not known to pass
++	  a usable device tree, so a bootable kernel is built with
++	  ARM_APPENDED_DTB.
++
+ menuconfig ARCH_HPE
+ 	bool "HPE SoC support"
+ 	depends on ARCH_MULTI_V7

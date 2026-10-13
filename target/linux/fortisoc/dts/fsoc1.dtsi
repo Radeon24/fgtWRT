@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Fortinet FortiSOC1
+ *
+ * A Faraday FA626TE core with stock Faraday peripherals and the Fortinet
+ * network processor.
+ */
+
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "fortinet,fsoc1";
+	interrupt-parent = <&intc>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "faraday,fa626te";
+			reg = <0>;
+			next-level-cache = <&l2>;
+		};
+	};
+
+	/* No clock controller is known: the rates are fixed. */
+	pclk: clock-pclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <65625000>;
+	};
+
+	uartclk: clock-uart {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <18103440>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		crypto@e3e00000 {
+			compatible = "fortinet,fsoc1-crypto";
+			reg = <0xe3e00000 0x1000>;
+			interrupts = <27 IRQ_TYPE_LEVEL_LOW>;
+		};
+
+		np: ethernet@e3f00000 {
+			compatible = "fortinet,fsoc1-np";
+			reg = <0xe3f00000 0x1000>;
+			interrupts = <26 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+
+			np_mdio: mdio {
+				#address-cells = <1>;
+				#size-cells = <0>;
+			};
+
+			ethernet-ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				np_port0: ethernet-port@0 {
+					reg = <0>;
+					status = "disabled";
+				};
+
+				np_port1: ethernet-port@1 {
+					reg = <1>;
+					status = "disabled";
+				};
+
+				np_port2: ethernet-port@2 {
+					reg = <2>;
+					status = "disabled";
+				};
+
+				np_port3: ethernet-port@3 {
+					reg = <3>;
+					status = "disabled";
+				};
+			};
+		};
+
+		uart0: serial@e4100000 {
+			compatible = "ns16550a";
+			reg = <0xe4100000 0x20>;
+			interrupts = <10 IRQ_TYPE_LEVEL_HIGH>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			clocks = <&uartclk>;
+			status = "disabled";
+		};
+
+		uart1: serial@e4200000 {
+			compatible = "ns16550a";
+			reg = <0xe4200000 0x20>;
+			interrupts = <11 IRQ_TYPE_LEVEL_HIGH>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			clocks = <&uartclk>;
+			status = "disabled";
+		};
+
+		/*
+		 * Battery-backed; the boot loader keeps the speed of its
+		 * console in the register at 0x10.
+		 */
+		rtc@e4300000 {
+			compatible = "fortinet,fsoc1-rtc";
+			reg = <0xe4300000 0x100>;
+		};
+
+		/*
+		 * No interrupt line of this block is known. Line 30 is the chip select of the boot flash on
+		 * the SPI controller.
+		 */
+		gpio0: gpio@e4400000 {
+			compatible = "faraday,ftgpio010";
+			reg = <0xe4400000 0x1000>;
+			clocks = <&pclk>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			status = "disabled";
+		};
+
+		timer@e4800000 {
+			compatible = "faraday,fttmr010";
+			reg = <0xe4800000 0x1000>;
+			interrupts = <22 IRQ_TYPE_EDGE_RISING>;
+			clocks = <&pclk>;
+			clock-names = "PCLK";
+		};
+
+		watchdog@e4900000 {
+			compatible = "faraday,ftwdt010";
+			reg = <0xe4900000 0x100>;
+			clocks = <&pclk>;
+			clock-names = "PCLK";
+		};
+
+		/*
+		 * Whether the boot loader leaves this cache on is not known.
+		 * Keep it off until its use with the DMA masters and
+		 * the table walker is validated: a board variant enables it.
+		 */
+		l2: cache-controller@e4b00000 {
+			compatible = "fortinet,fsoc1-l2cc";
+			reg = <0xe4b00000 0x1000>;
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <262144>;
+			cache-sets = <1024>;
+			cache-line-size = <32>;
+			status = "disabled";
+		};
+
+		/*
+		 * USB peripheral controller. Whether it is register compatible with the FOTG210 and
+		 * where it is wired on the boards is not established: keep
+		 * it disabled.
+		 */
+		usb0: usb@f0100000 {
+			compatible = "faraday,fotg210";
+			reg = <0xf0100000 0x1000>;
+			interrupts = <9 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&pclk>;
+			clock-names = "PCLK";
+			dr_mode = "peripheral";
+			status = "disabled";
+		};
+
+		/*
+		 * Host-only Faraday FUSBH200 USB 2.0 controller (FOTG210
+		 * family). Level interrupt, active high. No clock, reset or VBUS
+		 * control is known: the boot loader, which boots from USB,
+		 * leaves it clocked.
+		 */
+		usb1: usb@f0200000 {
+			compatible = "faraday,fusbh200";
+			reg = <0xf0200000 0x1000>;
+			interrupts = <8 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&pclk>;
+			clock-names = "PCLK";
+			dr_mode = "host";
+			status = "disabled";
+		};
+
+		intc: interrupt-controller@f0400000 {
+			compatible = "faraday,ftintc010";
+			reg = <0xf0400000 0x1000>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
+	};
+};

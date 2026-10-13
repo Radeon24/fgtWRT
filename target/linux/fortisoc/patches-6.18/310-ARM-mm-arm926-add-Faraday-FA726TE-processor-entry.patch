@@ -1,0 +1,95 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: mm: arm926: add Faraday FA726TE processor entry
+
+Add the processor entry of the Faraday FA726TE core of the FortiSOC2 to
+the ARM926 processor support.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/mm/Kconfig       |  3 ++
+ arch/arm/mm/proc-arm926.S | 51 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 54 insertions(+)
+
+--- a/arch/arm/mm/Kconfig
++++ b/arch/arm/mm/Kconfig
+@@ -147,6 +147,9 @@ config CPU_ARM926T
+ 	  instruction sequences for cache and TLB operations.  Curiously,
+ 	  there is no documentation on it at the ARM corporate website.
+ 
++	  This also supports the Faraday FA726TE, which has the cache and
++	  TLB layout of the ARM926.
++
+ 	  Say Y if you want support for the ARM926T processor.
+ 	  Otherwise, say N.
+ 
+--- a/arch/arm/mm/proc-arm926.S
++++ b/arch/arm/mm/proc-arm926.S
+@@ -446,6 +446,25 @@ __arm926_setup:
+ 	ret	lr
+ 	.size	__arm926_setup, . - __arm926_setup
+ 
++/*
++ * The Faraday FA726TE has the cache and TLB layout of the ARM926EJ-S, and
++ * works with the same control register value. Its TCM regions are turned
++ * off and its branch target buffer flushed before enabling the MMU, then
++ * the ARM926 setup runs. Only r0 is used, like in __arm926_setup.
++ */
++	.type	__fa726te_setup, #function
++__fa726te_setup:
++	mrc	p15, 0, r0, c9, c1, 0		@ data TCM region
++	bic	r0, r0, #1			@ disable
++	mcr	p15, 0, r0, c9, c1, 0
++	mrc	p15, 0, r0, c9, c1, 1		@ instruction TCM region
++	bic	r0, r0, #1			@ disable
++	mcr	p15, 0, r0, c9, c1, 1
++	mov	r0, #0
++	mcr	p15, 0, r0, c7, c5, 6		@ flush branch target buffer
++	b	__arm926_setup
++	.size	__fa726te_setup, . - __fa726te_setup
++
+ 	/*
+ 	 *  R
+ 	 * .RVI ZFRS BLDP WCAM
+@@ -466,6 +485,8 @@ arm926_crval:
+ 	string	cpu_arch_name, "armv5tej"
+ 	string	cpu_elf_name, "v5"
+ 	string	cpu_arm926_name, "ARM926EJ-S"
++	string	cpu_fa726te_arch_name, "armv5te"
++	string	cpu_fa726te_name, "FA726TE"
+ 
+ 	.align
+ 
+@@ -495,3 +516,33 @@ __arm926_proc_info:
+ 	.long	v4wb_user_fns
+ 	.long	arm926_cache_fns
+ 	.size	__arm926_proc_info, . - __arm926_proc_info
++
++/*
++ * Faraday FA726TE, ARMv5TE without Jazelle. The match is strict on the
++ * part number (0x726), with the mask of the other Faraday entries
++ * (FA526, FA626TE), so it cannot overlap with them.
++ */
++	.type	__fa726te_proc_info,#object
++__fa726te_proc_info:
++	.long	0x66017261
++	.long	0xff01fff1
++	.long   PMD_TYPE_SECT | \
++		PMD_SECT_BUFFERABLE | \
++		PMD_SECT_CACHEABLE | \
++		PMD_BIT4 | \
++		PMD_SECT_AP_WRITE | \
++		PMD_SECT_AP_READ
++	.long   PMD_TYPE_SECT | \
++		PMD_BIT4 | \
++		PMD_SECT_AP_WRITE | \
++		PMD_SECT_AP_READ
++	initfn	__fa726te_setup, __fa726te_proc_info
++	.long	cpu_fa726te_arch_name
++	.long	cpu_elf_name
++	.long	HWCAP_SWP|HWCAP_HALF|HWCAP_THUMB|HWCAP_FAST_MULT|HWCAP_EDSP
++	.long	cpu_fa726te_name
++	.long	arm926_processor_functions
++	.long	v4wbi_tlb_fns
++	.long	v4wb_user_fns
++	.long	arm926_cache_fns
++	.size	__fa726te_proc_info, . - __fa726te_proc_info

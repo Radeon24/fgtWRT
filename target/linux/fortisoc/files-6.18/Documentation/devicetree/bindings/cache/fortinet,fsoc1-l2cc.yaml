@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/cache/fortinet,fsoc1-l2cc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC1 and FortiSOC2 L2 cache controllers
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  Outer cache of the Fortinet FortiSOC1 SoC (FortiGate 60C), behind the
+  FA626TE core, and of the Fortinet FortiSOC2 SoC (FortiGate 60D), behind
+  the FA726TE core. Both are 256 KiB, 8-way, physically addressed caches
+  with 32-byte lines, maintained by memory mapped registers. The second
+  one is a Faraday FTL2CC031.
+  They share the control register and the geometry, but not the auxiliary
+  control and maintenance registers, hence the SoC specific compatibles.
+
+allOf:
+  - $ref: /schemas/cache-controller.yaml#
+
+properties:
+  compatible:
+    enum:
+      - fortinet,fsoc1-l2cc
+      - fortinet,fsoc2-l2cc
+
+  reg:
+    maxItems: 1
+
+  cache-level:
+    const: 2
+
+  cache-unified: true
+
+  cache-size:
+    const: 262144
+
+  cache-sets:
+    const: 1024
+
+  cache-line-size:
+    const: 32
+
+required:
+  - compatible
+  - reg
+  - cache-level
+  - cache-unified
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    cache-controller@e4b00000 {
+        compatible = "fortinet,fsoc1-l2cc";
+        reg = <0xe4b00000 0x1000>;
+        cache-level = <2>;
+        cache-unified;
+        cache-size = <262144>;
+        cache-sets = <1024>;
+        cache-line-size = <32>;
+    };

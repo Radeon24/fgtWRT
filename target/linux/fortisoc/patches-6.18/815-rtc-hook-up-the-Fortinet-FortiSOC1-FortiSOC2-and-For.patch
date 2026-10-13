@@ -1,0 +1,85 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] rtc: hook up the Fortinet FortiSOC1, FortiSOC2 and FortiSOC3 RTC drivers
+
+Build rtc-fsoc1, rtc-fsoc2 and rtc-fsoc3, and list the FortiSOC1 RTC in
+trivial-rtc.yaml.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ ...tation/devicetree/bindings/rtc/trivial-rtc.yaml |  2 +
+ drivers/rtc/Kconfig                                | 33 +++++++++++++++
+ drivers/rtc/Makefile                               |  3 +
+ 3 files changed, 38 insertions(+)
+
+--- a/Documentation/devicetree/bindings/rtc/trivial-rtc.yaml
++++ b/Documentation/devicetree/bindings/rtc/trivial-rtc.yaml
+@@ -53,6 +53,8 @@ properties:
+       - epson,rx8571
+       # I2C-BUS INTERFACE REAL TIME CLOCK MODULE
+       - epson,rx8581
++      # Fortinet FortiSOC1 SoC Real-time Clock
++      - fortinet,fsoc1-rtc
+       # Android Goldfish Real-time Clock
+       - google,goldfish-rtc
+       # Mvebu Real-time Clock
+--- a/drivers/rtc/Kconfig
++++ b/drivers/rtc/Kconfig
+@@ -1706,6 +1706,13 @@ config RTC_DRV_CADENCE
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called rtc-cadence.
+ 
++config RTC_DRV_FSOC3
++	bool "Fortinet FortiSOC3 internal RTC (read-only)"
++	depends on OF && HAS_IOMEM && (ARCH_FSOC3 || COMPILE_TEST)
++	help
++	  Read-only driver for the internal RTC of the Fortinet FortiSOC3
++	  (FortiGate 60E/100E): the time is read, never set.
++
+ config RTC_DRV_FTRTC010
+ 	tristate "Faraday Technology FTRTC010 RTC"
+ 	depends on HAS_IOMEM
+@@ -1717,6 +1724,32 @@ config RTC_DRV_FTRTC010
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called rtc-ftrtc010.
+ 
++config RTC_DRV_FSOC1
++	tristate "Fortinet FortiSOC1 RTC"
++	depends on ARCH_FSOC1 || COMPILE_TEST
++	depends on HAS_IOMEM
++	default ARCH_FSOC1
++	help
++	  If you say Y here you will get read-only support for the
++	  battery-backed real-time clock of the Fortinet FortiSOC1 SoC
++	  (FortiGate 60C).
++
++	  This driver can also be built as a module. If so, the module
++	  will be called rtc-fsoc1.
++
++config RTC_DRV_FSOC2
++	tristate "Fortinet FortiSOC2 RTC"
++	depends on ARCH_FSOC2 || COMPILE_TEST
++	depends on HAS_IOMEM
++	depends on OF
++	help
++	  If you say Y here you will get support for the battery-backed
++	  real-time clock of the system control unit of the Fortinet
++	  FortiSOC2, found in the FortiGate 60D.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called rtc-fsoc2.
++
+ config RTC_DRV_PS3
+ 	tristate "PS3 RTC"
+ 	depends on PPC_PS3
+--- a/drivers/rtc/Makefile
++++ b/drivers/rtc/Makefile
+@@ -70,6 +70,9 @@ obj-$(CONFIG_RTC_DRV_EM3027)	+= rtc-em30
+ obj-$(CONFIG_RTC_DRV_EP93XX)	+= rtc-ep93xx.o
+ obj-$(CONFIG_RTC_DRV_FM3130)	+= rtc-fm3130.o
+ obj-$(CONFIG_RTC_DRV_FSL_FTM_ALARM)	+= rtc-fsl-ftm-alarm.o
++obj-$(CONFIG_RTC_DRV_FSOC1)	+= rtc-fsoc1.o
++obj-$(CONFIG_RTC_DRV_FSOC2)	+= rtc-fsoc2.o
++obj-$(CONFIG_RTC_DRV_FSOC3)	+= rtc-fsoc3.o
+ obj-$(CONFIG_RTC_DRV_FTRTC010)	+= rtc-ftrtc010.o
+ obj-$(CONFIG_RTC_DRV_GENERIC)	+= rtc-generic.o
+ obj-$(CONFIG_RTC_DRV_GOLDFISH)	+= rtc-goldfish.o

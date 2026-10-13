@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/dts-v1/;
+
+#include "fsoc1.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
+/ {
+	model = "Fortinet FortiGate 60C";
+	compatible = "fortinet,fg60c", "fortinet,fsoc1";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:9600n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x3b000000>;
+	};
+
+	/* The reset button; no interrupt line is known for the GPIO block */
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
+
+		key-reset {
+			label = "reset";
+			gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+	};
+
+	/*
+	 * Two-colour STATUS and second front panel LEDs, and the speed
+	 * LEDs of the WAN1, WAN2 and DMZ ports: one line lit at 100 Mbit/s,
+	 * the other at 1000. The LEDs
+	 * of the switch ports belong to its PHYs. Left as found at boot.
+	 */
+	leds {
+		compatible = "gpio-leds";
+
+		led-status-green {
+			label = "status:green";
+			gpios = <&gpio0 10 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+
+		led-status-red {
+			label = "status:red";
+			gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+
+		led-wan2-100 {
+			label = "wan2:link100";
+			gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+
+		led-wan2-1000 {
+			label = "wan2:link1000";
+			gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+
+		led-wan1-100 {
+			label = "wan1:link100";
+			gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+
+		led-wan1-1000 {
+			label = "wan1:link1000";
+			gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+
+		led-dmz-100 {
+			label = "dmz:link100";
+			gpios = <&gpio0 16 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+
+		led-dmz-1000 {
+			label = "dmz:link1000";
+			gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+
+		/* ALARM or HA, same coding as STATUS */
+		led-alarm-green {
+			label = "alarm:green";
+			gpios = <&gpio0 18 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+
+		led-alarm-red {
+			label = "alarm:red";
+			gpios = <&gpio0 19 GPIO_ACTIVE_HIGH>;
+			default-state = "keep";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Descriptor rings and buffers the boot loader leaves the
+		 * network processor running on, until its driver takes over.
+		 */
+		np_loader: np-loader@9a00000 {
+			reg = <0x09a00000 0x00a00000>;
+			no-map;
+		};
+
+		/* Command ring and message queue of the network processor */
+		np_queues: np-queues@3b000000 {
+			reg = <0x3b000000 0x00100000>;
+			no-map;
+		};
+
+		/* Flow tables of the network processor */
+		np_flow: np-flow@3c000000 {
+			reg = <0x3c000000 0x03800000>;
+			no-map;
+		};
+
+		/* Packet buffer of the network processor */
+		np_pbuf: np-pbuf@3f800000 {
+			reg = <0x3f800000 0x00800000>;
+			no-map;
+		};
+	};
+};
+
+/*
+ * Only the lines of known use are available: 7 (reset button), 10 to 19
+ * (LEDs). Line 30 is the chip select of the boot flash; the others have
+ * no known use.
+ */
+&gpio0 {
+	gpio-reserved-ranges = <0 7>, <8 2>, <20 12>;
+	status = "okay";
+};
+
+&np {
+	memory-region = <&np_pbuf>, <&np_loader>, <&np_flow>, <&np_queues>;
+	status = "okay";
+};
+
+&np_mdio {
+	phy0: ethernet-phy@0 {
+		reg = <0>;
+	};
+
+	phy2: ethernet-phy@2 {
+		reg = <2>;
+	};
+
+	phy3: ethernet-phy@3 {
+		reg = <3>;
+	};
+
+	switch@4 {
+		compatible = "marvell,mv88e6085";
+		reg = <4>;
+
+		mdio {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			swphy0: ethernet-phy@0 {
+				reg = <0>;
+			};
+
+			swphy1: ethernet-phy@1 {
+				reg = <1>;
+			};
+
+			swphy2: ethernet-phy@2 {
+				reg = <2>;
+			};
+
+			swphy3: ethernet-phy@3 {
+				reg = <3>;
+			};
+
+			swphy4: ethernet-phy@4 {
+				reg = <4>;
+			};
+		};
+
+		ethernet-ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ethernet-port@0 {
+				reg = <0>;
+				label = "lan5";
+				phy-handle = <&swphy0>;
+				phy-mode = "internal";
+			};
+
+			ethernet-port@1 {
+				reg = <1>;
+				label = "lan4";
+				phy-handle = <&swphy1>;
+				phy-mode = "internal";
+			};
+
+			ethernet-port@2 {
+				reg = <2>;
+				label = "lan3";
+				phy-handle = <&swphy2>;
+				phy-mode = "internal";
+			};
+
+			ethernet-port@3 {
+				reg = <3>;
+				label = "lan2";
+				phy-handle = <&swphy3>;
+				phy-mode = "internal";
+			};
+
+			ethernet-port@4 {
+				reg = <4>;
+				label = "lan1";
+				phy-handle = <&swphy4>;
+				phy-mode = "internal";
+			};
+
+			ethernet-port@5 {
+				reg = <5>;
+				ethernet = <&np_port0>;
+				/* The switch adds the RGMII delays of the link. */
+				phy-mode = "rgmii-id";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+		};
+	};
+};
+
+/* RGMII link to port 5 of the switch */
+&np_port0 {
+	/* No delay on the board: the switch adds them. */
+	phy-mode = "rgmii-id";
+	status = "okay";
+
+	fixed-link {
+		speed = <1000>;
+		full-duplex;
+	};
+};
+
+&np_port1 {
+	label = "wan1";
+	phy-handle = <&phy3>;
+	phy-mode = "rgmii-id";
+	status = "okay";
+};
+
+&np_port2 {
+	label = "wan2";
+	phy-handle = <&phy0>;
+	phy-mode = "rgmii-id";
+	status = "okay";
+};
+
+&np_port3 {
+	label = "dmz";
+	phy-handle = <&phy2>;
+	phy-mode = "rgmii-id";
+	status = "okay";
+};
+
+&uart0 {
+	status = "okay";
+};
+
+/*
+ * A four-port USB 2.0 hub behind the controller serves the internal disk
+ * on module, the front USB port and the USB side of the ExpressCard slot.
+ */
+&usb1 {
+	status = "okay";
+};

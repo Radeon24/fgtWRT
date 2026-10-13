@@ -1,0 +1,35 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: debug: use the FortiSOC1 UART on the FortiSOC2 too
+
+The FortiSOC2 has the same debug UART as the FortiSOC1.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/Kconfig.debug | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+--- a/arch/arm/Kconfig.debug
++++ b/arch/arm/Kconfig.debug
+@@ -355,15 +355,16 @@ choice
+ 		  their output to the 8250 at PCI COM1.
+ 
+ 	config DEBUG_FSOC1_UART
+-		bool "Kernel low-level debugging messages via Fortinet FortiSOC1 UART0"
+-		depends on ARCH_FSOC1
++		bool "Kernel low-level debugging messages via Fortinet FortiSOC1/2 UART0"
++		depends on ARCH_FSOC1 || ARCH_FSOC2
+ 		select DEBUG_UART_8250
+ 		help
+ 		  Say Y here if you want kernel low-level debugging support
+-		  on Fortinet FortiSOC1 based platforms, such as the
+-		  FortiGate 60C. Output goes to UART0, the FTUART010 wired to
+-		  the console port of the appliance. Its registers are 32 bits
+-		  apart and need 32-bit accesses.
++		  on Fortinet FortiSOC1 and FortiSOC2 based platforms, such as
++		  the FortiGate 60C and 60D. Output goes to UART0, the
++		  FTUART010 wired to the console port of the appliance, at the
++		  same address on both SoCs. Its registers are 32 bits apart
++		  and need 32-bit accesses.
+ 
+ 	config DEBUG_GEMINI
+ 		bool "Kernel low-level debugging messages via Cortina Systems Gemini UART"

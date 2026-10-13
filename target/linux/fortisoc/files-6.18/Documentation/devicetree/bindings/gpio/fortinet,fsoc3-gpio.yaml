@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpio/fortinet,fsoc3-gpio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 GPIO block
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description: |
+  The 32 GPIO lines of the miscellaneous block of the NP6Lite network
+  processor of the Fortinet FortiSOC3 (fortinet,fsoc3-np6lite), at offset
+  0xfc00 of its register window. The registers are 8 bytes apart: input
+  level (0x00), output latch (0x08), direction, 1 for an output (0x10),
+  interrupt mask (0x30) and status (0x38), output clear (0x48) and
+  direction clear (0x50).
+
+  The block lies inside the register window of the network processor,
+  whose driver drives some of its lines itself (MDC lines, PHY and switch
+  resets): such lines are listed in gpio-reserved-ranges. No interrupt
+  line of the block is known.
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-gpio
+
+  reg:
+    maxItems: 1
+
+  gpio-controller: true
+
+  "#gpio-cells":
+    const: 2
+
+  ngpios:
+    const: 32
+
+  gpio-reserved-ranges: true
+
+  gpio-line-names:
+    maxItems: 32
+
+required:
+  - compatible
+  - reg
+  - gpio-controller
+  - "#gpio-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    gpio@f500fc00 {
+        compatible = "fortinet,fsoc3-gpio";
+        reg = <0xf500fc00 0x80>;
+        gpio-controller;
+        #gpio-cells = <2>;
+        ngpios = <32>;
+        gpio-reserved-ranges = <17 2>, <20 6>;
+    };

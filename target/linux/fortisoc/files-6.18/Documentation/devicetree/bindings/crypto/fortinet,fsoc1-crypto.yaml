@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/crypto/fortinet,fsoc1-crypto.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC1 and FortiSOC2 crypto engines
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  Memory to memory crypto engine of the Fortinet FortiSOC1 SoC (FortiGate
+  60C), separate from the network processor. It processes a ring of
+  descriptors and does DES, 3DES and AES in CBC mode, optionally combined
+  with HMAC-MD5 or HMAC-SHA1. The FortiSOC2 (FortiGate 60D) has a second
+  generation of the engine, inside the register window of its network
+  processor, which also does HMAC-SHA-256/384/512. Its interrupt reaches the
+  SoC through the interrupt map of the network processor.
+
+properties:
+  compatible:
+    enum:
+      - fortinet,fsoc1-crypto
+      - fortinet,fsoc2-crypto
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    crypto@e3e00000 {
+        compatible = "fortinet,fsoc1-crypto";
+        reg = <0xe3e00000 0x1000>;
+        interrupts = <27 IRQ_TYPE_LEVEL_LOW>;
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    crypto@e3f01900 {
+        compatible = "fortinet,fsoc2-crypto";
+        reg = <0xe3f01900 0x100>;
+        interrupts = <8 IRQ_TYPE_LEVEL_HIGH>;
+    };

@@ -1,0 +1,56 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] spi: hook up the Fortinet FortiSOC2 boot flash driver
+
+Build spi-fsoc2-ssp (SPI_FSOC2_SSP).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/spi/Kconfig  | 26 ++++++++++++++++++++++++++
+ drivers/spi/Makefile |  1 +
+ 2 files changed, 27 insertions(+)
+
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -420,6 +420,32 @@ config SPI_FALCON
+ 	  has only been tested with m25p80 type chips. The hardware has no
+ 	  support for other types of SPI peripherals.
+ 
++config SPI_FSOC2_SSP
++	bool "Fortinet FortiSOC2 boot flash controller (read-only)"
++	depends on ARCH_FSOC2 || COMPILE_TEST
++	depends on SPI_MEM && OF
++	help
++	  Read access to the SPI NOR flash that holds the boot loader and
++	  the factory data (base MAC address) of the Fortinet FortiGate 60D,
++	  behind the first FTSSP010 port of its FortiSOC2, as the boot
++	  loader sets it up. Only read commands reach the flash: it cannot
++	  be written or erased through this driver.
++
++	  If unsure, say N.
++
++config SPI_FSOC2_SSP_BUS
++	bool "Fortinet FortiSOC2 switch bus (second SSP port, test)"
++	depends on SPI_FSOC2_SSP
++	help
++	  Regular SPI messages on a second FTSSP010 port of the FortiSOC2
++	  ("fortinet,fsoc2-ssp-bus"), as the FortiGate 90D reaches its two
++	  BCM53128 switches. Its chip select must be another GPIO line than
++	  the one of the boot flash, which the driver checks against every
++	  read-only flash port of the device tree; the two ports never run
++	  at the same time. Test option of the FortiGate 90D.
++
++	  If unsure, say N.
++
+ config SPI_FSI
+ 	tristate "FSI SPI driver"
+ 	depends on FSI
+--- a/drivers/spi/Makefile
++++ b/drivers/spi/Makefile
+@@ -58,6 +58,7 @@ obj-$(CONFIG_SPI_DW_PCI)		+= spi-dw-pci.
+ obj-$(CONFIG_SPI_EP93XX)		+= spi-ep93xx.o
+ obj-$(CONFIG_SPI_FALCON)		+= spi-falcon.o
+ obj-$(CONFIG_SPI_FSI)			+= spi-fsi.o
++obj-$(CONFIG_SPI_FSOC2_SSP)		+= spi-fsoc2-ssp.o
+ obj-$(CONFIG_SPI_FSL_CPM)		+= spi-fsl-cpm.o
+ obj-$(CONFIG_SPI_FSL_DSPI)		+= spi-fsl-dspi.o
+ obj-$(CONFIG_SPI_FSL_LIB)		+= spi-fsl-lib.o

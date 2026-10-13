@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/dts-v1/;
+
+#include "fsoc3.dtsi"
+
+/ {
+	model = "Fortinet FortiGate 60E";
+	compatible = "fortinet,fg60e", "fortinet,fsoc3";
+
+	aliases {
+		serial0 = &uart0;
+		i2c0 = &i2c0;
+	};
+
+	chosen {
+		bootargs = "earlycon=em_uart,mmio32,0xfb000000 console=ttyS0,9600n8 loglevel=8 panic=10";
+		stdout-path = "serial0:9600n8";
+	};
+
+	/*
+	 * Memory given to Linux: 1888 MiB from 0. The rest of the 2 GiB,
+	 * from 0x76000000, is left out for the network processor (counter
+	 * base of its traffic counter engine, see fortinet,tce-base).
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x76000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * The boot loader leaves host queues 0 of its network processor
+		 * running (TFTP on wan1): receive ring and write-back at
+		 * 0x10000000 (64 entries), 2 KiB receive buffers from 0x10000620,
+		 * transmit ring at 0x10020620 (16 entries), transmit buffers up to
+		 * 0x10028840. Kept out of Linux even though
+		 * the NP6Lite driver stops them first; the whole MiB, as a margin.
+		 */
+		np_loader: np-loader@10000000 {
+			reg = <0x10000000 0x100000>;
+			no-map;
+		};
+
+		/*
+		 * The boot loader also leaves the traffic counter engine (TCE) of
+		 * its network processor enabled with its counter base at 0: each
+		 * counter is a 16 byte entry (64-bit bytes, 64-bit packets) at
+		 * base + 16 * index, added to every 255 packets or 64 KiB, and
+		 * entries 0-4 are in use (observed: page 0 rewritten every
+		 * 10-20 s on an idle system, page cache and init text
+		 * corrupted). The driver moves the base to fortinet,tce-base
+		 * at probe; until then, the 16 KiB below the kernel page tables
+		 * (counters 0-1023) are kept out of Linux. Reserved but mapped:
+		 * with no-map, the ARM code marks the rest of the first 2 MiB
+		 * no-map as well (first usable region PMD aligned), kernel
+		 * text included.
+		 */
+		np_tce_low: np-tce-low@0 {
+			reg = <0x00000000 0x4000>;
+		};
+	};
+
+	/*
+	 * Input clock of the eMMC controller, fixed at 90 909 090 Hz
+	 * (1 GHz / 11); the card clock derives from it through the TMIO
+	 * divider.
+	 */
+	sdhi_clk: clock-sdhi {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <90909090>;
+	};
+};
+
+&{/soc} {
+	/*
+	 * eMMC controller of the FortiSOC3: an R-Car Gen3 style SDHI. PIO
+	 * only, 4-bit bus, legacy timing at most 25 MHz, no SD/SDIO probing,
+	 * user area only, read-only (core guard: read commands only, apart from
+	 * the write windows below).
+	 */
+	mmc@f3010000 {
+		compatible = "fortinet,fsoc3-sdhi";
+		reg = <0xf3010000 0x2000>;
+		interrupts = <GIC_SPI 22 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&sdhi_clk>;
+		bus-width = <4>;
+		max-frequency = <25000000>;
+		non-removable;
+		no-sdio;
+		no-sd;
+		fortinet,force-ro;
+		/*
+		 * Writes the installer may make once armed: sector 0 and
+		 * partition 2, the second firmware slot.
+		 */
+		fortinet,write-windows = <0 1>, <786440 524288>;
+	};
+
+	/*
+	 * NP6Lite msc GPIO block, read only. Reserved: 17-18 (MDC lines) and
+	 * 20-25 (resets and interrupts of the WAN PHYs and of the switch),
+	 * owned by the NP6Lite driver. The block lies inside the NP6Lite
+	 * window: the GPIO driver maps it without requesting the region.
+	 */
+	gpio@f500fc00 {
+		compatible = "fortinet,fsoc3-gpio";
+		reg = <0xf500fc00 0x80>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		ngpios = <32>;
+		gpio-reserved-ranges = <17 2>, <20 6>;
+	};
+
+	/* Internal RTC, read only: never written. */
+	rtc@fc700000 {
+		compatible = "fortinet,fsoc3-rtc";
+		reg = <0xfc700000 0x100>;
+	};
+
+	/* First I2C controller (IICA), read-only driver. */
+	i2c0: i2c@fb004000 {
+		compatible = "fortinet,fsoc3-i2c";
+		reg = <0xfb004000 0x1000>;
+		interrupts = <GIC_SPI 13 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 12 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "transfer", "stop";
+		clocks = <&periph_clk>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* Present at 0x51, no driver: i2cget only. */
+		rtc@51 {
+			compatible = "nxp,pcf8563";
+			reg = <0x51>;
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * NP6Lite network processor. Board wiring: Marvell 88E1514 at 0 and 1
+	 * (SGMII) on the MDC line of NP GPIO 17, BCM53128 at pseudo-PHY 30 on
+	 * the MDC line of NP GPIO 18; resets on NP GPIO 20 and 24 (the loader
+	 * only raises 22, the wan1 PHY).
+	 */
+	np: ethernet@f5000000 {
+		compatible = "fortinet,fsoc3-np6lite";
+		reg = <0xf5000000 0x20000>;
+		/*
+		 * One pulse per vector message, not a level: rising edge.
+		 */
+		interrupts = <GIC_SPI 48 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 49 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 50 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 51 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 52 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "hif0", "hif1", "hif2", "hif3", "err";
+		/* through the ACP (profiles set by the machine code) */
+		dma-coherent;
+		/*
+		 * PHY and switch resets, pulsed at probe: 20 = wan2, 22 = wan1,
+		 * 24 = switch. The loader releases 22 only on its TFTP path: a
+		 * boot from the eMMC leaves the wan1 PHY in reset otherwise.
+		 */
+		fortinet,reset-pins = <20 22 24>;
+		/*
+		 * LIF 0 (wan1) and LIF 1 (host queue 0) get the loader's values,
+		 * replayed at probe; the driver writes the entries of the other
+		 * LIFs at probe.
+		 */
+		fortinet,init-logical-interfaces;
+		/*
+		 * Counter base of the traffic counter engine, outside the
+		 * memory given to Linux (0x8000 entries of 16 bytes,
+		 * 512 KiB at most).
+		 */
+		fortinet,tce-base = <0x76000000>;
+
+		mdio {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			fortinet,mdc-pin = <17>;
+
+			phy_wan1: ethernet-phy@0 {
+				reg = <0>;
+			};
+
+			phy_wan2: ethernet-phy@1 {
+				reg = <1>;
+			};
+		};
+
+		mdio-switch {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			fortinet,mdc-pin = <18>;
+
+			/*
+			 * dmz = switch port 0, internalN = port 8 - N, IMP = port
+			 * 8 on NP link 1 (RGMII); b53 sets both RGMII delays of
+			 * the IMP port. MAC address of each user port: factory
+			 * base + its rank (see the boot flash below).
+			 */
+			ethernet-switch@1e {
+				compatible = "brcm,bcm53128";
+				reg = <30>;
+
+				ethernet-ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					ethernet-port@0 {
+						reg = <0>;
+						label = "dmz";
+						nvmem-cells = <&mac_base 2>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+					ethernet-port@1 {
+						reg = <1>;
+						label = "internal7";
+						nvmem-cells = <&mac_base 9>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+					ethernet-port@2 {
+						reg = <2>;
+						label = "internal6";
+						nvmem-cells = <&mac_base 8>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+					ethernet-port@3 {
+						reg = <3>;
+						label = "internal5";
+						nvmem-cells = <&mac_base 7>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+					ethernet-port@4 {
+						reg = <4>;
+						label = "internal4";
+						nvmem-cells = <&mac_base 6>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+					ethernet-port@5 {
+						reg = <5>;
+						label = "internal3";
+						nvmem-cells = <&mac_base 5>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+					ethernet-port@6 {
+						reg = <6>;
+						label = "internal2";
+						nvmem-cells = <&mac_base 4>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+					ethernet-port@7 {
+						reg = <7>;
+						label = "internal1";
+						nvmem-cells = <&mac_base 3>;
+						nvmem-cell-names = "mac-address";
+						post-init-providers = <&mac_base>;
+					};
+
+					ethernet-port@8 {
+						reg = <8>;
+						ethernet = <&np_sw>;
+						phy-mode = "rgmii";
+
+						/*
+						 * Pause on the IMP: the switch then holds
+						 * frames from the NP and sends pause frames
+						 * instead of dropping them at the IMP input
+						 * when a user port is congested. The NP
+						 * MAC does not honour them (its txctl
+						 * flow control bit is left clear).
+						 */
+						fixed-link {
+							speed = <1000>;
+							full-duplex;
+							pause;
+						};
+					};
+				};
+			};
+		};
+
+		ethernet-ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* reg = LIF; fortinet,np-link = NP link (MAC port + 1) */
+			port@0 {
+				reg = <0>;
+				label = "wan1";
+				/* rank 0: factory base + 0 */
+				nvmem-cells = <&mac_base 0>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
+				fortinet,np-link = <3>;
+				phy-handle = <&phy_wan1>;
+				phy-mode = "sgmii";
+			};
+
+			port@2 {
+				reg = <2>;
+				label = "wan2";
+				/* rank 1: factory base + 1 */
+				nvmem-cells = <&mac_base 1>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
+				fortinet,np-link = <7>;
+				phy-handle = <&phy_wan2>;
+				phy-mode = "sgmii";
+			};
+
+			/* conduit of the switch */
+			np_sw: port@3 {
+				reg = <3>;
+				label = "sw0";
+				fortinet,np-link = <1>;
+				/*
+				 * LIF of switch port 0 to 7: dmz (port 0)
+				 * stays on the conduit LIF 3, internal7 to
+				 * internal1 (ports 1 to 7) on LIFs 9 to 15.
+				 */
+				fortinet,switch-logical-interfaces = <0 9 10 11 12 13 14 15>;
+				phy-mode = "rgmii";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * Factory block of the boot flash, read only (fsoc3-boot-flash): the base
+ * MAC address of the appliance, 6 bytes at 0x5880 into the block; the
+ * port of rank i gets the base + i (wan1 0, wan2 1, dmz 2,
+ * internal1-7 3-9). The cell is not a device: post-init-providers keeps
+ * fw_devlink from holding the ports on it forever if the flash fails.
+ */
+&boot_flash {
+	status = "okay";
+
+	nvmem-layout {
+		compatible = "fixed-layout";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		mac_base: mac-address@5880 {
+			compatible = "mac-base";
+			reg = <0x5880 0x6>;
+			#nvmem-cell-cells = <1>;
+		};
+	};
+};

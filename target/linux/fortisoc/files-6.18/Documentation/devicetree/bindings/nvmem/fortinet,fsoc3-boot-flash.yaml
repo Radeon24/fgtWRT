@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/nvmem/fortinet,fsoc3-boot-flash.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 boot flash factory block
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  The Fortinet FortiSOC3 reaches the SPI NOR flash holding its boot loader
+  and factory data through a small command port, which sends and receives
+  one byte at a time. The factory block, 32 KiB at offset 0x1f8000 of the
+  flash, is exposed as a read-only NVMEM device whose offsets are relative
+  to the start of that block. On the FortiGate 60E, the base MAC address
+  of the appliance is the 6 bytes at offset 0x5880 of the block, the port
+  of rank n getting the base + n; a "mac-base" cell gives it.
+
+allOf:
+  - $ref: nvmem.yaml#
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-boot-flash
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    flash-controller@fd300000 {
+        compatible = "fortinet,fsoc3-boot-flash";
+        reg = <0xfd300000 0x1000>;
+
+        nvmem-layout {
+            compatible = "fixed-layout";
+            #address-cells = <1>;
+            #size-cells = <1>;
+
+            mac-address@5880 {
+                compatible = "mac-base";
+                reg = <0x5880 0x6>;
+                #nvmem-cell-cells = <1>;
+            };
+        };
+    };

@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/i2c/fortinet,fsoc3-i2c.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 I2C controller
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  The Fortinet FortiSOC3 has two I2C controllers of the NEC/Renesas IICA
+  family. Their control bits are those of the IICA, but the register map
+  differs from the one of renesas,iic-emev2 (split control register, 16-bit
+  status register, no separate enable register). Each has two edge
+  triggered interrupts, one at the end of each byte transferred and one on
+  a stop condition.
+
+allOf:
+  - $ref: /schemas/i2c/i2c-controller.yaml#
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-i2c
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    items:
+      - description: Transfer (end of a byte)
+      - description: Stop condition detected
+
+  interrupt-names:
+    items:
+      - const: transfer
+      - const: stop
+
+  clocks:
+    maxItems: 1
+    description:
+      Input clock of the controller. Optional, the SCL widths being set
+      for the rate the controller runs at on the FortiSOC3.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    i2c@fb004000 {
+        compatible = "fortinet,fsoc3-i2c";
+        reg = <0xfb004000 0x1000>;
+        interrupts = <GIC_SPI 13 IRQ_TYPE_EDGE_RISING>,
+                     <GIC_SPI 12 IRQ_TYPE_EDGE_RISING>;
+        interrupt-names = "transfer", "stop";
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        rtc@51 {
+            compatible = "nxp,pcf8563";
+            reg = <0x51>;
+        };
+    };

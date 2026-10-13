@@ -1,0 +1,59 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: fsoc2: build without sibling calls on the Faraday FA726TE
+
+Add CPU_FA726TE_NO_SIBLING_CALLS, selected by ARCH_FSOC2, which builds
+the C code with -fno-optimize-sibling-calls: the FA726TE has been seen
+to occasionally miss a tail call branch.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/Kconfig.platforms |  1 +
+ arch/arm/Makefile          |  5 +++++
+ arch/arm/mm/Kconfig        | 12 ++++++++++++
+ 3 files changed, 18 insertions(+)
+
+--- a/arch/arm/Kconfig.platforms
++++ b/arch/arm/Kconfig.platforms
+@@ -109,6 +109,7 @@ config ARCH_FSOC2
+ 	depends on ARCH_MULTI_V5
+ 	depends on CPU_LITTLE_ENDIAN
+ 	select CPU_ARM926T
++	select CPU_FA726TE_NO_SIBLING_CALLS
+ 	select FARADAY_FTINTC010
+ 	select FTTMR010_TIMER
+ 	help
+--- a/arch/arm/Makefile
++++ b/arch/arm/Makefile
+@@ -152,6 +152,11 @@ KBUILD_CFLAGS	+=$(CFLAGS_ABI) $(CFLAGS_I
+ KBUILD_AFLAGS	+=$(CFLAGS_ABI) $(AFLAGS_ISA) -Wa,$(arch-y) $(tune-y) -include $(srctree)/arch/arm/include/asm/unified.h -msoft-float
+ KBUILD_RUSTFLAGS += --target=arm-unknown-linux-gnueabi
+ 
++# Faraday FA726TE: a missed tail call branch runs the next function instead
++ifeq ($(CONFIG_CPU_FA726TE_NO_SIBLING_CALLS),y)
++KBUILD_CFLAGS	+= -fno-optimize-sibling-calls
++endif
++
+ CHECKFLAGS	+= -D__arm__
+ 
+ # Text offset. This list is sorted numerically by address in order to
+--- a/arch/arm/mm/Kconfig
++++ b/arch/arm/mm/Kconfig
+@@ -153,6 +153,18 @@ config CPU_ARM926T
+ 	  Say Y if you want support for the ARM926T processor.
+ 	  Otherwise, say N.
+ 
++config CPU_FA726TE_NO_SIBLING_CALLS
++	bool
++	help
++	  The Faraday FA726TE has been seen to occasionally fall through an
++	  unconditional branch instead of taking it: execution goes on with
++	  the next instruction in memory. gcc turns calls in tail position
++	  into such a branch, so that a missed tail call silently runs the
++	  function laid out next with the caller's arguments.
++
++	  Selected by the platforms built around this core, to build the C
++	  code with -fno-optimize-sibling-calls.
++
+ # FA526
+ config CPU_FA526
+ 	bool

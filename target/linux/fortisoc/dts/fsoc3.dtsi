@@ -1,0 +1,169 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Fortinet FortiSOC3
+ *
+ * Four Cortex-A9 MPCore cores (r4p1, VFPv3-D16, no NEON) with their
+ * private peripherals, a PL310 L2 cache controller, an Emma Mobile
+ * compatible console UART and the Fortinet network processor (NP6Lite).
+ *
+ * Physical addresses and interrupts, as observed on the FortiGate 60E
+ * and 100E.
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "fortinet,fsoc3";
+	interrupt-parent = <&gic>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* Release and entry point through the system manager. */
+		enable-method = "fortinet,fsoc3-smp";
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			reg = <0>;
+			next-level-cache = <&l2>;
+		};
+
+		cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			reg = <1>;
+			next-level-cache = <&l2>;
+		};
+
+		cpu@2 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			reg = <2>;
+			next-level-cache = <&l2>;
+		};
+
+		cpu@3 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			reg = <3>;
+			next-level-cache = <&l2>;
+		};
+	};
+
+	/*
+	 * No clock controller is described: the rates are fixed. PERIPHCLK (private timers) runs at half the
+	 * 1008 MHz of the cores.
+	 */
+	periph_clk: clock-periph {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <504000000>;
+	};
+
+	uart_clk: clock-uart {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <48000000>;
+	};
+
+	/* Reset on a rising edge of bit 1 of sysmgr+0x68. */
+	reboot {
+		compatible = "fortinet,fsoc3-reboot";
+		fortinet,sysmgr = <&sysmgr>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		scu@f8000000 {
+			compatible = "arm,cortex-a9-scu";
+			reg = <0xf8000000 0x100>;
+		};
+
+		gic: interrupt-controller@f8001000 {
+			compatible = "arm,cortex-a9-gic";
+			reg = <0xf8001000 0x1000>,
+			      <0xf8000100 0x100>;
+			#interrupt-cells = <3>;
+			interrupt-controller;
+		};
+
+		/*
+		 * The Cortex-A9 private timer PPIs are rising edge, fixed in
+		 * hardware: a "level high" trigger makes the GIC driver warn
+		 * "PPI11 is secure or misconfigured".
+		 */
+		global_timer: timer@f8000200 {
+			compatible = "arm,cortex-a9-global-timer";
+			reg = <0xf8000200 0x20>;
+			interrupts = <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_EDGE_RISING)>;
+			clocks = <&periph_clk>;
+		};
+
+		twd_timer: timer@f8000600 {
+			compatible = "arm,cortex-a9-twd-timer";
+			reg = <0xf8000600 0x20>;
+			interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_EDGE_RISING)>;
+			clocks = <&periph_clk>;
+		};
+
+		/*
+		 * No latency, prefetch or power property: the boot loader
+		 * settings are kept. The Cortex-A9 specific features (early
+		 * BRESP, full line of zeros) stay off: not validated.
+		 */
+		l2: cache-controller@f8010000 {
+			compatible = "arm,pl310-cache";
+			reg = <0xf8010000 0x1000>;
+			interrupts = <GIC_SPI 40 IRQ_TYPE_LEVEL_HIGH>;
+			cache-unified;
+			cache-level = <2>;
+			arm,early-bresp-disable;
+			arm,full-line-zero-disable;
+		};
+
+		uart0: serial@fb000000 {
+			compatible = "renesas,em-uart";
+			reg = <0xfb000000 0x1000>;
+			interrupts = <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&uart_clk>;
+			clock-names = "sclk";
+		};
+
+		/*
+		 * Profiles of the accelerator coherency port, programmed by the
+		 * machine code (the boot loader leaves most of them unvalidated).
+		 */
+		acp@fb400000 {
+			compatible = "fortinet,fsoc3-acp";
+			reg = <0xfb400000 0x1000>;
+		};
+
+		/*
+		 * Command port of the SPI NOR flash of the boot loader, read
+		 * only through it (fsoc3-boot-flash: the factory block).
+		 */
+		boot_flash: flash-controller@fd300000 {
+			compatible = "fortinet,fsoc3-boot-flash";
+			reg = <0xfd300000 0x1000>;
+			status = "disabled";
+		};
+
+		/*
+		 * System manager: only the restart (+0x68 bit 1) and the
+		 * secondary CPU (+0x74 bits 17-19, +0xf4..+0xfc) registers
+		 * are written, by fsoc3-reboot and mach-fsoc3/platsmp.c.
+		 */
+		sysmgr: system-controller@fc000000 {
+			compatible = "fortinet,fsoc3-sysmgr", "syscon";
+			reg = <0xfc000000 0x1000>;
+		};
+	};
+};

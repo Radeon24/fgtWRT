@@ -1,0 +1,42 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] i2c: hook up the Fortinet FortiSOC3 I2C master driver
+
+Build i2c-fsoc3 (I2C_FSOC3).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/i2c/busses/Kconfig  | 12 ++++++++++++
+ drivers/i2c/busses/Makefile |  1 +
+ 2 files changed, 13 insertions(+)
+
+--- a/drivers/i2c/busses/Kconfig
++++ b/drivers/i2c/busses/Kconfig
+@@ -677,6 +677,18 @@ config I2C_EMEV2
+ 	  If you say yes to this option, support will be included for the
+ 	  I2C interface on the Renesas Electronics EM/EV family of processors.
+ 
++config I2C_FSOC3
++	tristate "Fortinet FortiSOC3 I2C controller"
++	depends on ARCH_FSOC3 || COMPILE_TEST
++	depends on OF
++	help
++	  If you say yes to this option, support will be included for the
++	  I2C controllers (NEC/Renesas IICA family) of the Fortinet
++	  FortiSOC3, found in the FortiGate 60E and 100E. Master mode only.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called i2c-fsoc3.
++
+ config I2C_EXYNOS5
+ 	tristate "Exynos high-speed I2C driver"
+ 	depends on OF
+--- a/drivers/i2c/busses/Makefile
++++ b/drivers/i2c/busses/Makefile
+@@ -64,6 +64,7 @@ i2c-designware-pci-y					:= i2c-designwa
+ obj-$(CONFIG_I2C_DIGICOLOR)	+= i2c-digicolor.o
+ obj-$(CONFIG_I2C_EG20T)		+= i2c-eg20t.o
+ obj-$(CONFIG_I2C_EMEV2)		+= i2c-emev2.o
++obj-$(CONFIG_I2C_FSOC3)		+= i2c-fsoc3.o
+ obj-$(CONFIG_I2C_EXYNOS5)	+= i2c-exynos5.o
+ obj-$(CONFIG_I2C_GPIO)		+= i2c-gpio.o
+ obj-$(CONFIG_I2C_HIGHLANDER)	+= i2c-highlander.o

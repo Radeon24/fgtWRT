@@ -1,0 +1,72 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: mm: fa526: add Faraday FA626TE processor entry
+
+Add the processor entry of the Faraday FA626TE core of the FortiSOC1,
+with a strict ID mask, to the FA526 processor support.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/mm/Kconfig      |  3 +++
+ arch/arm/mm/proc-fa526.S | 35 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+--- a/arch/arm/mm/Kconfig
++++ b/arch/arm/mm/Kconfig
+@@ -165,6 +165,9 @@ config CPU_FA526
+ 	  The FA526 is a version of the ARMv4 compatible processor with
+ 	  Branch Target Buffer, Unified TLB and cache line size 16.
+ 
++	  This also supports the Faraday FA626TE, which shares the FA526
++	  cache and MMU handling. The kernel then uses it as an ARMv4 core.
++
+ 	  Say Y if you want support for the FA526 processor.
+ 	  Otherwise, say N.
+ 
+--- a/arch/arm/mm/proc-fa526.S
++++ b/arch/arm/mm/proc-fa526.S
+@@ -188,6 +188,7 @@ fa526_cr1_set:
+ 	string	cpu_arch_name, "armv4"
+ 	string	cpu_elf_name, "v4"
+ 	string	cpu_fa526_name, "FA526"
++	string	cpu_fa626te_name, "FA626TE"
+ 
+ 	.align
+ 
+@@ -217,3 +218,37 @@ __fa526_proc_info:
+ 	.long	fa_user_fns
+ 	.long	fa_cache_fns
+ 	.size	__fa526_proc_info, . - __fa526_proc_info
++
++/*
++ * The FA626TE shares the FA526 cache, TLB and MMU handling, so it reuses the
++ * FA526 setup and processor functions. It implements ARMv5TE but is driven
++ * through the ARMv4 support of CPU_FA526, as nothing in these code paths
++ * depends on the architecture version.
++ *
++ * The match is strict on the part number (0x626), so that it cannot overlap
++ * with the FA526 entry above.
++ */
++	.type	__fa626te_proc_info,#object
++__fa626te_proc_info:
++	.long	0x66016261
++	.long	0xff01fff1
++	.long	PMD_TYPE_SECT | \
++		PMD_SECT_BUFFERABLE | \
++		PMD_SECT_CACHEABLE | \
++		PMD_BIT4 | \
++		PMD_SECT_AP_WRITE | \
++		PMD_SECT_AP_READ
++	.long	PMD_TYPE_SECT | \
++		PMD_BIT4 | \
++		PMD_SECT_AP_WRITE | \
++		PMD_SECT_AP_READ
++	initfn	__fa526_setup, __fa626te_proc_info
++	.long	cpu_arch_name
++	.long	cpu_elf_name
++	.long	HWCAP_SWP | HWCAP_HALF
++	.long	cpu_fa626te_name
++	.long	fa526_processor_functions
++	.long	fa_tlb_fns
++	.long	fa_user_fns
++	.long	fa_cache_fns
++	.size	__fa626te_proc_info, . - __fa626te_proc_info

@@ -1,0 +1,43 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] nvmem: hook up the Fortinet FortiSOC3 boot flash driver
+
+Build fsoc3-boot-flash (NVMEM_FSOC3_BOOT_FLASH).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/nvmem/Kconfig  | 12 ++++++++++++
+ drivers/nvmem/Makefile |  2 ++
+ 2 files changed, 14 insertions(+)
+
+--- a/drivers/nvmem/Kconfig
++++ b/drivers/nvmem/Kconfig
+@@ -96,6 +96,18 @@ config NVMEM_BRCM_NVRAM
+ 	  This driver provides support for Broadcom's NVRAM that can be accessed
+ 	  using I/O mapping.
+ 
++config NVMEM_FSOC3_BOOT_FLASH
++	bool "Fortinet FortiSOC3 boot flash factory block (read-only)"
++	depends on ARCH_FSOC3 || COMPILE_TEST
++	depends on OF
++	help
++	  Read access to the base MAC address of the Fortinet FortiGate 60E,
++	  in the factory block of the SPI NOR flash of its boot loader,
++	  behind the command port of the FortiSOC3. Only read commands reach
++	  the flash: it cannot be written or erased through this driver.
++
++	  If unsure, say N.
++
+ config NVMEM_IMX_IIM
+ 	tristate "i.MX IC Identification Module support"
+ 	depends on ARCH_MXC || COMPILE_TEST
+--- a/drivers/nvmem/Makefile
++++ b/drivers/nvmem/Makefile
+@@ -22,6 +22,8 @@ obj-$(CONFIG_NVMEM_BLOCK)		+= nvmem-bloc
+ nvmem-block-y				:= block.o
+ obj-$(CONFIG_NVMEM_BRCM_NVRAM)		+= nvmem_brcm_nvram.o
+ nvmem_brcm_nvram-y			:= brcm_nvram.o
++obj-$(CONFIG_NVMEM_FSOC3_BOOT_FLASH)	+= nvmem-fsoc3-boot-flash.o
++nvmem-fsoc3-boot-flash-y		:= fsoc3-boot-flash.o
+ obj-$(CONFIG_NVMEM_IMX_IIM)		+= nvmem-imx-iim.o
+ nvmem-imx-iim-y				:= imx-iim.o
+ obj-$(CONFIG_NVMEM_IMX_OCOTP)		+= nvmem-imx-ocotp.o

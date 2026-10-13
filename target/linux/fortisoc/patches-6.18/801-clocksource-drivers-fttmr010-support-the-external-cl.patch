@@ -1,0 +1,78 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] clocksource/drivers/fttmr010: support the external clock
+
+Support the external clock of the timer, used on the FortiSOC2.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/clocksource/timer-fttmr010.c | 34 ++++++++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+--- a/drivers/clocksource/timer-fttmr010.c
++++ b/drivers/clocksource/timer-fttmr010.c
+@@ -276,13 +276,15 @@ static int __init fttmr010_common_init(s
+ 	struct fttmr010 *fttmr010;
+ 	int irq;
+ 	struct clk *clk;
++	struct clk *extclk = NULL;
+ 	int ret;
+ 	u32 val;
+ 
+ 	/*
+-	 * These implementations require a clock reference.
+-	 * FIXME: we currently only support clocking using PCLK
+-	 * and using EXTCLK is not supported in the driver.
++	 * These implementations require a clock reference. The counters
++	 * run from PCLK, or from EXTCLK when it is given. EXTCLK is only
++	 * supported with the control register layout of the Faraday
++	 * timer, not with the Aspeed one.
+ 	 */
+ 	clk = of_clk_get_by_name(np, "PCLK");
+ 	if (IS_ERR(clk)) {
+@@ -302,6 +304,25 @@ static int __init fttmr010_common_init(s
+ 	}
+ 	fttmr010->tick_rate = clk_get_rate(clk);
+ 
++	if (!is_aspeed &&
++	    of_property_match_string(np, "clock-names", "EXTCLK") >= 0) {
++		struct clk *c = of_clk_get_by_name(np, "EXTCLK");
++
++		if (IS_ERR(c)) {
++			pr_err("could not get EXTCLK\n");
++			ret = PTR_ERR(c);
++			goto out_free;
++		}
++		ret = clk_prepare_enable(c);
++		if (ret) {
++			pr_err("failed to enable EXTCLK\n");
++			clk_put(c);
++			goto out_free;
++		}
++		extclk = c;
++		fttmr010->tick_rate = clk_get_rate(extclk);
++	}
++
+ 	fttmr010->base = of_iomap(np, 0);
+ 	if (!fttmr010->base) {
+ 		pr_err("Can't remap registers\n");
+@@ -342,6 +363,9 @@ static int __init fttmr010_common_init(s
+ 	else {
+ 		val = TIMER_2_CR_ENABLE | TIMER_1_CR_UPDOWN |
+ 			TIMER_2_CR_UPDOWN;
++		/* Both counters in use run from the external clock */
++		if (extclk)
++			val |= TIMER_1_CR_CLOCK | TIMER_2_CR_CLOCK;
+ 	}
+ 	writel(val, fttmr010->base + TIMER_CR);
+ 
+@@ -429,6 +453,10 @@ static int __init fttmr010_common_init(s
+ out_unmap:
+ 	iounmap(fttmr010->base);
+ out_free:
++	if (extclk) {
++		clk_disable_unprepare(extclk);
++		clk_put(extclk);
++	}
+ 	kfree(fttmr010);
+ out_disable_clock:
+ 	clk_disable_unprepare(clk);

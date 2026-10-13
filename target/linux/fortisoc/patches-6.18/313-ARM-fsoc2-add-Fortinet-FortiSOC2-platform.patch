@@ -1,0 +1,36 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] ARM: fsoc2: add Fortinet FortiSOC2 platform
+
+Add ARCH_FSOC2, the Fortinet FortiSOC2 (FortiGate 60D) platform.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ arch/arm/Kconfig.platforms | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+--- a/arch/arm/Kconfig.platforms
++++ b/arch/arm/Kconfig.platforms
+@@ -104,6 +104,23 @@ config ARCH_FSOC1
+ 	  ATAGs, so a kernel for this platform needs ARM_APPENDED_DTB and
+ 	  ARM_ATAG_DTB_COMPAT.
+ 
++config ARCH_FSOC2
++	bool "Fortinet FortiSOC2"
++	depends on ARCH_MULTI_V5
++	depends on CPU_LITTLE_ENDIAN
++	select CPU_ARM926T
++	select FARADAY_FTINTC010
++	select FTTMR010_TIMER
++	help
++	  Support for the Fortinet FortiSOC2, found in the FortiGate 60D
++	  appliance. It is built around a Faraday FA726TE core and stock
++	  Faraday peripherals: FTINTC010 interrupt controller, FTTMR010
++	  timer, FTUART010 serial ports and FTWDT010 watchdog.
++
++	  The stock boot loader cannot pass a device tree. It only passes
++	  ATAGs, so a kernel for this platform needs ARM_APPENDED_DTB and
++	  ARM_ATAG_DTB_COMPAT.
++
+ menuconfig ARCH_HPE
+ 	bool "HPE SoC support"
+ 	depends on ARCH_MULTI_V7
