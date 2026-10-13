@@ -1,0 +1,214 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] net: switchdev: escalate a foreign port object to the bridge only once
+
+With two DSA trees bridged through one LAG each, the foreign handling
+of __switchdev_handle_port_obj_add() escalates the LAG of the second
+tree to the bridge, whose lower walk revisits that same LAG, which is
+still foreign to the first switchdev found under the bridge: the
+recursion never ends and overflows the stack (vlan_vid_add on the
+conduit is the usual victim). Pass the escalating device down, skip
+it in the bridge's lower walk and never escalate twice. Do the same
+for port object deletion and FDB events, which share the pattern.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ net/switchdev/switchdev.c | 54 +++++++++++++++++++++++++++-------------
+ 1 file changed, 36 insertions(+), 18 deletions(-)
+
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@ -626,6 +626,7 @@ switchdev_lower_dev_find(struct net_devi
+ }
+ 
+ static int __switchdev_handle_fdb_event_to_device(struct net_device *dev,
++		const struct net_device *foreign_dev,
+ 		struct net_device *orig_dev, unsigned long event,
+ 		const struct switchdev_notifier_fdb_info *fdb_info,
+ 		bool (*check_cb)(const struct net_device *dev),
+@@ -647,8 +648,10 @@ static int __switchdev_handle_fdb_event_
+ 	 * towards a bridge or a LAG device.
+ 	 */
+ 	netdev_for_each_lower_dev(dev, lower_dev, iter) {
+-		/* Do not propagate FDB entries across bridges */
+-		if (netif_is_bridge_master(lower_dev))
++		/* Do not propagate FDB entries across bridges, and do not
++		 * revisit the foreign interface we escalated from.
++		 */
++		if (netif_is_bridge_master(lower_dev) || lower_dev == foreign_dev)
+ 			continue;
+ 
+ 		/* Bridge ports might be either us, or LAG interfaces
+@@ -659,7 +662,8 @@ static int __switchdev_handle_fdb_event_
+ 						  foreign_dev_check_cb))
+ 			continue;
+ 
+-		err = __switchdev_handle_fdb_event_to_device(lower_dev, orig_dev,
++		err = __switchdev_handle_fdb_event_to_device(lower_dev, foreign_dev,
++							     orig_dev,
+ 							     event, fdb_info, check_cb,
+ 							     foreign_dev_check_cb,
+ 							     mod_cb);
+@@ -670,6 +674,10 @@ static int __switchdev_handle_fdb_event_
+ 	/* Event is neither on a bridge nor a LAG. Check whether it is on an
+ 	 * interface that is in a bridge with us.
+ 	 */
++	/* Escalate to the bridge at most once (see __switchdev_handle_port_obj_add) */
++	if (foreign_dev)
++		return err;
++
+ 	br = netdev_master_upper_dev_get_rcu(dev);
+ 	if (!br || !netif_is_bridge_master(br))
+ 		return 0;
+@@ -681,7 +689,7 @@ static int __switchdev_handle_fdb_event_
+ 	if (!foreign_dev_check_cb(switchdev, dev))
+ 		return err;
+ 
+-	return __switchdev_handle_fdb_event_to_device(br, orig_dev, event, fdb_info,
++	return __switchdev_handle_fdb_event_to_device(br, dev, orig_dev, event, fdb_info,
+ 						      check_cb, foreign_dev_check_cb,
+ 						      mod_cb);
+ }
+@@ -697,7 +705,7 @@ int switchdev_handle_fdb_event_to_device
+ {
+ 	int err;
+ 
+-	err = __switchdev_handle_fdb_event_to_device(dev, dev, event, fdb_info,
++	err = __switchdev_handle_fdb_event_to_device(dev, NULL, dev, event, fdb_info,
+ 						     check_cb, foreign_dev_check_cb,
+ 						     mod_cb);
+ 	if (err == -EOPNOTSUPP)
+@@ -708,6 +716,7 @@ int switchdev_handle_fdb_event_to_device
+ EXPORT_SYMBOL_GPL(switchdev_handle_fdb_event_to_device);
+ 
+ static int __switchdev_handle_port_obj_add(struct net_device *dev,
++			const struct net_device *foreign_dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			bool (*foreign_dev_check_cb)(const struct net_device *dev,
+@@ -739,7 +748,8 @@ static int __switchdev_handle_port_obj_a
+ 	 * necessary to go through this helper.
+ 	 */
+ 	netdev_for_each_lower_dev(dev, lower_dev, iter) {
+-		if (netif_is_bridge_master(lower_dev))
++		/* @foreign_dev's own lowers were handled before escalating */
++		if (netif_is_bridge_master(lower_dev) || lower_dev == foreign_dev)
+ 			continue;
+ 
+ 		/* When searching for switchdev interfaces that are neighbors
+@@ -750,7 +760,8 @@ static int __switchdev_handle_port_obj_a
+ 		    !switchdev_lower_dev_find(lower_dev, check_cb, foreign_dev_check_cb))
+ 			continue;
+ 
+-		err = __switchdev_handle_port_obj_add(lower_dev, port_obj_info,
++		err = __switchdev_handle_port_obj_add(lower_dev, foreign_dev,
++						      port_obj_info,
+ 						      check_cb, foreign_dev_check_cb,
+ 						      add_cb);
+ 		if (err && err != -EOPNOTSUPP)
+@@ -760,7 +771,11 @@ static int __switchdev_handle_port_obj_a
+ 	/* Event is neither on a bridge nor a LAG. Check whether it is on an
+ 	 * interface that is in a bridge with us.
+ 	 */
+-	if (!foreign_dev_check_cb)
++	/* Escalate to the bridge at most once: with two switchdev trees
++	 * bridged through LAGs, @dev is foreign to the first switchdev found
++	 * under @br, and revisiting it from @br would recurse forever.
++	 */
++	if (!foreign_dev_check_cb || foreign_dev)
+ 		return err;
+ 
+ 	br = netdev_master_upper_dev_get(dev);
+@@ -774,7 +789,7 @@ static int __switchdev_handle_port_obj_a
+ 	if (!foreign_dev_check_cb(switchdev, dev))
+ 		return err;
+ 
+-	return __switchdev_handle_port_obj_add(br, port_obj_info, check_cb,
++	return __switchdev_handle_port_obj_add(br, dev, port_obj_info, check_cb,
+ 					       foreign_dev_check_cb, add_cb);
+ }
+ 
+@@ -791,7 +806,7 @@ int switchdev_handle_port_obj_add(struct
+ {
+ 	int err;
+ 
+-	err = __switchdev_handle_port_obj_add(dev, port_obj_info, check_cb,
++	err = __switchdev_handle_port_obj_add(dev, NULL, port_obj_info, check_cb,
+ 					      NULL, add_cb);
+ 	if (err == -EOPNOTSUPP)
+ 		err = 0;
+@@ -814,7 +829,7 @@ int switchdev_handle_port_obj_add_foreig
+ {
+ 	int err;
+ 
+-	err = __switchdev_handle_port_obj_add(dev, port_obj_info, check_cb,
++	err = __switchdev_handle_port_obj_add(dev, NULL, port_obj_info, check_cb,
+ 					      foreign_dev_check_cb, add_cb);
+ 	if (err == -EOPNOTSUPP)
+ 		err = 0;
+@@ -823,6 +838,7 @@ int switchdev_handle_port_obj_add_foreig
+ EXPORT_SYMBOL_GPL(switchdev_handle_port_obj_add_foreign);
+ 
+ static int __switchdev_handle_port_obj_del(struct net_device *dev,
++			const struct net_device *foreign_dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			bool (*foreign_dev_check_cb)(const struct net_device *dev,
+@@ -850,7 +866,8 @@ static int __switchdev_handle_port_obj_d
+ 	 * necessary to go through this helper.
+ 	 */
+ 	netdev_for_each_lower_dev(dev, lower_dev, iter) {
+-		if (netif_is_bridge_master(lower_dev))
++		/* @foreign_dev's own lowers were handled before escalating */
++		if (netif_is_bridge_master(lower_dev) || lower_dev == foreign_dev)
+ 			continue;
+ 
+ 		/* When searching for switchdev interfaces that are neighbors
+@@ -861,7 +878,8 @@ static int __switchdev_handle_port_obj_d
+ 		    !switchdev_lower_dev_find(lower_dev, check_cb, foreign_dev_check_cb))
+ 			continue;
+ 
+-		err = __switchdev_handle_port_obj_del(lower_dev, port_obj_info,
++		err = __switchdev_handle_port_obj_del(lower_dev, foreign_dev,
++						      port_obj_info,
+ 						      check_cb, foreign_dev_check_cb,
+ 						      del_cb);
+ 		if (err && err != -EOPNOTSUPP)
+@@ -869,9 +887,9 @@ static int __switchdev_handle_port_obj_d
+ 	}
+ 
+ 	/* Event is neither on a bridge nor a LAG. Check whether it is on an
+-	 * interface that is in a bridge with us.
++	 * interface that is in a bridge with us. Escalate at most once.
+ 	 */
+-	if (!foreign_dev_check_cb)
++	if (!foreign_dev_check_cb || foreign_dev)
+ 		return err;
+ 
+ 	br = netdev_master_upper_dev_get(dev);
+@@ -885,7 +903,7 @@ static int __switchdev_handle_port_obj_d
+ 	if (!foreign_dev_check_cb(switchdev, dev))
+ 		return err;
+ 
+-	return __switchdev_handle_port_obj_del(br, port_obj_info, check_cb,
++	return __switchdev_handle_port_obj_del(br, dev, port_obj_info, check_cb,
+ 					       foreign_dev_check_cb, del_cb);
+ }
+ 
+@@ -901,7 +919,7 @@ int switchdev_handle_port_obj_del(struct
+ {
+ 	int err;
+ 
+-	err = __switchdev_handle_port_obj_del(dev, port_obj_info, check_cb,
++	err = __switchdev_handle_port_obj_del(dev, NULL, port_obj_info, check_cb,
+ 					      NULL, del_cb);
+ 	if (err == -EOPNOTSUPP)
+ 		err = 0;
+@@ -923,7 +941,7 @@ int switchdev_handle_port_obj_del_foreig
+ {
+ 	int err;
+ 
+-	err = __switchdev_handle_port_obj_del(dev, port_obj_info, check_cb,
++	err = __switchdev_handle_port_obj_del(dev, NULL, port_obj_info, check_cb,
+ 					      foreign_dev_check_cb, del_cb);
+ 	if (err == -EOPNOTSUPP)
+ 		err = 0;
