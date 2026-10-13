@@ -1,0 +1,51 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] net: dsa: mv88e6xxx: name the hidden RGMII timing register
+
+Name the hidden RGMII timing register of the 88E6161.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/net/dsa/mv88e6xxx/chip.c | 12 ++++++++++--
+ drivers/net/dsa/mv88e6xxx/port.h |  7 +++++++
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/dsa/mv88e6xxx/chip.c
++++ b/drivers/net/dsa/mv88e6xxx/chip.c
+@@ -3681,11 +3681,19 @@ static int mv88e6320_setup_errata(struct
+ 	/* Workaround for erratum
+ 	 *   3.3 RGMII timing may be out of spec when transmit delay is enabled
+ 	 */
+-	err = mv88e6xxx_port_hidden_write(chip, 0, 0xf, 0x7, 0xe000);
++	err = mv88e6xxx_port_hidden_write(chip,
++					  MV88E6XXX_HIDDEN_RGMII_TIMING_BLOCK,
++					  MV88E6XXX_HIDDEN_RGMII_TIMING_PORT,
++					  MV88E6XXX_HIDDEN_RGMII_TIMING_REG,
++					  0xe000);
+ 	if (err)
+ 		return err;
+ 
+-	return mv88e6xxx_port_hidden_read(chip, 0, 0xf, 0x7, &dummy);
++	return mv88e6xxx_port_hidden_read(chip,
++					  MV88E6XXX_HIDDEN_RGMII_TIMING_BLOCK,
++					  MV88E6XXX_HIDDEN_RGMII_TIMING_PORT,
++					  MV88E6XXX_HIDDEN_RGMII_TIMING_REG,
++					  &dummy);
+ }
+ 
+ /* Check if the errata has already been applied. */
+--- a/drivers/net/dsa/mv88e6xxx/port.h
++++ b/drivers/net/dsa/mv88e6xxx/port.h
+@@ -465,6 +465,13 @@
+ #define MV88E6341_PORT_RESERVED_1A_FORCE_CMODE	0x8000
+ #define MV88E6341_PORT_RESERVED_1A_SGMII_AN	0x2000
+ 
++/* Hidden register block 0x0, port 0xf, register 0x7: RGMII timing control.
++ * Port 0xf is not a switch port but a global page of the hidden registers.
++ */
++#define MV88E6XXX_HIDDEN_RGMII_TIMING_BLOCK	0x0
++#define MV88E6XXX_HIDDEN_RGMII_TIMING_PORT	0xf
++#define MV88E6XXX_HIDDEN_RGMII_TIMING_REG	0x7
++
+ int mv88e6xxx_port_read(struct mv88e6xxx_chip *chip, int port, int reg,
+ 			u16 *val);
+ int mv88e6xxx_port_write(struct mv88e6xxx_chip *chip, int port, int reg,
