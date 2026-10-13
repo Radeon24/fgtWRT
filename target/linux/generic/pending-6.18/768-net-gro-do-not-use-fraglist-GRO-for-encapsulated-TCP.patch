@@ -1,0 +1,41 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] net: gro: do not use fraglist GRO for encapsulated TCP
+
+Encapsulated TCP must not be merged by fraglist GRO.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ net/ipv4/tcp_offload.c   | 6 +++++-
+ net/ipv6/tcpv6_offload.c | 6 +++++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -467,7 +467,11 @@ struct sk_buff *tcp4_gro_receive(struct
+ 	if (!th)
+ 		goto flush;
+ 
+-	if (unlikely(skb->dev->features & NETIF_F_GRO_FRAGLIST))
++	/* The segmentation of a fraglist packet does not rebuild the outer
++	 * headers of a tunnel: keep encapsulated segments on the regular path.
++	 */
++	if (unlikely(skb->dev->features & NETIF_F_GRO_FRAGLIST) &&
++	    !NAPI_GRO_CB(skb)->encap_mark)
+ 		tcp4_check_fraglist_gro(head, skb, th);
+ 
+ 	return tcp_gro_receive(head, skb, th);
+--- a/net/ipv6/tcpv6_offload.c
++++ b/net/ipv6/tcpv6_offload.c
+@@ -71,7 +71,11 @@ struct sk_buff *tcp6_gro_receive(struct
+ 	if (!th)
+ 		goto flush;
+ 
+-	tcp6_check_fraglist_gro(head, skb, th);
++	/* The segmentation of a fraglist packet does not rebuild the outer
++	 * headers of a tunnel: keep encapsulated segments on the regular path.
++	 */
++	if (!NAPI_GRO_CB(skb)->encap_mark)
++		tcp6_check_fraglist_gro(head, skb, th);
+ 
+ 	return tcp_gro_receive(head, skb, th);
+ 
