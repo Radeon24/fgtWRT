@@ -1,0 +1,66 @@
+# Copyright (C) 2006 OpenWrt.org
+# Copyright (C) 2010 Vertical Communications
+#
+# FortiSOC: as the generic file, but an initramfs whose device tree
+# describes a rootfs_data (/lib/functions/fortisoc.sh) mounts its root
+# too, once the disk holding it has shown up.
+
+. /lib/functions/fortisoc.sh
+
+missing_lines() {
+	local file1 file2 line
+	file1="$1"
+	file2="$2"
+	oIFS="$IFS"
+	IFS=":"
+	while read line; do
+		set -- $line
+		grep -q "^$1:" "$file2" || echo "$line"
+	done < "$file1"
+	IFS="$oIFS"
+}
+
+# Rootfs mount options can be passed by declaring in the kernel
+# cmdline as much options as needed prefixed with "rootfs_mount_options."
+#
+# Example:
+# rootfs_mount_options.compress_algorithm=zstd rootfs_mount_options.noinline_data
+#
+compose_rootfs_mount_options() {
+	local mount_options
+	local cmdlinevar
+
+	for cmdlinevar in $(cat /proc/cmdline); do
+		if [ "$cmdlinevar" != "${cmdlinevar#rootfs_mount_options\.}" ]; then
+			append mount_options "${cmdlinevar#rootfs_mount_options\.}"
+		fi
+	done
+
+	echo $mount_options
+}
+
+do_mount_root() {
+	local node
+
+	node="$(fortisoc_rootfs_data_node)" &&
+		! fortisoc_rootfs_data_wait "$node" 15 &&
+		echo "- rootfs_data: no disk of the described size after 15 s, running from RAM -"
+	mount_root start "$(compose_rootfs_mount_options)"
+	boot_run_hook preinit_mount_root
+	[ -f /sysupgrade.tgz -o -f /tmp/sysupgrade.tar ] && {
+		echo "- config restore -"
+		cp /etc/passwd /etc/group /etc/shadow /tmp
+		cd /
+		[ -f /sysupgrade.tgz ] && tar xzf /sysupgrade.tgz
+		[ -f /tmp/sysupgrade.tar ] && tar xf /tmp/sysupgrade.tar
+		missing_lines /tmp/passwd /etc/passwd >> /etc/passwd
+		missing_lines /tmp/group /etc/group >> /etc/group
+		missing_lines /tmp/shadow /etc/shadow >> /etc/shadow
+		rm /tmp/passwd /tmp/group /tmp/shadow
+		# Prevent configuration corruption on a power loss
+		sync
+	}
+}
+
+{ [ "$INITRAMFS" != "1" ] || fortisoc_rootfs_data_node > /dev/null; } &&
+	boot_hook_add preinit_main do_mount_root
