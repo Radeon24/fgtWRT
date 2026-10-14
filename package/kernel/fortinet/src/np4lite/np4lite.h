@@ -72,7 +72,8 @@ void fnp4l_ipsec_port_init(struct fnp4l_ipsec *ips,
 			   struct net_device *ndev);
 int fnp4l_ipsec_rx(struct fnp4l_ipsec *ips, const u8 *htag, u32 wb0,
 		   u32 ctrl, struct xfrm_state **x);
-bool fnp4l_ipsec_rx_skb(struct sk_buff *skb, struct xfrm_state *x);
+bool fnp4l_ipsec_rx_skb(struct fnp4l_ipsec *ips, struct sk_buff *skb,
+			struct xfrm_state *x);
 void fnp4l_ipsec_rx_put(struct xfrm_state *x);
 unsigned int fnp4l_ipsec_nr_stats(const struct fnp4l_ipsec *ips);
 void fnp4l_ipsec_get_strings(const struct fnp4l_ipsec *ips, u8 **data);
@@ -126,7 +127,8 @@ static inline int fnp4l_ipsec_rx(struct fnp4l_ipsec *ips,
 	return -ENOENT;
 }
 
-static inline bool fnp4l_ipsec_rx_skb(struct sk_buff *skb,
+static inline bool fnp4l_ipsec_rx_skb(struct fnp4l_ipsec *ips,
+				      struct sk_buff *skb,
 				      struct xfrm_state *x)
 {
 	return true;
