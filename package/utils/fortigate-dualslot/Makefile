@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=fortigate-dualslot
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_FLAGS:=nonshared
@@ -18,11 +18,15 @@ define Package/fortigate-dualslot
 endef
 
 define Package/fortigate-dualslot/description
- Installs OpenWrt into the firmware slot of the boot disk that is not the
- default one, through the write windows the kernel declares (an internal
- USB stick or the eMMC, both slots guarded by the kernel). Ships
- fgt-sector0 (real direct I/O on the boot sector) and the fgt_* helpers
- of /lib/upgrade/fortigate.sh, used by the platform.sh of the target.
+ Installs OpenWrt into a firmware slot of the boot disk, through the
+ write windows the kernel declares (an internal USB stick or the eMMC,
+ both slots guarded by the kernel): the slot that is not the default
+ one, or, on boards that ask for it, a slot made the default one (the
+ boot flags of the MBR switched, [B] in the boot menu brings the stock
+ firmware back) whose rest holds rootfs_data, the persistent overlay
+ described by the device tree. Ships fgt-sector0 (real direct I/O on
+ the boot sector) and the fgt_* helpers of /lib/upgrade/fortigate.sh,
+ used by the platform.sh of the target.
 endef
 
 define Build/Compile
