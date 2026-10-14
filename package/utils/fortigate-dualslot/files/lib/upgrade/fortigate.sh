@@ -43,6 +43,11 @@
 # whole disk). The kernel keeps that area writable at all times (a
 # persistent write window, see fgt_ww_read); the installer requires it
 # to be exactly that window, inside the slot and after the container.
+# fstools reaches it through a loop device backed by the whole disk,
+# whose page cache writes back whole 4 KiB pages aligned on the disk:
+# start and count must be multiples of 8 sectors (a page across its
+# start or end would write out of the window), and the container must
+# end before it, its last 4 KiB page of the slot device included.
 #
 # The platform.sh of the target sets, for the board named by
 # board_name (the fgt_board() case there):
@@ -97,7 +102,8 @@
 # file booted from RAM by option [R] is the one installed. Its MBR
 # entry always gives the size of the slot; the length copied into the
 # target slot is the size of the ext file system of partition 0 (from
-# its superblock), the whole slot or only the container.
+# its superblock, never a 64bit one), the whole slot or only the
+# container.
 #
 # Configuration, without FGT_PERSIST: use sysupgrade -n, nothing of
 # the RAM system is kept. With FGT_PERSIST, the order is: container,
@@ -515,6 +521,9 @@ fgt_check_rootfs_data() {
 	FGT_RD_START="$(fgt_be32 0 "$node/fortinet,rootfs-data")" &&
 		FGT_RD_COUNT="$(fgt_be32 4 "$node/fortinet,rootfs-data")" ||
 		{ fgt_refuse "cannot read rootfs_data from $node"; return 1; }
+	# Aligned on the 4 KiB pages of the disk (see the top of this file)
+	[ $((FGT_RD_START % 8)) = 0 ] && [ $((FGT_RD_COUNT % 8)) = 0 ] ||
+		{ fgt_refuse "rootfs_data ($FGT_RD_START+$FGT_RD_COUNT) is not aligned on 8 sectors (4 KiB)"; return 1; }
 	# Inside the slot, at least one sector of container before it
 	[ "$FGT_RD_COUNT" -ge 1 ] &&
 		[ "$FGT_RD_START" -gt "$FGT_SLOT_START" ] &&
@@ -626,13 +635,15 @@ fgt_check_disk() { # <sector 0 file>
 }
 
 # Checks the TFTP image: gzip stream, MBR, partition 0 of the size of
-# the target slot holding an ext file system, no larger than the slot
-# (with persistence: than the room before rootfs_data), and the image
-# long enough to hold it. Prints "<offset> <length>": offset of
-# partition 0, size of its file system (from the superblock).
+# the target slot holding an ext file system (not 64bit), no larger
+# than the slot (with persistence: than the room before rootfs_data,
+# counted in whole 4 KiB pages of the slot device), and the image long
+# enough to hold it. Prints "<offset> <length>": offset of partition 0,
+# size of its file system (from the superblock).
 fgt_check_container() { # <image>
 	local img="$1" mbr="/tmp/fortigate-image.mbr"
 	local sb="/tmp/fortigate-image.sb" lba sectors blocks logbs len room
+	local incompat
 
 	get_image "$img" | head -c 512 > "$mbr"
 	[ "$(fgt_hex 0 2 "$img")" = 1f8b ] &&
@@ -646,19 +657,26 @@ fgt_check_container() { # <image>
 		[ "$sectors" = "$FGT_SLOT_SECTORS" ] ||
 		{ fgt_refuse "partition 0 is not the size of a slot"; return 1; }
 	# Superblock of the ext2/3/4 file system of partition 0: magic
-	# (0xef53), s_blocks_count_lo and s_log_block_size
+	# (0xef53), s_blocks_count_lo and s_log_block_size; without the
+	# 64bit feature (s_feature_incompat 0x80), whose high half of the
+	# block count is not read here
 	get_image "$img" | tail -c +$((lba * 512 + 1)) | head -c 2048 > "$sb"
 	[ "$(fgt_hex 0x438 2 "$sb")" = 53ef ] ||
 		{ fgt_refuse "partition 0 holds no ext file system"; return 1; }
+	incompat="$(fgt_le32 0x460 "$sb")" && [ $((incompat & 0x80)) = 0 ] ||
+		{ fgt_refuse "the file system of partition 0 is 64bit"; return 1; }
 	blocks="$(fgt_le32 0x404 "$sb")" && logbs="$(fgt_le32 0x418 "$sb")" &&
 		[ "$blocks" -ge 1 ] && [ "$logbs" -le 6 ] ||
 		{ fgt_refuse "bad superblock in partition 0"; return 1; }
 	len=$((blocks * (1024 << logbs)))
 	[ $((len / 512)) -le "$FGT_SLOT_SECTORS" ] ||
 		{ fgt_refuse "the file system of partition 0 ($len bytes) is larger than the slot"; return 1; }
+	# The slot device writes back whole 4 KiB pages (from the start of
+	# the slot): the last page of the container must end before
+	# rootfs_data
 	if [ "$FGT_PERSIST" = 1 ]; then
 		room=$((FGT_RD_START - FGT_SLOT_START))
-		[ $((len / 512)) -le $room ] ||
+		[ $((((len + 4095) / 4096) * 8)) -le $room ] ||
 			{ fgt_refuse "the file system of partition 0 ($len bytes) overlaps rootfs_data (at sector $room of the slot)"; return 1; }
 	fi
 	# The image holds the whole file system
@@ -709,23 +727,40 @@ fgt_image_name() {
 	echo "${FGT_IMAGE_NAME_ENV:-$FGT_IMAGE_NAME}"
 }
 
-# Prints the loop device mounted (in FGT_PROC_MOUNTS) whose backing
-# file is the boot disk or one of its partitions (the overlay of
-# rootfs_data before stage2 unmounts it); fails when there is none
-fgt_loop_mounted() {
-	local l b
+# Prints the loop devices bound to the boot disk or to one of its
+# partitions (backing file, by name: the path the kernel shows may lie
+# under another root after stage2 pivots); fails when there is none.
+# The one of rootfs_data (fstools, autoclear) is no longer in
+# FGT_PROC_MOUNTS once stage2 lazily unmounts the overlay, but it stays
+# bound, and its page cache may still write back, until the last user
+# is gone.
+fgt_loop_bound() {
+	local l b d="${FGT_DISK##*/}" found=""
 
 	for l in "$FGT_SYS_BLOCK"/loop*; do
 		[ -r "$l/loop/backing_file" ] || continue
 		read -r b < "$l/loop/backing_file" || continue
 		case "$b" in
-		"$FGT_DISK"|"$FGT_DISK"[0-9p]*|"$FGT_SLOT") ;;
+		"$FGT_DISK"|"$FGT_DISK"[0-9p]*|"$FGT_SLOT"|*/"$d"|*/"$d"[0-9p]*) ;;
 		*) continue ;;
 		esac
-		grep -qs "^$FGT_DEV/${l##*/} " "$FGT_PROC_MOUNTS" &&
-			{ echo "${l##*/}"; return 0; }
+		found="$found${found:+ }${l##*/}"
 	done
-	return 1
+	[ -n "$found" ] && echo "$found"
+}
+
+# Waits up to 10 seconds, by steps of 1 second (busybox sleep), until no
+# loop device is bound to the boot disk; fails if one still is
+fgt_loop_wait() {
+	local n=0 loops
+
+	while loops="$(fgt_loop_bound)"; do
+		[ $n -lt 10 ] || { echo "$loops"; return 1; }
+		[ $n = 0 ] && echo "Waiting for $loops on $FGT_DISK to be released" >&2
+		n=$((n + 1))
+		sleep 1
+	done
+	return 0
 }
 
 # Backup archive of sysupgrade to write at the head of rootfs_data
@@ -748,7 +783,10 @@ fgt_rootfs_data_backup() {
 
 # Head of rootfs_data, through the target slot (offset relative to its
 # start): the backup archive <backup>, or the marker 0xdeadc0de when
-# empty; read back from the disk
+# empty; read back from the disk. The pages of the slot device start at
+# the slot: the first one written may also cover the end of the room
+# before rootfs_data (rewritten as read), all inside the slot, which
+# the armed session window covers.
 fgt_write_rootfs_data() { # [<backup>]
 	local rel=$((FGT_RD_START - FGT_SLOT_START)) size
 
@@ -806,11 +844,12 @@ fgt_do_upgrade() { # <image>
 	name="$(fgt_image_name)"
 	part="$(fgt_check_container "$img")" || return 1
 	ofs="${part% *}"; len="${part#* }"
-	# rootfs_data: no overlay left on the disk (stage2 unmounts it),
-	# and what to write at its head
+	# rootfs_data: no loop device left on the disk (stage2 unmounts
+	# the overlay, the loop device then frees itself), and what to
+	# write at its head
 	if [ "$FGT_PERSIST" = 1 ]; then
-		loop="$(fgt_loop_mounted)" &&
-			{ fgt_refuse "$loop on $FGT_DISK is still mounted"; return 74; }
+		loop="$(fgt_loop_wait)" ||
+			{ fgt_refuse "$loop still bound to $FGT_DISK"; return 74; }
 		backup="$(fgt_rootfs_data_backup)" || return 1
 	fi
 	echo "Boot disk: $FGT_DISK, target slot $FGT_SLOT"
