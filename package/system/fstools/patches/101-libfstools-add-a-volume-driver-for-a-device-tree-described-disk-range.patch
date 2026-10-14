@@ -1,0 +1,530 @@
+From 552c75df6a341100c6000575eb92172a1478b7b8 Mon Sep 17 00:00:00 2001
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:40:29 +0200
+Subject: [PATCH 101/101] libfstools: add a volume driver for a device tree
+ described disk range
+
+Some boards keep their root filesystem in an initramfs and have a plain
+disk whose layout the boot loader imposes: no squashfs at the start of a
+partition (rootdisk) and no partition table to name the overlay
+(partname).
+
+Add the "fortisoc" volume driver. It reads a node, direct child of the
+device tree root, of compatible "fortinet,disk-rootfs-data":
+
+	rootfs-data {
+		compatible = "fortinet,disk-rootfs-data";
+		fortinet,disk-vendor = "...";		(optional)
+		fortinet,disk-model = "...";		(optional)
+		fortinet,disk-sectors = /bits/ 64 <N>;
+		fortinet,rootfs-data = <start count>;
+	};
+
+Sectors are 512 bytes, absolute on the disk. The disk is the only whole
+block device of N sectors whose vendor and model match when given. The
+rootfs_data volume is the range start..start+count-1, exposed through a
+loop device bounded to it (offset and size limit, autoclear).
+
+The range is only claimed when it already holds an ext4 or f2fs
+filesystem, an erase marker or a configuration backup: a blank or
+unknown range is left alone, so nothing is ever written to a disk that
+was not prepared for an overlay, and mount_root falls back to a tmpfs
+overlay.
+
+The device tree, sysfs and /dev paths can be overridden at build time
+for host testing.
+
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ CMakeLists.txt        |   1 +
+ libfstools/fortisoc.c | 466 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 467 insertions(+)
+ create mode 100644 libfstools/fortisoc.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e138f98..932f6e2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -16,6 +16,7 @@ ADD_LIBRARY(fstools SHARED
+ 		libfstools/mount.c
+ 		libfstools/ubi.c
+ 		libfstools/rootdisk.c
++		libfstools/fortisoc.c
+ 		libfstools/partname.c
+ 		libfstools/find.c)
+ TARGET_LINK_LIBRARIES(fstools ubox)
+diff --git a/libfstools/fortisoc.c b/libfstools/fortisoc.c
+new file mode 100644
+index 0000000..fbfca25
+--- /dev/null
++++ b/libfstools/fortisoc.c
+@@ -0,0 +1,466 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Overlay volume described by the device tree as a range of a whole disk.
++ *
++ * The board device tree carries a node, direct child of the root:
++ *
++ *	rootfs-data {
++ *		compatible = "fortinet,disk-rootfs-data";
++ *		fortinet,disk-vendor = "...";		(optional)
++ *		fortinet,disk-model = "...";		(optional)
++ *		fortinet,disk-sectors = /bits/ 64 <N>;
++ *		fortinet,rootfs-data = <start count>;
++ *	};
++ *
++ * All sector values are 512-byte sectors, absolute on the disk. The disk is
++ * the only whole block device whose size is N sectors and whose vendor and
++ * model strings match, when given. The range is exposed through a loop
++ * device bounded to it.
++ *
++ * A range whose content is not recognised (no filesystem, no erase marker,
++ * no configuration backup) is never claimed, so nothing is ever written to
++ * a disk that was not prepared for an overlay.
++ */
++
++#include "common.h"
++
++#include <errno.h>
++#include <linux/loop.h>
++
++#ifndef FORTISOC_DT_BASE
++#define FORTISOC_DT_BASE	"/sys/firmware/devicetree/base"
++#endif
++#ifndef FORTISOC_SYS_BLOCK
++#define FORTISOC_SYS_BLOCK	"/sys/block"
++#endif
++#ifndef FORTISOC_DEV_DIR
++#define FORTISOC_DEV_DIR	"/dev"
++#endif
++
++#define FORTISOC_COMPATIBLE	"fortinet,disk-rootfs-data"
++#define FORTISOC_PATHLEN	256
++#define FORTISOC_STRLEN		64
++
++struct fortisoc_volume {
++	struct volume v;
++	uint64_t offset;
++	uint64_t size;
++	char disk[FORTISOC_PATHLEN];
++	char loop_name[FORTISOC_PATHLEN];
++};
++
++struct fortisoc_desc {
++	char vendor[FORTISOC_STRLEN + 1];
++	char model[FORTISOC_STRLEN + 1];
++	uint64_t disk_sectors;
++	uint64_t start;
++	uint64_t count;
++};
++
++static struct driver fortisoc_driver;
++
++/* Read at most len bytes of a file; returns the length read or -1. */
++static ssize_t fortisoc_read_file(const char *dir, const char *name,
++				  void *buf, size_t len)
++{
++	char path[FORTISOC_PATHLEN];
++	ssize_t n;
++	int fd;
++
++	if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int)sizeof(path))
++		return -1;
++
++	fd = open(path, O_RDONLY);
++	if (fd < 0)
++		return -1;
++
++	n = read(fd, buf, len);
++	close(fd);
++
++	return n;
++}
++
++static void fortisoc_trim(char *s)
++{
++	size_t l = strlen(s);
++
++	while (l > 0 && (s[l - 1] == ' ' || s[l - 1] == '\t' || s[l - 1] == '\n'))
++		s[--l] = '\0';
++}
++
++/* Device tree string property, NUL terminated; -1 if absent or invalid. */
++static int fortisoc_dt_string(const char *node, const char *prop, char *buf)
++{
++	ssize_t n;
++
++	n = fortisoc_read_file(node, prop, buf, FORTISOC_STRLEN + 1);
++	if (n < 1 || n > FORTISOC_STRLEN || buf[n - 1] != '\0')
++		return -1;
++
++	fortisoc_trim(buf);
++	return 0;
++}
++
++/* Device tree property of exactly len bytes. */
++static int fortisoc_dt_fixed(const char *node, const char *prop, void *buf,
++			     size_t len)
++{
++	char tmp[16];
++	ssize_t n;
++
++	if (len > sizeof(tmp) - 1)
++		return -1;
++
++	n = fortisoc_read_file(node, prop, tmp, sizeof(tmp));
++	if (n != (ssize_t)len)
++		return -1;
++
++	memcpy(buf, tmp, len);
++	return 0;
++}
++
++static bool fortisoc_dt_compatible(const char *node)
++{
++	char buf[256];
++	ssize_t n;
++	char *p;
++
++	n = fortisoc_read_file(node, "compatible", buf, sizeof(buf) - 1);
++	if (n <= 0)
++		return false;
++	buf[n] = '\0';
++
++	for (p = buf; p < buf + n; p += strlen(p) + 1)
++		if (!strcmp(p, FORTISOC_COMPATIBLE))
++			return true;
++
++	return false;
++}
++
++/* Find the only matching node among the children of the root. */
++static int fortisoc_dt_find(char *node, size_t len)
++{
++	char path[FORTISOC_PATHLEN];
++	struct dirent *d;
++	struct stat st;
++	int found = 0;
++	DIR *dir;
++
++	dir = opendir(FORTISOC_DT_BASE);
++	if (!dir)
++		return -1;
++
++	while ((d = readdir(dir)) != NULL) {
++		if (d->d_name[0] == '.')
++			continue;
++
++		if (snprintf(path, sizeof(path), "%s/%s", FORTISOC_DT_BASE,
++			     d->d_name) >= (int)sizeof(path))
++			continue;
++
++		if (stat(path, &st) || !S_ISDIR(st.st_mode))
++			continue;
++
++		if (!fortisoc_dt_compatible(path))
++			continue;
++
++		if (found++) {
++			ULOG_ERR("more than one %s node\n", FORTISOC_COMPATIBLE);
++			break;
++		}
++		snprintf(node, len, "%s", path);
++	}
++
++	closedir(dir);
++
++	return found == 1 ? 0 : -1;
++}
++
++static int fortisoc_dt_read(struct fortisoc_desc *desc)
++{
++	char node[FORTISOC_PATHLEN];
++	uint64_t sectors;
++	uint32_t range[2];
++
++	memset(desc, 0, sizeof(*desc));
++
++	if (fortisoc_dt_find(node, sizeof(node)))
++		return -1;
++
++	if (fortisoc_dt_fixed(node, "fortinet,disk-sectors", &sectors,
++			      sizeof(sectors)) ||
++	    fortisoc_dt_fixed(node, "fortinet,rootfs-data", range,
++			      sizeof(range))) {
++		ULOG_ERR("%s: missing or malformed property\n", node);
++		return -1;
++	}
++
++	if (fortisoc_dt_string(node, "fortinet,disk-vendor", desc->vendor))
++		desc->vendor[0] = '\0';
++	if (fortisoc_dt_string(node, "fortinet,disk-model", desc->model))
++		desc->model[0] = '\0';
++
++	desc->disk_sectors = be64_to_cpu(sectors);
++	desc->start = be32_to_cpu(range[0]);
++	desc->count = be32_to_cpu(range[1]);
++
++	/* start and count are 32-bit: their sum cannot overflow */
++	if (!desc->start || !desc->count ||
++	    desc->start + desc->count > desc->disk_sectors) {
++		ULOG_ERR("%s: invalid range %llu+%llu on a %llu-sector disk\n",
++			 node, (unsigned long long)desc->start,
++			 (unsigned long long)desc->count,
++			 (unsigned long long)desc->disk_sectors);
++		return -1;
++	}
++
++	return 0;
++}
++
++static bool fortisoc_sys_string_eq(const char *dir, const char *name,
++				   const char *want)
++{
++	char buf[FORTISOC_STRLEN + 2];
++	ssize_t n;
++
++	if (!want[0])
++		return true;
++
++	n = fortisoc_read_file(dir, name, buf, sizeof(buf) - 1);
++	if (n <= 0)
++		return false;
++	buf[n] = '\0';
++	fortisoc_trim(buf);
++
++	return !strcmp(buf, want);
++}
++
++static bool fortisoc_disk_matches(const char *name,
++				  const struct fortisoc_desc *desc)
++{
++	char dir[FORTISOC_PATHLEN];
++	char buf[32];
++	struct stat st;
++	char *end;
++	ssize_t n;
++
++	if (!strncmp(name, "loop", 4) || !strncmp(name, "ram", 3) ||
++	    !strncmp(name, "mtdblock", 8) || !strncmp(name, "zram", 4))
++		return false;
++
++	if (snprintf(dir, sizeof(dir), "%s/%s", FORTISOC_SYS_BLOCK, name) >=
++	    (int)sizeof(dir))
++		return false;
++
++	/* whole disks only */
++	n = strlen(dir);
++	snprintf(dir + n, sizeof(dir) - n, "/partition");
++	if (!stat(dir, &st))
++		return false;
++	dir[n] = '\0';
++
++	n = fortisoc_read_file(dir, "size", buf, sizeof(buf) - 1);
++	if (n <= 0)
++		return false;
++	buf[n] = '\0';
++
++	errno = 0;
++	if (strtoull(buf, &end, 10) != desc->disk_sectors || errno ||
++	    end == buf)
++		return false;
++
++	return fortisoc_sys_string_eq(dir, "device/vendor", desc->vendor) &&
++	       fortisoc_sys_string_eq(dir, "device/model", desc->model);
++}
++
++/* Find the only whole disk matching the description. */
++static int fortisoc_disk_find(const struct fortisoc_desc *desc, char *disk,
++			      size_t len)
++{
++	struct dirent *d;
++	int found = 0;
++	DIR *dir;
++
++	dir = opendir(FORTISOC_SYS_BLOCK);
++	if (!dir)
++		return -1;
++
++	while ((d = readdir(dir)) != NULL) {
++		if (d->d_name[0] == '.')
++			continue;
++
++		if (!fortisoc_disk_matches(d->d_name, desc))
++			continue;
++
++		if (found++) {
++			ULOG_ERR("more than one disk matches %s\n",
++				 FORTISOC_COMPATIBLE);
++			break;
++		}
++
++		if (snprintf(disk, len, "%s/%s", FORTISOC_DEV_DIR, d->d_name) >=
++		    (int)len)
++			found = 2;
++	}
++
++	closedir(dir);
++
++	return found == 1 ? 0 : -1;
++}
++
++static int fortisoc_volume_identify(struct volume *v)
++{
++	struct fortisoc_volume *p = container_of(v, struct fortisoc_volume, v);
++	int ret = FS_NONE;
++	FILE *f;
++
++	f = fopen(p->disk, "r");
++	if (!f)
++		return ret;
++
++	ret = block_file_identify(f, p->offset);
++
++	fclose(f);
++
++	return ret;
++}
++
++static struct volume *fortisoc_volume_find(char *name)
++{
++	struct fortisoc_volume *p;
++	struct fortisoc_desc desc;
++
++	if (strcmp(name, "rootfs_data") != 0)
++		return NULL;
++
++	if (fortisoc_dt_read(&desc))
++		return NULL;
++
++	p = calloc(1, sizeof(*p));
++	if (!p)
++		return NULL;
++
++	if (fortisoc_disk_find(&desc, p->disk, sizeof(p->disk)))
++		goto out;
++
++	p->v.drv = &fortisoc_driver;
++	p->v.name = "rootfs_data";
++	p->offset = desc.start * 512;
++	p->size = desc.count * 512;
++
++	/* never claim, hence never format, a range that holds nothing known */
++	switch (fortisoc_volume_identify(&p->v)) {
++	case FS_EXT4:
++	case FS_F2FS:
++	case FS_DEADCODE:
++	case FS_TARGZ:
++		return &p->v;
++	default:
++		ULOG_INFO("%s: no overlay at sector %llu, ignored\n", p->disk,
++			  (unsigned long long)desc.start);
++		break;
++	}
++
++out:
++	free(p);
++	return NULL;
++}
++
++static int fortisoc_create_loop(struct fortisoc_volume *p)
++{
++	struct loop_info64 info;
++	int ret = -1;
++	int fd = -1;
++	int i, ffd;
++
++	ffd = open(p->disk, O_RDWR);
++	if (ffd < 0)
++		return -1;
++
++	for (i = 0; i < 8; i++) {
++		snprintf(p->loop_name, sizeof(p->loop_name), "%s/loop%d",
++			 FORTISOC_DEV_DIR, i);
++
++		if (fd >= 0)
++			close(fd);
++
++		fd = open(p->loop_name, O_RDWR);
++		if (fd < 0)
++			continue;
++
++		if (ioctl(fd, LOOP_GET_STATUS64, &info) == 0) {
++			if (strcmp((char *) info.lo_file_name, p->disk) != 0)
++				continue;
++			if (info.lo_offset != p->offset)
++				continue;
++			if (info.lo_sizelimit != p->size)
++				continue;
++			ret = 0;
++			break;
++		}
++
++		if (errno != ENXIO)
++			continue;
++
++		if (ioctl(fd, LOOP_SET_FD, ffd) != 0)
++			continue;
++
++		memset(&info, 0, sizeof(info));
++		snprintf((char *) info.lo_file_name, sizeof(info.lo_file_name), "%s",
++			 p->disk);
++		info.lo_offset = p->offset;
++		info.lo_sizelimit = p->size;
++		info.lo_flags |= LO_FLAGS_AUTOCLEAR;
++
++		if (ioctl(fd, LOOP_SET_STATUS64, &info) != 0) {
++			ioctl(fd, LOOP_CLR_FD, 0);
++			continue;
++		}
++
++		/*
++		 * Don't close fd. Leave it open until this process exits, to avoid
++		 * the autoclear from happening too soon.
++		 */
++		fd = -1;
++
++		ret = 0;
++		break;
++	}
++
++	if (fd >= 0)
++		close(fd);
++
++	close(ffd);
++
++	if (ret)
++		p->loop_name[0] = 0;
++
++	return ret;
++}
++
++static int fortisoc_volume_init(struct volume *v)
++{
++	struct fortisoc_volume *p = container_of(v, struct fortisoc_volume, v);
++
++	if (!p->loop_name[0] && fortisoc_create_loop(p) != 0) {
++		ULOG_ERR("unable to create loop device\n");
++		return -1;
++	}
++
++	v->type = BLOCKDEV;
++	v->size = p->size;
++	v->blk = p->loop_name;
++
++	/* the loop device is bounded to the range: its whole size is usable */
++	return block_volume_format(v, 0, v->blk);
++}
++
++static struct driver fortisoc_driver = {
++	.name = "fortisoc",
++	.priority = 40,
++	.find = fortisoc_volume_find,
++	.init = fortisoc_volume_init,
++	.identify = fortisoc_volume_identify,
++};
++
++DRIVER(fortisoc_driver);
+-- 
+2.39.5
+

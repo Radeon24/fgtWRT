@@ -1,0 +1,73 @@
+From 57f640712459d72d56a8acd1cc8691ca949ae2ed Mon Sep 17 00:00:00 2001
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:40:29 +0200
+Subject: [PATCH 100/101] libfstools: add a command line option to format
+ without discard
+
+mkfs.ext4 and mkfs.f2fs discard the whole device before formatting it.
+Some block devices refuse discard requests, or the board may not want
+them at all (e.g. a device whose writes are filtered by range).
+
+Add fstools_overlay_nodiscard=1 on the kernel command line: the overlay
+is then formatted with "mkfs.ext4 -E nodiscard" or "mkfs.f2fs -t 0".
+
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ libfstools/common.c | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/libfstools/common.c b/libfstools/common.c
+index a948321..d086885 100644
+--- a/libfstools/common.c
++++ b/libfstools/common.c
+@@ -165,11 +165,23 @@ static bool use_f2fs_compression(void)
+ 	return typeparam[0] && strcmp(typeparam, "none");
+ }
+ 
++static bool use_nodiscard(void)
++{
++	char param[BUFLEN];
++
++	if (!get_var_from_file("/proc/cmdline", "fstools_overlay_nodiscard",
++			       param, sizeof(param)))
++		return false;
++
++	return !strcmp(param, "1");
++}
++
+ int block_volume_format(struct volume *v, uint64_t offset, const char *bdev)
+ {
+ 	int ret = 0;
+ 	char str[256];
+ 	unsigned int skip_blocks = 0;
++	bool nodiscard;
+ 	int fd;
+ 	__u32 deadc0de;
+ 	size_t sz;
+@@ -216,16 +228,20 @@ int block_volume_format(struct volume *v, uint64_t offset, const char *bdev)
+ 		}
+ do_format:
+ 		ULOG_INFO("overlay filesystem in %s has not been formatted yet\n", v->blk);
++		nodiscard = use_nodiscard();
+ 		if (use_f2fs(v, offset, bdev)) {
+ 			if (use_f2fs_compression()) {
+ 				ULOG_INFO("f2fs overlay compression enabled\n");
+ 				snprintf(str, sizeof(str),
+-					 "mkfs.f2fs -q -f -O extra_attr,compression -l rootfs_data %s", v->blk);
++					 "mkfs.f2fs -q -f%s -O extra_attr,compression -l rootfs_data %s",
++					 nodiscard ? " -t 0" : "", v->blk);
+ 			} else {
+-				snprintf(str, sizeof(str), "mkfs.f2fs -q -f -l rootfs_data %s", v->blk);
++				snprintf(str, sizeof(str), "mkfs.f2fs -q -f%s -l rootfs_data %s",
++					 nodiscard ? " -t 0" : "", v->blk);
+ 			}
+ 		} else {
+-			snprintf(str, sizeof(str), "mkfs.ext4 -q -F -L rootfs_data %s", v->blk);
++			snprintf(str, sizeof(str), "mkfs.ext4 -q -F%s -L rootfs_data %s",
++				 nodiscard ? " -E nodiscard" : "", v->blk);
+ 		}
+ 
+ 		ret = system(str);
+-- 
+2.39.5
+
