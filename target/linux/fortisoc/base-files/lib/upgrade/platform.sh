@@ -2,9 +2,26 @@
 #
 # These images run from RAM only: nothing is installed, except on the
 # boards below, whose installer (the fgt_* functions of fortigate.sh,
-# package fortigate-dualslot) writes the firmware slot of the boot
-# disk that is not the default one, through the write windows of the
-# kernel: an internal USB stick, or the eMMC.
+# package fortigate-dualslot) writes a firmware slot of the boot disk
+# through the write windows of the kernel: an internal USB stick, or
+# the eMMC.
+#
+# 90D and 60E: the slot that is not the default one; the default slot
+# is left unchanged ([B] in the boot menu switches to OpenWrt), and
+# nothing of the system is kept (sysupgrade -n).
+#
+# 60D: persistence (FGT_PERSIST). Its slot (partition 1, sectors
+# 1-524288 of the stick) holds the container (the ext file system the
+# boot loader reads, smaller than the slot) followed by rootfs_data,
+# the upper layer of the overlay. The place of rootfs_data is read
+# from the device tree (node fortinet,disk-rootfs-data), never set
+# here: the expected witness below only repeats what the kernel
+# reports from the same device tree, and rootfs_data must be its
+# persistent window. The slot is made the default one
+# (FGT_SLOT_MAKE_DEFAULT: boot flags 0x1be/0x1ce, allowed by the
+# witness); [B] in the boot menu brings FortiOS back. sysupgrade
+# keeps the configuration (its backup archive at the head of
+# rootfs_data), sysupgrade -n erases it.
 
 # Sets the disk, the target slot and the image name of the board named
 # by board_name, for the fgt_* functions of fortigate.sh. Fails on any
@@ -26,9 +43,12 @@ fgt_board() {
 		FGT_SLOT_SIZE=524288
 		FGT_SLOT_IMAGE=0
 		FGT_IMAGE_NAME=FGT60D-OpenWrt
-		FGT_SLOT_NONDEFAULT=1
+		# OpenWrt becomes the default slot, rootfs_data persistent
+		# (its place comes from the device tree)
+		FGT_SLOT_MAKE_DEFAULT=1
+		FGT_PERSIST=1
 		FGT_HEADER_FORBIDDEN="0xdc:1"
-		FGT_WW_EXPECTED="0+1 1+524288 sector0 0x10+32 0x128+4"
+		FGT_WW_EXPECTED="0+1 1+524288 persistent 32769+491520 sector0 0x10+32 0x128+4 0x1be+1 0x1ce+1"
 		;;
 	fortinet,fg90d)
 		FGT_BOARD="FortiGate 90D"
@@ -86,7 +106,9 @@ platform_do_upgrade() {
 }
 
 # Binaries copied into the upgrade ramdisk, on top of the default ones
-# (fortigate.sh needs them there)
+# (fortigate.sh needs them there; dd, hexdump, tail, wc, grep, cut and
+# printf, also used for rootfs_data and the device tree, are among the
+# default ones of stage2)
 case "$(board_name)" in
 fortinet,fg60d|fortinet,fg90d)
 	RAMFS_COPY_BIN="$RAMFS_COPY_BIN blockdev cmp head readlink sha256sum fgt-sector0"

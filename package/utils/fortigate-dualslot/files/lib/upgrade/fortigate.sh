@@ -19,9 +19,30 @@
 # zeros; the build numbers of images 0 and 1 are at 0x128 and 0x12c
 # (4 bytes). The boot loader picks the default slot from the boot flag
 # of MBR entries 1 and 2; its menu option [B] switches it (and only
-# writes 0x1be/0x1ce). Nothing here changes the default slot: OpenWrt
-# goes to the slot that is not the default one, and the switch is left
-# to the boot loader.
+# writes 0x1be/0x1ce). By default nothing here changes the default
+# slot: OpenWrt goes to the slot that is not the default one, and the
+# switch is left to the boot loader. A board may ask instead that the
+# target slot become the default one (FGT_SLOT_MAKE_DEFAULT): the boot
+# flags are then switched (target 0x80, other 0x00) in the same write
+# of sector 0 as the name and the build number, and [B] in the boot
+# menu brings the stock firmware back.
+#
+# Persistence (FGT_PERSIST): the slot then holds two areas,
+#
+#   start of the slot   the container: the ext file system the boot
+#                       loader reads (flatkc...), never mounted by
+#                       OpenWrt; its size is the one of the ext file
+#                       system of the image, smaller than the slot
+#   rest of the slot    rootfs_data: the upper layer of the overlay,
+#                       an ext4 file system made by fstools at boot
+#
+# The place of rootfs_data is never set here nor in platform.sh: it is
+# read from the device tree, node "fortinet,disk-rootfs-data", a child
+# of the root (properties fortinet,disk-sectors, 64-bit, the size of
+# the disk, and fortinet,rootfs-data, <start count>, in sectors of the
+# whole disk). The kernel keeps that area writable at all times (a
+# persistent write window, see fgt_ww_read); the installer requires it
+# to be exactly that window, inside the slot and after the container.
 #
 # The platform.sh of the target sets, for the board named by
 # board_name (the fgt_board() case there):
@@ -39,6 +60,13 @@
 #                         boot flags, the magic and the other image
 #   FGT_SLOT_NONDEFAULT   1: refuse unless the target slot is not the
 #                         default one
+#   FGT_SLOT_MAKE_DEFAULT 1: make the target slot the default one (the
+#                         boot flags 0x1be/0x1ce become writable for
+#                         this board only); never with
+#                         FGT_SLOT_NONDEFAULT
+#   FGT_PERSIST           1: persistence, rootfs_data in the rest of
+#                         the slot (needs FGT_DISK_SECTORS, the device
+#                         tree node and a persistent window)
 #
 #   usb: FGT_USB_PATH (USB host controller), FGT_USB_PORT (port of the
 #        stick), FGT_DISK_VENDOR, FGT_DISK_MODEL, FGT_DISK_SECTORS (the
@@ -58,19 +86,40 @@
 # The closed list of header bytes is enforced here as well.
 # The windows are disarmed at boot: this script arms them, once per
 # boot and for 10 minutes at most, right before writing, and turns
-# them off when done or on failure. A USB stick may also be kept
+# them off when done or on failure (the persistent window of
+# rootfs_data does not depend on it). A USB stick may also be kept
 # read-only by user space (blockdev --setro): the stick alone is made
 # writable while the windows are armed, and read-only again
 # afterwards.
 #
 # Upgrade image: the TFTP image itself (a gzip stream holding a disk
 # image whose partition 0 is the file system of a slot), so that the
-# file booted from RAM by option [R] is the one installed. Partition 0
-# is copied as is into the target slot. Use sysupgrade -n: nothing of
-# the RAM system is kept.
+# file booted from RAM by option [R] is the one installed. Its MBR
+# entry always gives the size of the slot; the length copied into the
+# target slot is the size of the ext file system of partition 0 (from
+# its superblock), the whole slot or only the container.
+#
+# Configuration, without FGT_PERSIST: use sysupgrade -n, nothing of
+# the RAM system is kept. With FGT_PERSIST, the order is: container,
+# then rootfs_data, then sector 0. sysupgrade (keep the configuration)
+# hands over its backup archive (UPGRADE_BACKUP, /tmp/sysupgrade.tgz,
+# set by procd, visible in platform_do_upgrade): it is written at the
+# head of rootfs_data, and at the next boot fstools extracts it,
+# formats rootfs_data and the configuration is restored (as
+# emmc_copy_config does); with -c or -o the archive merely holds more
+# files (the changed files of /etc, or of / but the packages: they
+# need /overlay/upper/etc, there with persistence). sysupgrade -n (no
+# UPGRADE_BACKUP): the marker 0xdeadc0de is written at the head of
+# rootfs_data, and fstools formats it at the next boot. rootfs_data is
+# never formatted here.
 #
 # The name of the image written in the header can be overridden without
 # touching platform.sh: set FGT_IMAGE_NAME_ENV in the environment.
+#
+# The paths of sysfs, /dev, /proc and of the device tree may be
+# overridden from the environment, for a test harness on a PC only:
+# FGT_SYS_BLOCK, FGT_SYS_CLASS_BLOCK, FGT_SYS_MODULE, FGT_DEV,
+# FGT_PROC_MOUNTS, FGT_DT_BASE, FGT_DROP_CACHES, FGT_SECTOR0.
 
 # Kill switch: set to 0 to refuse every upgrade (not forceable).
 FGT_DUALSLOT_CONFIRMED=1
@@ -81,8 +130,22 @@ FGT_MAGIC=aa55
 FGT_NAME_LEN=32
 FGT_BUILD_LEN=4
 # Direct I/O on sector 0 (never busybox dd: not direct at bs=512)
-FGT_SECTOR0=fgt-sector0
-FGT_DROP_CACHES=/proc/sys/vm/drop_caches
+FGT_SECTOR0="${FGT_SECTOR0:-fgt-sector0}"
+# Description of rootfs_data in the device tree
+FGT_DT_COMPAT=fortinet,disk-rootfs-data
+# Marker that makes fstools format rootfs_data at the next boot
+FGT_DEADCODE=deadc0de
+# Head of the backup archive fstools recognizes (gzip, deflate, no flag)
+FGT_TARGZ=1f8b0800
+
+# Paths of the running system (overridable for a test harness only)
+FGT_SYS_BLOCK="${FGT_SYS_BLOCK:-/sys/block}"
+FGT_SYS_CLASS_BLOCK="${FGT_SYS_CLASS_BLOCK:-/sys/class/block}"
+FGT_SYS_MODULE="${FGT_SYS_MODULE:-/sys/module}"
+FGT_DEV="${FGT_DEV:-/dev}"
+FGT_PROC_MOUNTS="${FGT_PROC_MOUNTS:-/proc/mounts}"
+FGT_DT_BASE="${FGT_DT_BASE:-/sys/firmware/devicetree/base}"
+FGT_DROP_CACHES="${FGT_DROP_CACHES:-/proc/sys/vm/drop_caches}"
 
 # Hexadecimal dump of <count> bytes at <offset> of a file or a stream
 fgt_hex() { # <offset> <count> [<file>]
@@ -99,6 +162,20 @@ fgt_le32() { # <offset> <file>
 
 	[ ${#h} -eq 8 ] || return 1
 	echo $((0x${h:6:2}${h:4:2}${h:2:2}${h:0:2}))
+}
+
+# Big-endian 32-bit value at <offset> of a file (device tree cells)
+fgt_be32() { # <offset> <file>
+	local h="$(fgt_hex "$1" 4 "$2")"
+
+	[ ${#h} -eq 8 ] || return 1
+	echo $((0x$h))
+}
+
+# Bytes of a whole file, or of the standard input, as " xx xx ..."
+# (one word per byte, so that a match never straddles two bytes)
+fgt_hexw() { # [<file>]
+	hexdump -v -e '1/1 " %02x"' ${1:+"$1"}
 }
 
 fgt_refuse() {
@@ -129,8 +206,8 @@ fgt_check_settings() {
 	local o
 
 	case "$FGT_DISK_KIND" in
-	usb) FGT_WW=/sys/module/block/parameters/write_windows ;;
-	mmc) FGT_WW=/sys/module/mmc_core/parameters/write_windows ;;
+	usb) FGT_WW="$FGT_SYS_MODULE/block/parameters/write_windows" ;;
+	mmc) FGT_WW="$FGT_SYS_MODULE/mmc_core/parameters/write_windows" ;;
 	*) return 1 ;;
 	esac
 	case "$FGT_SLOT_PART" in
@@ -141,9 +218,13 @@ fgt_check_settings() {
 	0|1) ;;
 	*) return 1 ;;
 	esac
+	case "$FGT_SLOT_NONDEFAULT:$FGT_SLOT_MAKE_DEFAULT:$FGT_PERSIST" in
+	*[!01:]*) return 1 ;;
+	1:1:*) return 1 ;;
+	esac
 	[ -n "$FGT_BOARD" ] && [ -n "$FGT_IMAGE_NAME" ] &&
 		[ -n "$FGT_WW_EXPECTED" ] || return 1
-	case "$FGT_SLOT_LBA$FGT_SLOT_SIZE" in
+	case "$FGT_SLOT_LBA$FGT_SLOT_SIZE$FGT_DISK_SECTORS" in
 	*[!0-9]*) return 1 ;;
 	esac
 	[ -n "$FGT_SLOT_LBA" ] && [ "$FGT_SLOT_LBA" -ge 1 ] &&
@@ -155,30 +236,54 @@ fgt_check_settings() {
 	else
 		[ -n "$FGT_MMC_DISK" ] && [ -n "$FGT_MMC_SLOT" ] || return 1
 	fi
+	# Persistence: the size of the disk is checked against the device
+	# tree, on the eMMC as well
+	if [ "$FGT_PERSIST" = 1 ]; then
+		[ -n "$FGT_DISK_SECTORS" ] || return 1
+	fi
 	o="$(fgt_image_offsets "$FGT_SLOT_IMAGE")" || return 1
 	FGT_NAME_OFS="${o% *}"; FGT_BUILD_OFS="${o#* }"
 	o="$(fgt_image_offsets "$((1 - FGT_SLOT_IMAGE))")" || return 1
 	FGT_OTHER_NAME_OFS="${o% *}"; FGT_OTHER_BUILD_OFS="${o#* }"
+	# Boot flags of the target partition and of the other one
+	FGT_FLAG_OFS=$(fgt_mbr $FGT_SLOT_PART 0)
+	FGT_OTHER_FLAG_OFS=$(fgt_mbr $((3 - FGT_SLOT_PART)) 0)
 	# The closed list of header bytes this script may change (first
-	# offset, length): name and build number of the image it writes.
+	# offset, length): name and build number of the image it writes,
+	# and the boot flags of MBR entries 1 and 2 when the board makes
+	# the target slot the default one.
 	FGT_WRITABLE="$FGT_NAME_OFS:$FGT_NAME_LEN $FGT_BUILD_OFS:$FGT_BUILD_LEN"
 	# Header bytes never to be changed, whatever the list above says:
-	# boot flags of MBR entries 1 and 2, magic, name and build number
-	# of the other image, and the bytes listed by the board.
-	FGT_FORBIDDEN="0x1be:1 0x1ce:1 0x0e:2 \
+	# boot flags of MBR entries 1 and 2 (unless the board makes the
+	# target slot the default one), magic, name and build number of
+	# the other image, and the bytes listed by the board.
+	if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ]; then
+		FGT_WRITABLE="$FGT_WRITABLE 0x1be:1 0x1ce:1"
+		FGT_FORBIDDEN=""
+	else
+		FGT_FORBIDDEN="0x1be:1 0x1ce:1 "
+	fi
+	FGT_FORBIDDEN="${FGT_FORBIDDEN}0x0e:2 \
 $FGT_OTHER_NAME_OFS:$FGT_NAME_LEN $FGT_OTHER_BUILD_OFS:$FGT_BUILD_LEN \
 $FGT_HEADER_FORBIDDEN"
 }
 
 # Every range of FGT_WRITABLE must lie in the header (before the
-# partition table) and out of FGT_FORBIDDEN
+# partition table), or be the boot flag of MBR entry 1 or 2 when the
+# board makes the target slot the default one, and lie out of
+# FGT_FORBIDDEN
 fgt_check_writable_list() {
 	local w f wo wl fo fl
 
 	for w in $FGT_WRITABLE; do
 		wo=$((${w%%:*})); wl=$((${w##*:}))
-		[ $wl -gt 0 ] && [ $((wo + wl)) -le $((0x1be)) ] ||
-			return 1
+		if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ] && [ $wl = 1 ] &&
+			{ [ $wo = $(fgt_mbr 1 0) ] || [ $wo = $(fgt_mbr 2 0) ]; }; then
+			:
+		else
+			[ $wl -gt 0 ] && [ $((wo + wl)) -le $((0x1be)) ] ||
+				return 1
+		fi
 		for f in $FGT_FORBIDDEN; do
 			fo=$((${f%%:*})); fl=$((${f##*:}))
 			[ $((wo + wl)) -le $fo ] || [ $((fo + fl)) -le $wo ] ||
@@ -192,7 +297,7 @@ fgt_check_writable_list() {
 fgt_disk_usb() {
 	local b d real v m n found=""
 
-	for b in /sys/block/sd*; do
+	for b in "$FGT_SYS_BLOCK"/sd*; do
 		[ -e "$b" ] || continue
 		d="${b##*/}"
 		real="$(readlink -f "$b")" || continue
@@ -217,21 +322,29 @@ fgt_disk_mmc() {
 	[ -b "$FGT_MMC_DISK" ] && [ -b "$FGT_MMC_SLOT" ]
 }
 
-# Witness of the write windows, read at every check: the first word is
-# "inactive", "off", "disarmed" or "armed"; then the windows
-# ("<start>+<count>", in sectors of the whole disk, or "none"), and,
-# for the USB guard, "sector0" followed by the bytes of sector 0 that
-# may change ("<offset hex>+<count>", or "none"). Sets FGT_WW_LINE (the
-# witness), FGT_WW_STATE, FGT_WW_WINDOWS and FGT_WW_BYTES in the calling
-# shell: never call it from a command substitution. Any other shape
-# (unknown word, state word not first or repeated) gives the state
-# "unknown".
+# Witness of the write windows, read at every check, one line:
+#
+#   <state> <windows...> [persistent <windows...>] [sector0 <bytes...>]
+#
+# The state is "inactive", "off", "disarmed" or "armed"; then the
+# session windows ("<start>+<count>", in sectors of the whole disk, or
+# "none"), armed by this script; then, on boards with persistence
+# only, "persistent" followed by the windows the kernel keeps writable
+# at all times (rootfs_data); then, for the USB guard, "sector0"
+# followed by the bytes of sector 0 that may change ("<offset
+# hex>+<count>", or "none"). Sets FGT_WW_LINE (the witness),
+# FGT_WW_STATE, FGT_WW_WINDOWS, FGT_WW_PERSISTENT and FGT_WW_BYTES in
+# the calling shell: never call it from a command substitution. Any
+# other shape (unknown word, state word not first or repeated,
+# "persistent" or "sector0" repeated, out of order or not expected on
+# this board) gives the state "unknown".
 fgt_ww_read() {
-	local w n=0 s0=0
+	local w n=0 part=session
 
 	FGT_WW_LINE=""
 	FGT_WW_STATE=unknown
 	FGT_WW_WINDOWS=""
+	FGT_WW_PERSISTENT=""
 	FGT_WW_BYTES=""
 	[ -r "$FGT_WW" ] || return 1
 	read -r FGT_WW_LINE < "$FGT_WW" || return 1
@@ -242,19 +355,24 @@ fgt_ww_read() {
 			[ $n = 1 ] || { FGT_WW_STATE=unknown; return 0; }
 			FGT_WW_STATE="$w"
 			;;
-		sector0)
-			[ $s0 = 0 ] && [ "$FGT_DISK_KIND" = usb ] ||
+		persistent)
+			[ $part = session ] && [ "$FGT_PERSIST" = 1 ] ||
 				{ FGT_WW_STATE=unknown; return 0; }
-			s0=1
+			part=persistent
+			;;
+		sector0)
+			[ $part != sector0 ] && [ "$FGT_DISK_KIND" = usb ] ||
+				{ FGT_WW_STATE=unknown; return 0; }
+			part=sector0
 			;;
 		none)
 			;;
 		[0-9]*+[0-9]*)
-			if [ "$s0" = 1 ]; then
-				FGT_WW_BYTES="$FGT_WW_BYTES $w"
-			else
-				FGT_WW_WINDOWS="$FGT_WW_WINDOWS $w"
-			fi
+			case $part in
+			session) FGT_WW_WINDOWS="$FGT_WW_WINDOWS $w" ;;
+			persistent) FGT_WW_PERSISTENT="$FGT_WW_PERSISTENT $w" ;;
+			sector0) FGT_WW_BYTES="$FGT_WW_BYTES $w" ;;
+			esac
 			;;
 		*)
 			FGT_WW_STATE=unknown
@@ -278,7 +396,8 @@ fgt_ww_is() { # <state>
 		[ "$FGT_WW_LINE" = "$1 $FGT_WW_EXPECTED" ]
 }
 
-# True when the windows cover <start>+<count> sectors of the disk
+# True when the session windows cover <start>+<count> sectors of the
+# disk
 fgt_ww_covers() { # <start> <count>
 	local w ws wc
 
@@ -334,21 +453,87 @@ fgt_drop_caches() {
 	echo 3 > "$FGT_DROP_CACHES"
 }
 
+# The one node of the device tree, child of the root, compatible with
+# FGT_DT_COMPAT. Prints its path; fails unless exactly one matches.
+fgt_dt_node() {
+	local c want found=""
+
+	want=" 00$(printf '%s' "$FGT_DT_COMPAT" | fgt_hexw) 00 "
+	for c in "$FGT_DT_BASE"/*/compatible; do
+		[ -f "$c" ] || continue
+		case " 00$(fgt_hexw "$c") " in
+		*"$want"*) ;;
+		*) continue ;;
+		esac
+		[ -z "$found" ] || return 1
+		found="${c%/compatible}"
+	done
+	[ -n "$found" ] && echo "$found"
+}
+
+# True when the string property <file> of the device tree is absent or
+# holds exactly <string>
+fgt_dt_string_is() { # <file> <string>
+	[ -e "$1" ] || return 0
+	[ "$(fgt_hexw "$1")" = "$(printf '%s' "$2" | fgt_hexw) 00" ]
+}
+
+# rootfs_data as described by the device tree (never by platform.sh):
+# the size of the disk must be FGT_DISK_SECTORS and the one of the
+# disk found, the area must lie inside the target slot (a container
+# before it) and be exactly the one persistent window of the witness
+# (fgt_ww_read first). Sets FGT_RD_START and FGT_RD_COUNT (sectors of
+# the whole disk).
+fgt_check_rootfs_data() {
+	local node hi lo size=""
+
+	FGT_RD_START=""; FGT_RD_COUNT=""
+	node="$(fgt_dt_node)" ||
+		{ fgt_refuse "no device tree node $FGT_DT_COMPAT (or more than one)"; return 1; }
+	[ "$(wc -c < "$node/fortinet,disk-sectors" 2>/dev/null)" = 8 ] &&
+		[ "$(wc -c < "$node/fortinet,rootfs-data" 2>/dev/null)" = 8 ] ||
+		{ fgt_refuse "malformed device tree node $node"; return 1; }
+	# 64-bit size of the disk: a high cell of 0 (2 TiB at most)
+	hi="$(fgt_be32 0 "$node/fortinet,disk-sectors")" &&
+		lo="$(fgt_be32 4 "$node/fortinet,disk-sectors")" &&
+		[ "$hi" = 0 ] && [ "$lo" = "$FGT_DISK_SECTORS" ] ||
+		{ fgt_refuse "device tree disk size ($hi:$lo) is not $FGT_DISK_SECTORS sectors"; return 1; }
+	read size < "$FGT_SYS_CLASS_BLOCK/${FGT_DISK##*/}/size" 2>/dev/null
+	[ "$size" = "$FGT_DISK_SECTORS" ] ||
+		{ fgt_refuse "$FGT_DISK is not $FGT_DISK_SECTORS sectors ($size)"; return 1; }
+	if [ "$FGT_DISK_KIND" = usb ]; then
+		fgt_dt_string_is "$node/fortinet,disk-vendor" "$FGT_DISK_VENDOR" &&
+			fgt_dt_string_is "$node/fortinet,disk-model" "$FGT_DISK_MODEL" ||
+			{ fgt_refuse "device tree disk vendor or model is not $FGT_DISK_VENDOR $FGT_DISK_MODEL"; return 1; }
+	fi
+	FGT_RD_START="$(fgt_be32 0 "$node/fortinet,rootfs-data")" &&
+		FGT_RD_COUNT="$(fgt_be32 4 "$node/fortinet,rootfs-data")" ||
+		{ fgt_refuse "cannot read rootfs_data from $node"; return 1; }
+	# Inside the slot, at least one sector of container before it
+	[ "$FGT_RD_COUNT" -ge 1 ] &&
+		[ "$FGT_RD_START" -gt "$FGT_SLOT_START" ] &&
+		[ $((FGT_RD_START + FGT_RD_COUNT)) -le $((FGT_SLOT_START + FGT_SLOT_SECTORS)) ] ||
+		{ fgt_refuse "rootfs_data ($FGT_RD_START+$FGT_RD_COUNT) is not inside partition $FGT_SLOT_PART after its start"; return 1; }
+	[ "$FGT_WW_PERSISTENT" = " $FGT_RD_START+$FGT_RD_COUNT" ] ||
+		{ fgt_refuse "the persistent write window ($FGT_WW_PERSISTENT) is not rootfs_data ($FGT_RD_START+$FGT_RD_COUNT)"; return 1; }
+}
+
 # Checks of the disk and its boot sector, shared by the image check and
 # the upgrade itself. Sets FGT_DISK, FGT_SLOT, FGT_SLOT_START and
-# FGT_SLOT_SECTORS; the target partition must lie inside the write
-# windows of the kernel, and the bytes of the header this script
-# changes must be among those the kernel allows (USB guard).
+# FGT_SLOT_SECTORS (and FGT_RD_START, FGT_RD_COUNT with persistence);
+# the target partition must lie inside the write windows of the
+# kernel, and the bytes of the header this script changes must be
+# among those the kernel allows (USB guard).
 fgt_check_disk() { # <sector 0 file>
-	local s0="$1" disk part start size
+	local s0="$1" disk part start size flags
 
 	if [ "$FGT_DISK_KIND" = usb ]; then
 		command -v blockdev > /dev/null ||
 			{ fgt_refuse "blockdev is missing"; return 1; }
 		disk="$(fgt_disk_usb)" ||
 			{ fgt_refuse "boot stick not found (or more than one)"; return 1; }
-		FGT_DISK="/dev/$disk"
-		FGT_SLOT="/dev/$disk$FGT_SLOT_PART"
+		FGT_DISK="$FGT_DEV/$disk"
+		FGT_SLOT="$FGT_DEV/$disk$FGT_SLOT_PART"
 		part="$disk$FGT_SLOT_PART"
 	else
 		fgt_disk_mmc ||
@@ -362,10 +547,10 @@ fgt_check_disk() { # <sector 0 file>
 	[ -b "$FGT_DISK" ] && [ -b "$FGT_SLOT" ] ||
 		{ fgt_refuse "no slot $FGT_SLOT"; return 1; }
 	if [ "$FGT_DISK_KIND" = usb ]; then
-		grep -qs "^$FGT_DISK" /proc/mounts &&
+		grep -qs "^$FGT_DISK" "$FGT_PROC_MOUNTS" &&
 			{ fgt_refuse "$FGT_DISK is mounted"; return 1; }
 	else
-		grep -qs "^$FGT_SLOT " /proc/mounts &&
+		grep -qs "^$FGT_SLOT " "$FGT_PROC_MOUNTS" &&
 			{ fgt_refuse "$FGT_SLOT is mounted"; return 1; }
 	fi
 	rm -f "$s0"
@@ -378,15 +563,23 @@ fgt_check_disk() { # <sector 0 file>
 
 	# The other partition (the stock firmware) must be the default
 	# slot, when the board asks for it
+	flags="$(fgt_hex $FGT_FLAG_OFS 1 "$s0")$(fgt_hex $FGT_OTHER_FLAG_OFS 1 "$s0")"
 	if [ "$FGT_SLOT_NONDEFAULT" = 1 ]; then
-		[ "$(fgt_hex $(fgt_mbr $FGT_SLOT_PART 0) 1 "$s0")" = 00 ] &&
-			[ "$(fgt_hex $(fgt_mbr $((3 - FGT_SLOT_PART)) 0) 1 "$s0")" = 80 ] ||
+		[ "$flags" = 0080 ] ||
 			{ fgt_refuse "partition $FGT_SLOT_PART is the default slot (or no default): switch to partition $((3 - FGT_SLOT_PART)) with [B] first"; return 1; }
+	fi
+	# Exactly one default slot before the switch, when the board makes
+	# the target slot the default one
+	if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ]; then
+		case "$flags" in
+		8000|0080) ;;
+		*) fgt_refuse "boot flags of partitions $FGT_SLOT_PART and $((3 - FGT_SLOT_PART)) are $flags, neither 8000 nor 0080: switch with [B] first"; return 1 ;;
+		esac
 	fi
 
 	# The target partition as seen by the kernel and by its MBR entry
-	start="$(cat /sys/class/block/$part/start)"
-	size="$(cat /sys/class/block/$part/size)"
+	start="$(cat "$FGT_SYS_CLASS_BLOCK/$part/start")"
+	size="$(cat "$FGT_SYS_CLASS_BLOCK/$part/size")"
 	[ -n "$start" ] && [ -n "$size" ] ||
 		{ fgt_refuse "no partition $part"; return 1; }
 	[ "$start" = "$(fgt_le32 $(fgt_mbr $FGT_SLOT_PART 8) "$s0")" ] &&
@@ -413,14 +606,27 @@ fgt_check_disk() { # <sector 0 file>
 		fgt_ww_bytes_cover "$FGT_NAME_OFS" $FGT_NAME_LEN &&
 			fgt_ww_bytes_cover "$FGT_BUILD_OFS" $FGT_BUILD_LEN ||
 			{ fgt_refuse "the kernel does not allow the name or the build number of image $FGT_SLOT_IMAGE to change"; return 1; }
+		if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ]; then
+			fgt_ww_bytes_cover "$FGT_FLAG_OFS" 1 &&
+				fgt_ww_bytes_cover "$FGT_OTHER_FLAG_OFS" 1 ||
+				{ fgt_refuse "the kernel does not allow the boot flags to change"; return 1; }
+		fi
+	fi
+
+	# rootfs_data: from the device tree, the persistent window
+	if [ "$FGT_PERSIST" = 1 ]; then
+		fgt_check_rootfs_data || return 1
 	fi
 }
 
 # Checks the TFTP image: gzip stream, MBR, partition 0 of the size of
-# the target slot holding an ext file system. Prints "<offset>
-# <length>" of partition 0.
+# the target slot holding an ext file system, no larger than the slot
+# (with persistence: than the room before rootfs_data), and the image
+# long enough to hold it. Prints "<offset> <length>": offset of
+# partition 0, size of its file system (from the superblock).
 fgt_check_container() { # <image>
-	local img="$1" mbr="/tmp/fortigate-image.mbr" lba sectors
+	local img="$1" mbr="/tmp/fortigate-image.mbr"
+	local sb="/tmp/fortigate-image.sb" lba sectors blocks logbs len room
 
 	get_image "$img" | head -c 512 > "$mbr"
 	[ "$(fgt_hex 0 2 "$img")" = 1f8b ] &&
@@ -433,15 +639,32 @@ fgt_check_container() { # <image>
 		[ "$sectors" = "$FGT_SLOT_SIZE" ] &&
 		[ "$sectors" = "$FGT_SLOT_SECTORS" ] ||
 		{ fgt_refuse "partition 0 is not the size of a slot"; return 1; }
-	# ext2/3/4 magic (0xef53) of partition 0
-	[ "$(get_image "$img" | tail -c +$((lba * 512 + 1080 + 1)) |
-		fgt_hex 0 2)" = 53ef ] ||
+	# Superblock of the ext2/3/4 file system of partition 0: magic
+	# (0xef53), s_blocks_count_lo and s_log_block_size
+	get_image "$img" | tail -c +$((lba * 512 + 1)) | head -c 2048 > "$sb"
+	[ "$(fgt_hex 0x438 2 "$sb")" = 53ef ] ||
 		{ fgt_refuse "partition 0 holds no ext file system"; return 1; }
-	echo "$((lba * 512)) $((sectors * 512))"
+	blocks="$(fgt_le32 0x404 "$sb")" && logbs="$(fgt_le32 0x418 "$sb")" &&
+		[ "$blocks" -ge 1 ] && [ "$logbs" -le 6 ] ||
+		{ fgt_refuse "bad superblock in partition 0"; return 1; }
+	len=$((blocks * (1024 << logbs)))
+	[ $((len / 512)) -le "$FGT_SLOT_SECTORS" ] ||
+		{ fgt_refuse "the file system of partition 0 ($len bytes) is larger than the slot"; return 1; }
+	if [ "$FGT_PERSIST" = 1 ]; then
+		room=$((FGT_RD_START - FGT_SLOT_START))
+		[ $((len / 512)) -le $room ] ||
+			{ fgt_refuse "the file system of partition 0 ($len bytes) overlaps rootfs_data (at sector $room of the slot)"; return 1; }
+	fi
+	# The image holds the whole file system
+	[ "$(get_image "$img" | tail -c +$((lba * 512 + len)) | head -c 1 |
+		wc -c)" -eq 1 ] ||
+		{ fgt_refuse "the image is shorter than the file system of partition 0"; return 1; }
+	echo "$((lba * 512)) $len"
 }
 
 # New header in <new> from <s0>: name of the image at its offset, its
-# build number at 0; every changed byte must lie in the closed list.
+# build number at 0, and the target slot made the default one when the
+# board asks for it; every changed byte must lie in the closed list.
 fgt_new_header() { # <s0> <new> <name>
 	local s0="$1" new="$2" name="$3" diff
 
@@ -451,6 +674,14 @@ fgt_new_header() { # <s0> <new> <name>
 			oflag=seek_bytes seek=$(($FGT_NAME_OFS)) 2>/dev/null
 	dd if=/dev/zero of="$new" bs=$FGT_BUILD_LEN count=1 conv=notrunc \
 		oflag=seek_bytes seek=$(($FGT_BUILD_OFS)) 2>/dev/null
+	if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ]; then
+		printf '\200' | dd of="$new" bs=1 count=1 conv=notrunc \
+			seek=$FGT_FLAG_OFS 2>/dev/null
+		dd if=/dev/zero of="$new" bs=1 count=1 conv=notrunc \
+			seek=$FGT_OTHER_FLAG_OFS 2>/dev/null
+		[ "$(fgt_hex $FGT_FLAG_OFS 1 "$new")$(fgt_hex $FGT_OTHER_FLAG_OFS 1 "$new")" = 8000 ] ||
+			{ fgt_refuse "boot flags not set in the header buffer"; return 1; }
+	fi
 	[ "$(wc -c < "$new")" -eq 512 ] ||
 		{ fgt_refuse "header buffer of a wrong size"; return 1; }
 	diff="$(cmp -l "$s0" "$new" | while read w _; do
@@ -470,6 +701,70 @@ fgt_new_header() { # <s0> <new> <name>
 # environment)
 fgt_image_name() {
 	echo "${FGT_IMAGE_NAME_ENV:-$FGT_IMAGE_NAME}"
+}
+
+# Prints the loop device mounted (in FGT_PROC_MOUNTS) whose backing
+# file is the boot disk or one of its partitions (the overlay of
+# rootfs_data before stage2 unmounts it); fails when there is none
+fgt_loop_mounted() {
+	local l b
+
+	for l in "$FGT_SYS_BLOCK"/loop*; do
+		[ -r "$l/loop/backing_file" ] || continue
+		read -r b < "$l/loop/backing_file" || continue
+		case "$b" in
+		"$FGT_DISK"|"$FGT_DISK"[0-9p]*|"$FGT_SLOT") ;;
+		*) continue ;;
+		esac
+		grep -qs "^$FGT_DEV/${l##*/} " "$FGT_PROC_MOUNTS" &&
+			{ echo "${l##*/}"; return 0; }
+	done
+	return 1
+}
+
+# Backup archive of sysupgrade to write at the head of rootfs_data
+# (prints its path), or nothing for the 0xdeadc0de marker; it must be
+# a gzip stream fstools recognizes and fit in rootfs_data
+fgt_rootfs_data_backup() {
+	local size
+
+	[ -n "$UPGRADE_BACKUP" ] || return 0
+	[ -f "$UPGRADE_BACKUP" ] ||
+		{ echo "Backup $UPGRADE_BACKUP not found: rootfs_data will be erased" >&2; return 0; }
+	size="$(wc -c < "$UPGRADE_BACKUP")"
+	[ -n "$size" ] && [ "$size" -ge 4 ] &&
+		[ "$(fgt_hex 0 4 "$UPGRADE_BACKUP")" = "$FGT_TARGZ" ] ||
+		{ fgt_refuse "the backup $UPGRADE_BACKUP is not a gzip archive: use sysupgrade -n"; return 1; }
+	[ $(((size + 511) / 512)) -le "$FGT_RD_COUNT" ] ||
+		{ fgt_refuse "the backup $UPGRADE_BACKUP ($size bytes) is larger than rootfs_data"; return 1; }
+	echo "$UPGRADE_BACKUP"
+}
+
+# Head of rootfs_data, through the target slot (offset relative to its
+# start): the backup archive <backup>, or the marker 0xdeadc0de when
+# empty; read back from the disk
+fgt_write_rootfs_data() { # [<backup>]
+	local rel=$((FGT_RD_START - FGT_SLOT_START)) size
+
+	if [ -n "$1" ]; then
+		size="$(wc -c < "$1")"
+		echo "Writing the configuration backup at the head of rootfs_data ($size bytes)"
+		dd if="$1" of="$FGT_SLOT" bs=512 seek=$rel conv=notrunc,fsync 2>/dev/null ||
+			{ fgt_refuse "writing rootfs_data failed"; return 1; }
+		fgt_drop_caches
+		dd if="$FGT_SLOT" bs=512 skip=$rel count=$(((size + 511) / 512)) 2>/dev/null |
+			head -c $size | cmp -s - "$1" ||
+			{ fgt_refuse "rootfs_data does not read back as written"; return 1; }
+	else
+		echo "Writing the marker $FGT_DEADCODE at the head of rootfs_data (formatted at the next boot)"
+		printf '\336\255\300\336' |
+			dd of="$FGT_SLOT" bs=512 seek=$rel conv=notrunc,fsync 2>/dev/null ||
+			{ fgt_refuse "writing rootfs_data failed"; return 1; }
+		fgt_drop_caches
+		[ "$(dd if="$FGT_SLOT" bs=512 skip=$rel count=1 2>/dev/null |
+			fgt_hex 0 4)" = "$FGT_DEADCODE" ] ||
+			{ fgt_refuse "rootfs_data does not read back as written"; return 1; }
+	fi
 }
 
 fgt_check_image() { # <image>
@@ -493,7 +788,7 @@ fgt_do_upgrade() { # <image>
 	local img="$1"
 	local s0="/tmp/fortigate-s0.bak" new="/tmp/fortigate-s0.new"
 	local rb="/tmp/fortigate-s0.read"
-	local name part ofs len sum
+	local name part ofs len sum loop backup=""
 
 	[ "$FGT_DUALSLOT_CONFIRMED" = 1 ] ||
 		{ fgt_refuse "installing to the boot disk is disabled"; return 74; }
@@ -505,6 +800,13 @@ fgt_do_upgrade() { # <image>
 	name="$(fgt_image_name)"
 	part="$(fgt_check_container "$img")" || return 1
 	ofs="${part% *}"; len="${part#* }"
+	# rootfs_data: no overlay left on the disk (stage2 unmounts it),
+	# and what to write at its head
+	if [ "$FGT_PERSIST" = 1 ]; then
+		loop="$(fgt_loop_mounted)" &&
+			{ fgt_refuse "$loop on $FGT_DISK is still mounted"; return 74; }
+		backup="$(fgt_rootfs_data_backup)" || return 1
+	fi
 	echo "Boot disk: $FGT_DISK, target slot $FGT_SLOT"
 	echo "Boot sector saved to $s0: $(sha256sum < "$s0" | cut -c1-64)"
 	# Header prepared and checked before anything is written
@@ -524,8 +826,8 @@ fgt_do_upgrade() { # <image>
 			{ fgt_refuse "$FGT_DISK stays read-only"; fgt_ww_done; return 1; }
 	fi
 
-	# 1. Target slot: partition 0 of the image, then read back from
-	# the disk
+	# 1. Target slot: the file system of partition 0 of the image (the
+	# container only, with persistence), then read back from the disk
 	echo "Writing the target slot ($FGT_SLOT, $len bytes)"
 	get_image "$img" | tail -c +$((ofs + 1)) | head -c $len |
 		dd of="$FGT_SLOT" bs=1M conv=fsync 2>/dev/null ||
@@ -534,7 +836,13 @@ fgt_do_upgrade() { # <image>
 	[ "$(head -c $len "$FGT_SLOT" | sha256sum | cut -c1-64)" = "$sum" ] ||
 		{ fgt_refuse "the target slot does not read back as written"; fgt_ww_done; return 1; }
 
-	# 2. Header (read-modify-write of sector 0, direct I/O), read
+	# 2. rootfs_data: the backup archive or the marker at its head
+	if [ "$FGT_PERSIST" = 1 ]; then
+		fgt_write_rootfs_data "$backup" ||
+			{ fgt_ww_done; return 1; }
+	fi
+
+	# 3. Header (read-modify-write of sector 0, direct I/O), read
 	# back from the disk
 	fgt_ww_is armed ||
 		{ fgt_refuse "write windows no longer armed, header unchanged"; fgt_ww_done; return 1; }
@@ -548,5 +856,16 @@ fgt_do_upgrade() { # <image>
 		{ fgt_refuse "boot sector does not read back as written"; return 1; }
 
 	echo "Partition $FGT_SLOT_PART written ($sum), image $FGT_SLOT_IMAGE named \"${name:0:$FGT_NAME_LEN}\", build 0."
-	echo "The default slot is unchanged: switch with [B] in the boot menu."
+	if [ "$FGT_PERSIST" = 1 ]; then
+		if [ -n "$backup" ]; then
+			echo "rootfs_data holds the configuration backup: restored at the next boot."
+		else
+			echo "rootfs_data erased: formatted at the next boot."
+		fi
+	fi
+	if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ]; then
+		echo "Partition $FGT_SLOT_PART is now the default slot: [B] in the boot menu brings the stock firmware back."
+	else
+		echo "The default slot is unchanged: switch with [B] in the boot menu."
+	fi
 }
