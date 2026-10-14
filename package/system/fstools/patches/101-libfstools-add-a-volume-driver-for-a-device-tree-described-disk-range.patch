@@ -1,4 +1,4 @@
-From 552c75df6a341100c6000575eb92172a1478b7b8 Mon Sep 17 00:00:00 2001
+From 78e17b741c3704c63c465ee2a489942db8b8120a Mon Sep 17 00:00:00 2001
 From: Radeon24 <Radeon24@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 11:40:29 +0200
 Subject: [PATCH 101/101] libfstools: add a volume driver for a device tree
@@ -23,22 +23,32 @@ device tree root, of compatible "fortinet,disk-rootfs-data":
 Sectors are 512 bytes, absolute on the disk. The disk is the only whole
 block device of N sectors whose vendor and model match when given. The
 rootfs_data volume is the range start..start+count-1, exposed through a
-loop device bounded to it (offset and size limit, autoclear).
+loop device bounded to it (offset and size limit, autoclear). The loop
+device is backed by the whole disk without direct I/O, and the page
+cache of the disk writes back whole 4 KiB pages: start and count must
+be multiples of 8 sectors, or writes would spill out of the range.
 
-The range is only claimed when it already holds an ext4 or f2fs
-filesystem, an erase marker or a configuration backup: a blank or
-unknown range is left alone, so nothing is ever written to a disk that
-was not prepared for an overlay, and mount_root falls back to a tmpfs
-overlay.
+The kernel of these boards guards the disk and only lets writes through
+its windows; the range must be the one persistent window its witness
+(/sys/module/block/parameters/write_windows) shows, in a state where
+that window is open (disarmed, armed or expired). Without the witness,
+or with another window, there is no volume.
 
-The device tree, sysfs and /dev paths can be overridden at build time
-for host testing.
+The range is only claimed when it already holds an ext4 filesystem
+labelled rootfs_data, an erase marker or a configuration backup; f2fs
+is not claimed, the overlay is ext4 there. A blank or unknown range is
+left alone, so nothing is ever written to a disk that was not prepared
+for an overlay. Without a volume, mount_root mounts no overlay at all
+(volume_identify() of no volume fails): the root stays the initramfs.
+
+The device tree, sysfs, /dev and witness paths can be overridden at
+build time for host testing.
 
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
  CMakeLists.txt        |   1 +
- libfstools/fortisoc.c | 466 ++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 467 insertions(+)
+ libfstools/fortisoc.c | 578 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 579 insertions(+)
  create mode 100644 libfstools/fortisoc.c
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -55,10 +65,10 @@ index e138f98..932f6e2 100644
  TARGET_LINK_LIBRARIES(fstools ubox)
 diff --git a/libfstools/fortisoc.c b/libfstools/fortisoc.c
 new file mode 100644
-index 0000000..fbfca25
+index 0000000..0dab2e1
 --- /dev/null
 +++ b/libfstools/fortisoc.c
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,578 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Overlay volume described by the device tree as a range of a whole disk.
@@ -76,11 +86,18 @@ index 0000000..fbfca25
 + * All sector values are 512-byte sectors, absolute on the disk. The disk is
 + * the only whole block device whose size is N sectors and whose vendor and
 + * model strings match, when given. The range is exposed through a loop
-+ * device bounded to it.
++ * device bounded to it, backed by the whole disk without direct I/O: the
++ * page cache of the disk writes back whole 4 KiB pages, so start and count
++ * must be multiples of 8 sectors, or a write would spill out of the range.
 + *
-+ * A range whose content is not recognised (no filesystem, no erase marker,
-+ * no configuration backup) is never claimed, so nothing is ever written to
-+ * a disk that was not prepared for an overlay.
++ * The kernel guards that disk: the range must be its one persistent write
++ * window, as the witness of the guard shows it (state "disarmed", "armed"
++ * or "expired", then "persistent start+count"); otherwise no volume.
++ *
++ * A range whose content is not recognised (no ext4 filesystem labelled
++ * rootfs_data, no erase marker, no configuration backup) is never claimed,
++ * so nothing is ever written to a disk that was not prepared for an
++ * overlay. f2fs is not claimed either: the overlay is ext4 there.
 + */
 +
 +#include "common.h"
@@ -97,10 +114,18 @@ index 0000000..fbfca25
 +#ifndef FORTISOC_DEV_DIR
 +#define FORTISOC_DEV_DIR	"/dev"
 +#endif
++#ifndef FORTISOC_WRITE_WINDOWS
++#define FORTISOC_WRITE_WINDOWS	"/sys/module/block/parameters/write_windows"
++#endif
 +
 +#define FORTISOC_COMPATIBLE	"fortinet,disk-rootfs-data"
 +#define FORTISOC_PATHLEN	256
 +#define FORTISOC_STRLEN		64
++/* sectors per page of the page cache of the disk (4 KiB) */
++#define FORTISOC_ALIGN		8
++/* ext4 superblock (at 1 KiB): s_volume_name, 16 bytes */
++#define FORTISOC_EXT4_LABEL	(0x400 + 0x78)
++#define FORTISOC_LABEL		"rootfs_data"
 +
 +struct fortisoc_volume {
 +	struct volume v;
@@ -275,7 +300,77 @@ index 0000000..fbfca25
 +		return -1;
 +	}
 +
++	if (desc->start % FORTISOC_ALIGN || desc->count % FORTISOC_ALIGN) {
++		ULOG_ERR("%s: range %llu+%llu not aligned on %d sectors\n",
++			 node, (unsigned long long)desc->start,
++			 (unsigned long long)desc->count, FORTISOC_ALIGN);
++		return -1;
++	}
++
 +	return 0;
++}
++
++/*
++ * The witness of the write windows of the kernel guard must show the range
++ * as the one persistent window, in a state where that window is open.
++ */
++static bool fortisoc_witness_ok(const struct fortisoc_desc *desc)
++{
++	char buf[512], want[48], *tok, *save;
++	int seen = 0, in_persistent = 0, n_persistent = 0, words = 0;
++	bool state_ok = false, match = false;
++	ssize_t n;
++	int fd;
++
++	fd = open(FORTISOC_WRITE_WINDOWS, O_RDONLY);
++	if (fd < 0) {
++		ULOG_ERR("no write window witness (%s): no overlay\n",
++			 FORTISOC_WRITE_WINDOWS);
++		return false;
++	}
++	n = read(fd, buf, sizeof(buf) - 1);
++	close(fd);
++	if (n <= 0) {
++		ULOG_ERR("empty write window witness: no overlay\n");
++		return false;
++	}
++	buf[n] = '\0';
++
++	snprintf(want, sizeof(want), "%llu+%llu",
++		 (unsigned long long)desc->start,
++		 (unsigned long long)desc->count);
++
++	for (tok = strtok_r(buf, " \t\n", &save); tok;
++	     tok = strtok_r(NULL, " \t\n", &save)) {
++		if (!words++) {
++			state_ok = !strcmp(tok, "disarmed") ||
++				   !strcmp(tok, "armed") ||
++				   !strcmp(tok, "expired");
++			continue;
++		}
++		if (!strcmp(tok, "persistent")) {
++			seen++;
++			in_persistent = 1;
++			continue;
++		}
++		if (!strcmp(tok, "sector0")) {
++			in_persistent = 0;
++			continue;
++		}
++		if (in_persistent) {
++			n_persistent++;
++			if (!strcmp(tok, want))
++				match = true;
++		}
++	}
++
++	if (!state_ok || seen != 1 || n_persistent != 1 || !match) {
++		ULOG_ERR("write window witness without the persistent window %s: no overlay\n",
++			 want);
++		return false;
++	}
++
++	return true;
 +}
 +
 +static bool fortisoc_sys_string_eq(const char *dir, const char *name,
@@ -386,6 +481,25 @@ index 0000000..fbfca25
 +	return ret;
 +}
 +
++/* The ext4 filesystem of the range is labelled rootfs_data. */
++static bool fortisoc_ext4_is_overlay(struct fortisoc_volume *p)
++{
++	char label[16 + 1] = { 0 };
++	bool ret;
++	FILE *f;
++
++	f = fopen(p->disk, "r");
++	if (!f)
++		return false;
++
++	ret = !fseeko(f, p->offset + FORTISOC_EXT4_LABEL, SEEK_SET) &&
++	      fread(label, 1, 16, f) == 16 && !strcmp(label, FORTISOC_LABEL);
++
++	fclose(f);
++
++	return ret;
++}
++
 +static struct volume *fortisoc_volume_find(char *name)
 +{
 +	struct fortisoc_volume *p;
@@ -395,6 +509,9 @@ index 0000000..fbfca25
 +		return NULL;
 +
 +	if (fortisoc_dt_read(&desc))
++		return NULL;
++
++	if (!fortisoc_witness_ok(&desc))
 +		return NULL;
 +
 +	p = calloc(1, sizeof(*p));
@@ -412,7 +529,12 @@ index 0000000..fbfca25
 +	/* never claim, hence never format, a range that holds nothing known */
 +	switch (fortisoc_volume_identify(&p->v)) {
 +	case FS_EXT4:
-+	case FS_F2FS:
++		if (fortisoc_ext4_is_overlay(p))
++			return &p->v;
++		ULOG_INFO("%s: ext4 at sector %llu not labelled %s, ignored\n",
++			  p->disk, (unsigned long long)desc.start,
++			  FORTISOC_LABEL);
++		break;
 +	case FS_DEADCODE:
 +	case FS_TARGZ:
 +		return &p->v;
