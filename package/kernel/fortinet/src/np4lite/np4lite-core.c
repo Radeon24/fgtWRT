@@ -5259,7 +5259,7 @@ static void fnp4l_rx_frame(struct fnp4l *np, unsigned int i, u32 ctrl,
 	skb->protocol = eth_type_trans(skb, ndev);
 	fnp4l_rx_csum(skb, ctrl);
 	/* The reference of @x goes with the frame, or is dropped */
-	if (x && !fnp4l_ipsec_rx_skb(skb, x)) {
+	if (x && !fnp4l_ipsec_rx_skb(np->ipsec, skb, x)) {
 		DEV_STATS_INC(ndev, rx_dropped);
 		kfree_skb(skb);
 		return;
@@ -5267,7 +5267,14 @@ static void fnp4l_rx_frame(struct fnp4l *np, unsigned int i, u32 ctrl,
 
 	DEV_STATS_INC(ndev, rx_packets);
 	DEV_STATS_ADD(ndev, rx_bytes, len);
-	napi_gro_receive(&np->napi, skb);
+	/*
+	 * Not a decrypted frame through GRO: GRO does not compare the
+	 * sec_path, and would merge it with a plain one of the same flow.
+	 */
+	if (x)
+		netif_receive_skb(skb);
+	else
+		napi_gro_receive(&np->napi, skb);
 	return;
 
 drop:

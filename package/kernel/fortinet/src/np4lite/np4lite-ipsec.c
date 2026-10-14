@@ -309,6 +309,7 @@ struct fnp4l_ipsec {
 	atomic_long_t rx_nosa;		/* of them, for no SA in service */
 	atomic_long_t rx_replay;	/* anti-replay verdicts, dropped */
 	atomic_long_t rx_lif_f;		/* frames with the second encoding */
+	atomic_long_t rx_sel;		/* dropped: not covered by the selector */
 	/* TX path: outbound policies and SAs of each port */
 	spinlock_t tx_lock;		/* writers */
 	struct list_head tx_pols[NP4L_NR_PORTS];
@@ -1259,16 +1260,85 @@ int fnp4l_ipsec_rx(struct fnp4l_ipsec *ips, const u8 *htag, u32 wb0,
 	return ret;
 }
 
+static bool fnp4l_sel_match(const struct xfrm_selector *sel,
+			    const struct fnp4l_ft_tuple *t);
+
+/*
+ * Whether the selector of SA @x covers the frame @skb, network header in
+ * front, as xfrm checks it for an SA it decrypts itself: in packet offload
+ * the policy check of xfrm takes the frame on the word of the driver, and
+ * the engine only checks the ICV. The ports are those xfrm takes; those
+ * of a fragment are not known here and are not checked. A frame that is
+ * not IPv4 is not covered by an IPv4 selector.
+ */
+static bool fnp4l_ipsec_rx_sel(struct sk_buff *skb,
+			       const struct xfrm_state *x)
+{
+	const struct xfrm_selector *sel = &x->sel;
+	struct fnp4l_ft_tuple t = {};
+	const struct iphdr *iph;
+	__be16 *pp, buf[2];
+
+	if (sel->family != AF_INET)
+		return true;
+	if (skb->protocol != htons(ETH_P_IP) ||
+	    !pskb_may_pull(skb, sizeof(*iph)))
+		return false;
+
+	iph = (const struct iphdr *)skb->data;
+	if (iph->version != 4 || iph->ihl < 5)
+		return false;
+	t.saddr = iph->saddr;
+	t.daddr = iph->daddr;
+	t.proto = iph->protocol;
+	if (ip_is_fragment(iph)) {
+		t.sport = sel->sport;
+		t.dport = sel->dport;
+		return fnp4l_sel_match(sel, &t);
+	}
+
+	switch (t.proto) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+	case IPPROTO_UDPLITE:
+	case IPPROTO_SCTP:
+		pp = skb_header_pointer(skb, iph->ihl * 4, sizeof(buf), buf);
+		if (pp) {
+			t.sport = pp[0];
+			t.dport = pp[1];
+		}
+		break;
+	case IPPROTO_ICMP:
+		pp = skb_header_pointer(skb, iph->ihl * 4, sizeof(buf), buf);
+		if (pp) {
+			t.sport = htons(((u8 *)pp)[0]);
+			t.dport = htons(((u8 *)pp)[1]);
+		}
+		break;
+	}
+
+	return fnp4l_sel_match(sel, &t);
+}
+
 /*
  * Attach the SA @x to the frame, which the engine has decrypted and
  * checked: the policy check of xfrm then takes it as is. The reference
- * goes with it. False if the frame must be dropped (no sec_path, or a full
- * one, counted as xfrm_input() does): the reference is then dropped too.
+ * goes with it. False if the frame must be dropped (not covered by the
+ * selector of the SA, no sec_path, or a full one, counted as xfrm does):
+ * the reference is then dropped too.
  */
-bool fnp4l_ipsec_rx_skb(struct sk_buff *skb, struct xfrm_state *x)
+bool fnp4l_ipsec_rx_skb(struct fnp4l_ipsec *ips, struct sk_buff *skb,
+			struct xfrm_state *x)
 {
 	struct xfrm_offload *xo;
 	struct sec_path *sp;
+
+	if (unlikely(!fnp4l_ipsec_rx_sel(skb, x))) {
+		atomic_long_inc(&ips->rx_sel);
+		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINSTATEMISMATCH);
+		xfrm_state_put(x);
+		return false;
+	}
 
 	sp = secpath_set(skb);
 	if (unlikely(!sp)) {
@@ -1328,6 +1398,7 @@ static const char fnp4l_ipsec_stats[][ETH_GSTRING_LEN] = {
 	"ipsec_msg_bad",	/* byte lifetime messages not taken */
 	"ft_refused_ipsec",	/* flow directions refused: policy, SA */
 	"flow_purged_ipsec",	/* flow directions deleted: policy, SA added */
+	"rx_ipsec_sel",		/* decrypted, dropped: not covered by the selector */
 #ifdef CONFIG_FORTINET_NP4LITE_IPSEC_FLOWS
 	"flow_chained_ipsec",	/* flow directions chained to an SA */
 	"flow_purged_sa",	/* of them, deleted for their SA */
@@ -1375,9 +1446,10 @@ unsigned int fnp4l_ipsec_get_stats(const struct fnp4l_ipsec *ips,
 	data[17] = atomic_long_read(&ips->msg_bad);
 	data[18] = atomic_long_read(&ips->ft_refused);
 	data[19] = atomic_long_read(&ips->sse_purged);
+	data[20] = atomic_long_read(&ips->rx_sel);
 #ifdef CONFIG_FORTINET_NP4LITE_IPSEC_FLOWS
-	data[20] = atomic_long_read(&ips->sse_chained);
-	data[21] = atomic_long_read(&ips->sse_purged_sa);
+	data[21] = atomic_long_read(&ips->sse_chained);
+	data[22] = atomic_long_read(&ips->sse_purged_sa);
 #endif
 
 	return ARRAY_SIZE(fnp4l_ipsec_stats);
