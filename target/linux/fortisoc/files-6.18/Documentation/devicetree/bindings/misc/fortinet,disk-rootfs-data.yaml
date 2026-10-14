@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/fortinet,disk-rootfs-data.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Writable data area of a firmware slot on an internal boot disk
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description: |
+  Some appliances boot from an internal disk holding firmware slots behind
+  a boot sector. The slot of the running system holds the boot image
+  followed by an area reserved for a writable file system (rootfs_data).
+  This node describes that area for user space: the disk is the one block
+  device of the given size, and of the given vendor and model when they are
+  present; the area is given in absolute 512-byte sectors of that disk.
+
+  The node is not a device: no kernel driver binds to it. It is a direct
+  child of the root node, found by its compatible.
+
+properties:
+  compatible:
+    const: fortinet,disk-rootfs-data
+
+  fortinet,disk-vendor:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^.{1,8}$"
+    description:
+      Vendor identification of the disk, as its SCSI INQUIRY data gives it,
+      without the trailing spaces. Without it, the vendor is not checked.
+
+  fortinet,disk-model:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^.{1,16}$"
+    description:
+      Product identification of the disk, as its SCSI INQUIRY data gives
+      it, without the trailing spaces. Without it, the model is not
+      checked.
+
+  fortinet,disk-sectors:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    minimum: 1
+    description:
+      Exact size of the disk, in 512-byte sectors.
+
+  fortinet,rootfs-data:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    maxItems: 1
+    items:
+      items:
+        - description: First 512-byte sector of the area, on the whole disk
+          minimum: 1
+        - description: Number of sectors of the area
+          minimum: 1
+    description:
+      Area of the disk that holds the writable file system of the running
+      system. It is reached through a loop device backed by the whole disk,
+      whose page cache writes back whole 4 KiB pages: start and count are
+      multiples of 8 sectors.
+
+required:
+  - compatible
+  - fortinet,disk-sectors
+  - fortinet,rootfs-data
+
+additionalProperties: false
+
+examples:
+  - |
+    rootfs-data {
+        compatible = "fortinet,disk-rootfs-data";
+        fortinet,disk-vendor = "VENDOR";
+        fortinet,disk-model = "BOOT_DISK";
+        fortinet,disk-sectors = /bits/ 64 <7913472>;
+        fortinet,rootfs-data = <32768 491520>;
+    };

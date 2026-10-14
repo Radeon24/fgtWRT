@@ -17,7 +17,9 @@ description: |
   system can guard the disk: every write is refused, except plain writes
   lying entirely inside one of the windows while they are armed from user
   space. A write starting at sector 0 may only change the listed bytes of
-  that sector.
+  that sector. Persistent windows, if any, are open without arming, from
+  the time the disk is found until user space turns the windows off, for a
+  file system kept on that part of the disk.
 
   The node is not a device. The disk is the one USB mass storage disk whose
   SCSI vendor and model match; without the node, no disk is guarded.
@@ -60,6 +62,25 @@ properties:
       Parts of the disk an installer may write once the windows are armed.
       Without it, every write to the disk is refused.
 
+  fortinet,persistent-windows:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    maxItems: 4
+    items:
+      items:
+        - description: First 512-byte sector of the window, on the whole
+            disk, never sector 0
+          minimum: 1
+        - description: Number of sectors of the window
+          minimum: 1
+    description:
+      Parts of the disk any plain write may change without arming, until
+      the windows are turned off; the end of an armed time leaves them
+      open. A window over sector 0 is a bad configuration (every write
+      refused). Without it, no part of the disk is writable unarmed. A
+      window written through the page cache of the whole disk starts and
+      ends on its 4 KiB pages (multiples of 8 sectors), or the write back
+      of a page across its edge is refused.
+
   fortinet,sector0-bytes:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     maxItems: 8
@@ -91,4 +112,5 @@ examples:
         fortinet,disk-sectors = /bits/ 64 <7913472>;
         fortinet,write-windows = <0 1>, <1 524288>;
         fortinet,sector0-bytes = <0x10 32>, <0x128 4>;
+        fortinet,persistent-windows = <32768 491520>;
     };

@@ -138,7 +138,13 @@
 	/*
 	 * Internal 4 GB USB boot disk: write windows of its installer, armed
 	 * from user space (sector 0, where only the name and build number of
-	 * image 0 may change, and partition 1, the slot of image 0).
+	 * image 0 and the active flags of partitions 1 and 2 may change, and
+	 * partition 1, the slot of image 0), and the persistent window of the
+	 * writable file system of that slot (rootfs_data, sectors 32768 to
+	 * 524287, after the 16 380 KiB boot image at sectors 1 to 32760),
+	 * open without arming. rootfs_data is aligned on the 4 KiB pages of
+	 * the page cache of the disk, through which its loop device writes;
+	 * sectors 32761 to 32767 and 524288 of the slot stay unused.
 	 */
 	write-windows {
 		compatible = "fortinet,usb-disk-write-windows";
@@ -146,7 +152,17 @@
 		fortinet,disk-model = "S01_V140320_004";
 		fortinet,disk-sectors = /bits/ 64 <7913472>;
 		fortinet,write-windows = <0 1>, <1 524288>;
-		fortinet,sector0-bytes = <0x10 32>, <0x128 4>;
+		fortinet,sector0-bytes = <0x10 32>, <0x128 4>, <0x1be 1>, <0x1ce 1>;
+		fortinet,persistent-windows = <32768 491520>;
+	};
+
+	/* Writable file system of the slot of image 0, for user space */
+	rootfs-data {
+		compatible = "fortinet,disk-rootfs-data";
+		fortinet,disk-vendor = "FORTINET";
+		fortinet,disk-model = "S01_V140320_004";
+		fortinet,disk-sectors = /bits/ 64 <7913472>;
+		fortinet,rootfs-data = <32768 491520>;
 	};
 };
 
@@ -258,14 +274,13 @@
 	ethernet-switch@1e {
 		compatible = "brcm,bcm53128";
 		reg = <30>;
-		/*
-		 * Traffic class 7 on every user port: the network processor
-		 * classes the frames of the switch on their tag (port and
-		 * class) and never matches port 0 (dmz) in class 0.
-		 */
-		brcm,port-traffic-class = <7>;
 
-		/* Front panel ports in reverse order, DMZ on port 0 */
+		/*
+		 * Front panel ports in reverse order, DMZ on port 0. Factory
+		 * MAC addresses: base + 1 for dmz, base + 0 for internal1,
+		 * base + 4 to base + 9 for internal2 to internal7 (base + 2 and
+		 * base + 3 are wan1 and wan2).
+		 */
 		ethernet-ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -273,41 +288,65 @@
 			ethernet-port@0 {
 				reg = <0>;
 				label = "dmz";
+				nvmem-cells = <&mac_base 1>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
 			};
 
 			ethernet-port@1 {
 				reg = <1>;
 				label = "internal7";
+				nvmem-cells = <&mac_base 9>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
 			};
 
 			ethernet-port@2 {
 				reg = <2>;
 				label = "internal6";
+				nvmem-cells = <&mac_base 8>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
 			};
 
 			ethernet-port@3 {
 				reg = <3>;
 				label = "internal5";
+				nvmem-cells = <&mac_base 7>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
 			};
 
 			ethernet-port@4 {
 				reg = <4>;
 				label = "internal4";
+				nvmem-cells = <&mac_base 6>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
 			};
 
 			ethernet-port@5 {
 				reg = <5>;
 				label = "internal3";
+				nvmem-cells = <&mac_base 5>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
 			};
 
 			ethernet-port@6 {
 				reg = <6>;
 				label = "internal2";
+				nvmem-cells = <&mac_base 4>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
 			};
 
 			ethernet-port@7 {
 				reg = <7>;
 				label = "internal1";
+				nvmem-cells = <&mac_base 0>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
 			};
 
 			/* IMP port, RGMII to link 0 of the network processor */
@@ -317,9 +356,16 @@
 				/* The switch adds the RGMII delays of the link. */
 				phy-mode = "rgmii";
 
+				/*
+				 * Pause on the IMP: the switch then holds
+				 * frames from the network processor and sends
+				 * pause frames instead of dropping them at the
+				 * IMP input when a user port is congested.
+				 */
 				fixed-link {
 					speed = <1000>;
 					full-duplex;
+					pause;
 				};
 			};
 		};
@@ -327,22 +373,20 @@
 };
 
 /*
- * RGMII link to the IMP port of the switch, DSA conduit. The network
- * processor classes the frames of each switch port on a logical interface
- * (LIF) of its own: dmz on LIF 1, internal7 to internal1 (ports 1 to 7) on
- * LIFs 10 to 4; "fortinet,switch-logical-interfaces" gives the LIF of
- * switch port 0 to 7. The conduit takes LIF 11 for the frames of the
- * switch the network processor does not class by port. LIFs above 8 need
- * FORTINET_NP4LITE_DSA: without it, the network processor refuses them at
- * probe.
+ * RGMII link to the IMP port of the switch, DSA conduit, on its own LIF.
+ * The switch ports are not offloaded: without
+ * "fortinet,switch-logical-interfaces" (a LIF per switch port, see the
+ * binding), their frames reach the host through the conduit.
  */
 &np_port0 {
 	/* No delay on this side: the switch adds them. */
 	phy-mode = "rgmii";
-	fortinet,logical-interface = <11>;
-	fortinet,switch-logical-interfaces = <1 10 9 8 7 6 5 4>;
 	status = "okay";
-	fixed-link { speed = <1000>; full-duplex; };
+
+	fixed-link {
+		speed = <1000>;
+		full-duplex;
+	};
 };
 
 /*
@@ -366,7 +410,8 @@
 /*
  * SPI NOR flash of the boot loader (Winbond W25X40CL, 512 KiB), read only.
  * Only its factory data block is described, which holds the base MAC
- * address of the appliance: 6 bytes, binary, at 0x1880 into the block; port n of the network processor gets the base + n.
+ * address of the appliance: 6 bytes, binary, at 0x1880 into the block; port n of the network processor gets the base + n,
+ * the switch ports the index of their cell.
  */
 &ssp0 {
 	status = "okay";

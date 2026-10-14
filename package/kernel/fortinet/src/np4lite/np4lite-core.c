@@ -318,8 +318,17 @@ MODULE_PARM_DESC(napi_threaded,
  */
 #define NP4L_LIFB_HI_INIT	0x01980000
 /*
- * Largest frame of a LIF, as the boot loader programs it: carries 1500-byte
- * frames with an 802.1Q tag, and 1500-byte frames with an EDSA tag.
+ * MTU field of a LIF (entry B): the largest IP packet, IP header included
+ * and link header excluded, the NP sends out whole on the LIF. A larger
+ * packet it builds itself (ESP from the IPsec engine) leaves in IP
+ * fragments that fit: with 1536, ESP packets of 1560 bytes left with
+ * their last fragment at offset 1512, after a first one of 1532 bytes
+ * that a 1500-byte link drops. Established by observation. Received
+ * frames are bounded by the IGR length window (fnp4l_loader_regs).
+ *  - the LIF of a port holds the MTU of its net_device, kept by
+ *    fnp4l_change_mtu();
+ *  - a DSA conduit and the LIFs of its switch ports keep the value the
+ *    boot loader programs in LIF 0, NP4L_LIF_MTU, room for the switch tag.
  */
 #define NP4L_LIF_MTU		1536
 
@@ -688,8 +697,8 @@ struct fnp4l_sse_hdr {
 struct fnp4l_sse_key {
 	__be32 saddr;
 	__be32 daddr;
-	/* Ports, or the SPI of an inbound SA (fnp4l_sse_spi()) */
-	struct_group(ports, __be16 sport; __be16 dport;);
+	__be16 sport;
+	__be16 dport;
 	u8 proto;
 	u8 vid_lo;
 	__le16 lif;
@@ -1315,6 +1324,7 @@ struct fnp4l_port {
 	struct phylink_config phylink_config;
 	u32 priv_flags;			/* NP4L_PRIV_*, read locklessly */
 	bool ipopt_flag;		/* "ip-options-host" offered */
+	bool lif_mtu_fixed;		/* DSA conduit: LIF MTU NP4L_LIF_MTU */
 };
 
 #ifdef CONFIG_FORTINET_NP4LITE_DSA
@@ -2077,6 +2087,12 @@ static u32 fnp4l_of_port_lif(const struct device_node *child, u32 link)
 	return lif;
 }
 
+/* MTU field of the LIF of @port, see NP4L_LIF_MTU */
+static u32 fnp4l_lif_mtu(const struct fnp4l_port *port, unsigned int mtu)
+{
+	return port->lif_mtu_fixed ? NP4L_LIF_MTU : mtu;
+}
+
 /*
  * Entries A (MAC filter) and B of the LIF of a port, at probe with the
  * HIF stopped. The FortiSOC1 boot loader only initialises LIF 0; the other
@@ -2094,7 +2110,8 @@ static u32 fnp4l_of_port_lif(const struct device_node *child, u32 link)
  *    MAC address of LIF 0 (FortiSOC1) or the one fnp4l_loader_mac()
  *    found (FortiSOC2). The NP filters on the address of entry A.
  *  - both entries are built from scratch, nothing is kept from the table:
- *    the values of LIF 0, link = port, no egress tag, MTU = NP4L_LIF_MTU.
+ *    the values of LIF 0, link = port, no egress tag, MTU as
+ *    fnp4l_lif_mtu().
  *  - traffic counters of the LIF, cleared before the LIF points at them
  *    (the SRAM may hold anything there, even an entry that is not a
  *    counter). Should that fail, the LIF uses the shared counters of the
@@ -2166,7 +2183,7 @@ static int fnp4l_lif_setup(struct fnp4l_port *port)
 	nahi = m[4] | m[5] << 8 | NP4L_LIFA_HI_INIT |
 	       FIELD_PREP(NP4L_LIFA_EGR_CNT, egr);
 
-	nblo = FIELD_PREP(NP4L_LIFB_MTU, NP4L_LIF_MTU) |
+	nblo = FIELD_PREP(NP4L_LIFB_MTU, fnp4l_lif_mtu(port, ndev->mtu)) |
 	       FIELD_PREP(NP4L_LIFB_PORT, port->id);
 	nbhi = NP4L_LIFB_HI_INIT | FIELD_PREP(NP4L_LIFB_IGR_CNT, igr);
 
@@ -7793,7 +7810,7 @@ int fnp4l_sse_spi(struct fnp4l *np, unsigned int id, __be32 saddr,
 
 	key->saddr = saddr;
 	key->daddr = daddr;
-	memcpy(&key->ports, &spi, sizeof(spi));
+	memcpy(&key->sport, &spi, sizeof(spi));
 	key->proto = IPPROTO_ESP;
 	key->lif = cpu_to_le16(FIELD_PREP(NP4L_SSE_KEY_LIF, port->lif));
 	if (!add)
@@ -10127,6 +10144,43 @@ static int fnp4l_get_offload_stats(int attr_id, const struct net_device *ndev,
 	return 0;
 }
 
+/*
+ * The MTU field of the LIF follows the MTU of the port (NP4L_LIF_MTU),
+ * written before the new MTU shows: a smaller one first cuts the packets
+ * the NP builds, then the host sends smaller ones.
+ */
+static int fnp4l_change_mtu(struct net_device *ndev, int new_mtu)
+{
+	struct fnp4l_port *port = netdev_priv(ndev);
+	struct fnp4l *np = port->np;
+	u32 idx = port->lif + NP4L_LIF_ENTRY_B;
+	u32 lo, hi, nlo;
+	int ret;
+
+	if (!port->lif_mtu_fixed) {
+		spin_lock_bh(&np->tbl_lock);
+		ret = fnp4l_tbl_read(np, NP4L_TBL_LIF, idx, &lo, &hi);
+		if (!ret) {
+			nlo = (lo & ~NP4L_LIFB_MTU) |
+			      FIELD_PREP(NP4L_LIFB_MTU,
+					 fnp4l_lif_mtu(port, new_mtu));
+			if (nlo != lo)
+				ret = fnp4l_tbl_write(np, NP4L_TBL_LIF, idx,
+						      nlo, hi);
+		}
+		spin_unlock_bh(&np->tbl_lock);
+		if (ret) {
+			netdev_err(ndev, "cannot set MTU %d on LIF %u: %d\n",
+				   new_mtu, port->lif, ret);
+			return ret;
+		}
+	}
+
+	WRITE_ONCE(ndev->mtu, new_mtu);
+
+	return 0;
+}
+
 static const struct net_device_ops fnp4l_netdev_ops = {
 	.ndo_open		= fnp4l_open,
 	.ndo_stop		= fnp4l_stop,
@@ -10136,6 +10190,7 @@ static const struct net_device_ops fnp4l_netdev_ops = {
 	.ndo_set_rx_mode	= fnp4l_set_rx_mode,
 	.ndo_set_mac_address	= fnp4l_set_mac_address,
 	.ndo_validate_addr	= eth_validate_addr,
+	.ndo_change_mtu		= fnp4l_change_mtu,
 	.ndo_set_features	= fnp4l_set_features,
 	.ndo_eth_ioctl		= fnp4l_eth_ioctl,
 	.ndo_get_phys_port_name	= fnp4l_get_phys_port_name,
@@ -10788,11 +10843,12 @@ static int fnp4l_port_probe(struct fnp4l *np, struct device_node *child)
 		return dev_err_probe(dev, -EINVAL, "%pOF: LIF %u twice\n",
 				     child, port->lif);
 
+	conduit = fnp4l_port_is_conduit(child);
+	port->lif_mtu_fixed = conduit;
 	ret = fnp4l_lif_setup(port);
 	if (ret)
 		return ret;
 	fnp4l_igr_default_lif(port);
-	conduit = fnp4l_port_is_conduit(child);
 	fnp4l_igr_probe(port, conduit);
 #ifdef CONFIG_FORTINET_NP4LITE_DSA
 	if (conduit)

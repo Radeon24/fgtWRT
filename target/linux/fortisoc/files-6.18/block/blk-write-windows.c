@@ -8,7 +8,8 @@
  * transport, SCSI vendor and model given by the device tree, optionally its
  * exact size): every bio that may change its medium is refused, except
  * plain REQ_OP_WRITE bios lying entirely inside one of the windows given by
- * the device tree, while the windows are armed.
+ * the device tree, while the windows are armed, or entirely inside one of
+ * its persistent windows (a data area written at any time, see below).
  *
  * The board describes the disk and its windows in one node, found by its
  * compatible (no driver, no probe order):
@@ -20,6 +21,7 @@
  *		fortinet,disk-sectors = /bits/ 64 <7913472>;
  *		fortinet,write-windows = <0 1>, <1 524288>;
  *		fortinet,sector0-bytes = <0x10 32>, <0x128 4>;
+ *		fortinet,persistent-windows = <32768 491520>;
  *	};
  *
  *  - No such node: no disk is guarded, the parameter reads "inactive" and
@@ -39,6 +41,23 @@
  *    armed time, the removal of the disk, a second matching disk or a bad
  *    configuration turn them off until the next boot. The parameter reads
  *    "inactive" (no matching disk yet), "disarmed ...", "armed ..." or "off".
+ *  - Persistent windows (optional): fortinet,persistent-windows, <start
+ *    count> pairs as above, never covering sector 0 (refused: bad
+ *    configuration). Plain writes lying entirely inside one of them are
+ *    accepted without arming, from the registration of the disk ("disarmed")
+ *    until "off", the removal of the disk or a second matching disk, for a
+ *    file system mounted on that area. With them, the end of the armed time
+ *    only closes the other windows: the state becomes "expired" (persistent
+ *    windows still open, "arm" refused until the next boot) instead of
+ *    "off". "off" from user space still closes every window. The parameter
+ *    then lists them after the word "persistent", e.g.
+ *    "disarmed 0+1 1+524288 persistent 32768+491520 sector0 0x10+32 0x128+4".
+ *    A window written through the page cache of the whole disk (a loop
+ *    device backed by it) must be aligned on its pages, 8 sectors here:
+ *    the page cache writes back whole pages, and a page across the edge
+ *    of the window would be refused.
+ *    Absent: no persistent window, the behaviour and the parameter are those
+ *    described above.
  *
  * Refused whatever the state: discard, secure erase, write zeroes, zone
  * operations on the guarded disk (bios), and SCSI pass-through (SG_IO and
@@ -91,6 +110,9 @@ struct wrwin_range {
 
 static struct wrwin_range wrwin_windows[WRWIN_MAX_WINDOWS];
 static unsigned int wrwin_nr_windows;
+/* Windows open without arming (none: no fortinet,persistent-windows) */
+static struct wrwin_range wrwin_persistent[WRWIN_MAX_WINDOWS];
+static unsigned int wrwin_nr_persistent;
 /* Bytes of sector 0 that a write may change (offset, length) */
 static struct wrwin_range wrwin_bytes[WRWIN_MAX_BYTES];
 static unsigned int wrwin_nr_bytes;
@@ -104,14 +126,18 @@ static bool wrwin_bad;				/* bad node: windows off */
 /*
  * State, one way only within a boot (never back to a more permissive one):
  *  INACTIVE  no matching disk registered yet;
- *  DISARMED  one matching disk registered, every write refused (default);
+ *  DISARMED  one matching disk registered, every write refused except in the
+ *            persistent windows (default);
  *  ARMED     armed by user space ("arm"), once per boot, WRWIN_ARM_SECS at most;
+ *  EXPIRED   armed time over with persistent windows: those stay open, every
+ *            other write refused, "arm" refused (never without them: OFF);
  *  OFF       every write to a guarded disk refused until the next boot.
  */
 enum {
 	WRWIN_INACTIVE,
 	WRWIN_DISARMED,
 	WRWIN_ARMED,
+	WRWIN_EXPIRED,
 	WRWIN_OFF,
 };
 
@@ -128,16 +154,45 @@ static void wrwin_disable(const char *why)
 		pr_warn("write windows off (%s)\n", why);
 }
 
-/* True while armed; turns the windows off once the armed time is over */
-static bool wrwin_armed(void)
+/*
+ * End of the armed time: off without persistent windows; with them, only
+ * from ARMED to EXPIRED (never back from OFF).
+ */
+static void wrwin_expire(void)
 {
-	if (atomic_read(&wrwin_state) != WRWIN_ARMED)
-		return false;
+	if (!wrwin_nr_persistent) {
+		wrwin_disable("armed time over");
+		return;
+	}
+	if (atomic_cmpxchg(&wrwin_state, WRWIN_ARMED, WRWIN_EXPIRED) ==
+	    WRWIN_ARMED)
+		pr_warn("write windows expired (armed time over), persistent windows open\n");
+}
+
+/* Current state; ends an armed time that is over */
+static int wrwin_state_now(void)
+{
+	int state = atomic_read(&wrwin_state);
+
+	if (state != WRWIN_ARMED)
+		return state;
 	/* pairs with the full barrier of the arming cmpxchg */
 	smp_rmb();
 	if (time_before(jiffies, READ_ONCE(wrwin_until)))
-		return true;
-	wrwin_disable("armed time over");
+		return WRWIN_ARMED;
+	wrwin_expire();
+	return atomic_read(&wrwin_state);
+}
+
+/* Sectors start..end - 1 entirely inside one of the nr windows w */
+static bool wrwin_inside(const struct wrwin_range *w, unsigned int nr,
+			 u64 start, u64 end)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr; i++)
+		if (start >= w[i].start && end <= w[i].start + w[i].count)
+			return true;
 	return false;
 }
 
@@ -220,6 +275,17 @@ static int __init wrwin_init(void)
 		pr_err("%pOF: bad fortinet,write-windows\n", np);
 		wrwin_bad = true;
 	}
+	if (wrwin_read_pairs(np, "fortinet,persistent-windows",
+			     wrwin_persistent, WRWIN_MAX_WINDOWS,
+			     &wrwin_nr_persistent)) {
+		pr_err("%pOF: bad fortinet,persistent-windows\n", np);
+		wrwin_bad = true;
+	}
+	for (i = 0; i < wrwin_nr_persistent; i++)
+		if (!wrwin_persistent[i].start) {
+			pr_err("persistent window over sector 0\n");
+			wrwin_bad = true;
+		}
 	if (wrwin_read_pairs(np, "fortinet,sector0-bytes", wrwin_bytes,
 			     WRWIN_MAX_BYTES, &wrwin_nr_bytes)) {
 		pr_err("%pOF: bad fortinet,sector0-bytes\n", np);
@@ -281,6 +347,13 @@ static bool wrwin_config_ok(struct gendisk *disk)
 			       wrwin_windows[i].start, wrwin_windows[i].count, cap);
 			return false;
 		}
+	for (i = 0; i < wrwin_nr_persistent; i++)
+		if (wrwin_persistent[i].start + wrwin_persistent[i].count > cap) {
+			pr_err("persistent window %llu+%llu beyond the disk (%llu sectors)\n",
+			       wrwin_persistent[i].start,
+			       wrwin_persistent[i].count, cap);
+			return false;
+		}
 	return true;
 }
 
@@ -325,6 +398,11 @@ void blk_wrwin_register(struct gendisk *disk)
 			disk->disk_name, wrwin_windows[i].start,
 			wrwin_windows[i].start + wrwin_windows[i].count - 1,
 			wrwin_windows[i].count);
+	for (i = 0; i < wrwin_nr_persistent; i++)
+		pr_warn("%s: persistent window sectors %llu..%llu (%llu), open\n",
+			disk->disk_name, wrwin_persistent[i].start,
+			wrwin_persistent[i].start + wrwin_persistent[i].count - 1,
+			wrwin_persistent[i].count);
 	for (i = 0; i < wrwin_nr_bytes; i++)
 		pr_warn("%s: sector 0 bytes %#llx..%#llx may change\n",
 			disk->disk_name, wrwin_bytes[i].start,
@@ -392,8 +470,9 @@ static bool wrwin_sector0_ok(struct bio *bio)
 bool blk_wrwin_refuse(struct bio *bio)
 {
 	u64 start = bio->bi_iter.bi_sector, end;
-	unsigned int nr = bio_sectors(bio), i;
+	unsigned int nr = bio_sectors(bio);
 	const char *why;
+	int state;
 
 	if (!op_is_write(bio_op(bio)))
 		return false;
@@ -408,15 +487,17 @@ bool blk_wrwin_refuse(struct bio *bio)
 	why = "logical block size not 512";
 	if (bdev_logical_block_size(bio->bi_bdev) != WRWIN_SECTOR)
 		goto refuse;
+	state = wrwin_state_now();
+	/* persistent windows: open from the registration of the disk to "off" */
+	if ((state == WRWIN_DISARMED || state == WRWIN_ARMED ||
+	     state == WRWIN_EXPIRED) &&
+	    wrwin_inside(wrwin_persistent, wrwin_nr_persistent, start, end))
+		return false;
 	why = "windows not armed";
-	if (!wrwin_armed())
+	if (state != WRWIN_ARMED)
 		goto refuse;
 	why = "outside the windows";
-	for (i = 0; i < wrwin_nr_windows; i++)
-		if (start >= wrwin_windows[i].start &&
-		    end <= wrwin_windows[i].start + wrwin_windows[i].count)
-			break;
-	if (i == wrwin_nr_windows)
+	if (!wrwin_inside(wrwin_windows, wrwin_nr_windows, start, end))
 		goto refuse;
 	why = "sector 0 content";
 	if (start == 0 && !wrwin_sector0_ok(bio))
@@ -452,21 +533,31 @@ static int wrwin_read_sector0(struct gendisk *disk)
 
 static int wrwin_get(char *buf, const struct kernel_param *kp)
 {
+	static const char * const names[] = {
+		[WRWIN_DISARMED] = "disarmed",
+		[WRWIN_ARMED] = "armed",
+		[WRWIN_EXPIRED] = "expired",
+	};
 	unsigned int i;
 	int n, state;
 
-	wrwin_armed();	/* turns an expired arming off */
-	state = atomic_read(&wrwin_state);
+	state = wrwin_state_now();	/* ends an armed time that is over */
 	if (state == WRWIN_OFF)
 		return sysfs_emit(buf, "off\n");
 	if (state == WRWIN_INACTIVE)
 		return sysfs_emit(buf, "inactive\n");
-	n = sysfs_emit(buf, "%s", state == WRWIN_ARMED ? "armed" : "disarmed");
+	n = sysfs_emit(buf, "%s", names[state]);
 	for (i = 0; i < wrwin_nr_windows; i++)
 		n += sysfs_emit_at(buf, n, " %llu+%llu", wrwin_windows[i].start,
 				   wrwin_windows[i].count);
 	if (!wrwin_nr_windows)
 		n += sysfs_emit_at(buf, n, " none");
+	if (wrwin_nr_persistent)
+		n += sysfs_emit_at(buf, n, " persistent");
+	for (i = 0; i < wrwin_nr_persistent; i++)
+		n += sysfs_emit_at(buf, n, " %llu+%llu",
+				   wrwin_persistent[i].start,
+				   wrwin_persistent[i].count);
 	n += sysfs_emit_at(buf, n, " sector0");
 	for (i = 0; i < wrwin_nr_bytes; i++)
 		n += sysfs_emit_at(buf, n, " %#llx+%llu", wrwin_bytes[i].start,
@@ -492,7 +583,7 @@ static int wrwin_set(const char *val, const struct kernel_param *kp)
 		return -EINVAL;
 
 	guard(mutex)(&wrwin_lock);
-	/* Only DISARMED can be armed: once per boot, never pushed back */
+	/* Only DISARMED can be armed: once per boot, never pushed back (not EXPIRED) */
 	if (atomic_read(&wrwin_state) != WRWIN_DISARMED || !wrwin_disk)
 		return -EPERM;
 	if (!wrwin_nr_windows)
