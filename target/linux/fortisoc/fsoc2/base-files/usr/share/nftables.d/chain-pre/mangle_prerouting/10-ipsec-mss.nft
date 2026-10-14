@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# IPsec MSS clamp, inbound half: TCP SYNs decrypted from an SA.
+#
+# The NP4Lite encrypts offloaded IPsec flows itself and never hands an
+# oversized packet back to the host: the ESP packet of a full-size segment
+# leaves fragmented, no ICMP "fragmentation needed" reaches the sender, and
+# the connection stalls. Clamping the MSS of the TCP connections carried by
+# an SA keeps their ESP packets within the 1500-byte MTU of the ports.
+#
+# The secpath is only visible before the forward policy check, hence
+# prerouting here; the outbound half is in chain-pre/mangle_forward.
+#
+# 1398 = SA MTU - 40 (IPv4 + TCP headers), for an IPv4 tunnel-mode SA with
+# aes128-cbc + hmac-sha1-96 over a 1500-byte link (SA MTU 1438). For another
+# suite, SA MTU = ((1500 - 28 - IV - ICV) rounded down to the cipher block
+# size) - 2; change the value in both files. IPv4 only.
+
+meta nfproto ipv4 tcp flags & (syn | rst) == syn meta secpath exists tcp option maxseg size > 1398 counter tcp option maxseg size set 1398

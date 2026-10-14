@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# IPsec MSS clamp, outbound half: TCP SYNs routed into an SA. See
+# chain-pre/mangle_prerouting/10-ipsec-mss.nft for the reason and the value.
+#
+# mangle_forward runs before the flow offload rule of the forward chain.
+# "tcp option maxseg size set rt mtu" would follow the SA MTU by itself,
+# but only here (no route yet in prerouting); the fixed value is the one
+# that was tested.
+
+meta nfproto ipv4 tcp flags & (syn | rst) == syn rt ipsec exists tcp option maxseg size > 1398 counter tcp option maxseg size set 1398
