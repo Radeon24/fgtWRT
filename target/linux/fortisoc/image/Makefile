@@ -5,6 +5,7 @@ include $(INCLUDE_DIR)/image.mk
 
 DEVICE_VARS += FORTIGATE_CMDLINE FORTIGATE_MODEL
 DEVICE_VARS += FORTIGATE_PART_LBA FORTIGATE_PART_SECTORS FORTIGATE_CONTAINER_DTB
+DEVICE_VARS += FORTIGATE_CONTAINER_SECTORS
 
 FORTIGATE_EPOCH := $(if $(SOURCE_DATE_EPOCH),$(SOURCE_DATE_EPOCH),0)
 
@@ -60,7 +61,10 @@ endef
 # (the kernel uses the copy appended to the zImage). The container is then
 # compressed by gzip-filename with the model as name, which the boot loader
 # checks too. The output only depends on SOURCE_DATE_EPOCH, which e2fsprogs
-# also prefers to E2FSPROGS_FAKE_TIME.
+# also prefers to E2FSPROGS_FAKE_TIME. The ext2 spans
+# FORTIGATE_CONTAINER_SECTORS (default: the whole partition), while the
+# partition entry always gives FORTIGATE_PART_SECTORS, the size of the
+# firmware slot; the end of the slot then stays out of the container.
 define Build/fortigate-container
 	rm -rf $@.root $@.ext2
 	mkdir -p $@.root
@@ -76,7 +80,8 @@ define Build/fortigate-container
 		-O none,ext_attr,resize_inode,dir_index,filetype,sparse_super \
 		-U clear \
 		-E root_owner=0:0,hash_seed=66727469-7772-7400-0000-000000000309 \
-		-d $@.root $@.ext2 $$(($(FORTIGATE_PART_SECTORS) / 2))
+		-d $@.root $@.ext2 \
+		$$(($(or $(FORTIGATE_CONTAINER_SECTORS),$(FORTIGATE_PART_SECTORS)) / 2))
 	for f in flatkc rootfs.gz $(if $(FORTIGATE_CONTAINER_DTB),devicetree.dtb); do \
 		echo "sif /$$f uid 0"; \
 		echo "sif /$$f gid 0"; \
@@ -112,9 +117,14 @@ define Device/Default
   FORTIGATE_CMDLINE := console=ttyS0,9600n8
   # Name of the gzip member of the TFTP image, checked by the boot loader
   FORTIGATE_MODEL :=
-  # Partition 0 of the container: start (LBA) and size (sectors, 16 MiB)
+  # Partition 0 of the container, in 512-byte sectors: start (LBA) and
+  # size, the size of the firmware slot (16 MiB here, each device sets
+  # its own)
   FORTIGATE_PART_LBA := 1
   FORTIGATE_PART_SECTORS := 32768
+  # Size of the ext2 of the container, in 512-byte sectors, at most
+  # FORTIGATE_PART_SECTORS; empty: FORTIGATE_PART_SECTORS
+  FORTIGATE_CONTAINER_SECTORS :=
   # Also put the device tree in the container (FortiSOC3)
   FORTIGATE_CONTAINER_DTB :=
   # No OpenWrt-style sysupgrade image is defined here: the container

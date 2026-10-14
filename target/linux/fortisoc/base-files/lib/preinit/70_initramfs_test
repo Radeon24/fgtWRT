@@ -1,0 +1,18 @@
+# Copyright (C) 2006 OpenWrt.org
+# Copyright (C) 2010 Vertical Communications
+#
+# FortiSOC: as the generic file, but for an initramfs whose device tree
+# describes a rootfs_data (/lib/functions/fortisoc.sh), which goes on
+# with the regular preinit, overlay included.
+
+. /lib/functions/fortisoc.sh
+
+initramfs_test() {
+	if [ -n "$INITRAMFS" ] && ! fortisoc_rootfs_data_node > /dev/null; then
+		boot_run_hook initramfs
+		preinit_ip_deconfig
+		break
+	fi
+}
+
+boot_hook_add preinit_main initramfs_test
