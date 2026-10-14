@@ -8,10 +8,13 @@ define Device/fortinet_fg-60d
   # Geometry of the firmware slots of the boot stick (256 MiB partition):
   # the container is also the image of the installer
   FORTIGATE_PART_SECTORS := 524288
-  # The container only fills the first 16 MiB of the slot; the rest of
-  # the slot holds the rootfs_data of the overlay (described by the
-  # device tree), formatted with mkfs.ext4 at the first boot
-  FORTIGATE_CONTAINER_SECTORS := 32768
+  # The container only fills the first 16 380 KiB of the slot; the rest
+  # of the slot holds the rootfs_data of the overlay (described by the
+  # device tree: sectors 32768 to 524287 of the disk, aligned on the
+  # 4 KiB pages of its page cache), formatted with mkfs.ext4 at the first
+  # boot. The container (from sector 1) must end before it, page
+  # included: 32760 sectors, 4095 pages of the slot
+  FORTIGATE_CONTAINER_SECTORS := 32760
   # Kernel command line of the flatkc header: the one of the kernel
   # (CONFIG_CMDLINE, forced)
   FORTIGATE_CMDLINE := earlycon=uart8250,mmio32,0xe4100000 \

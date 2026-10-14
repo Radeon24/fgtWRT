@@ -48,7 +48,7 @@ fgt_board() {
 		FGT_SLOT_MAKE_DEFAULT=1
 		FGT_PERSIST=1
 		FGT_HEADER_FORBIDDEN="0xdc:1"
-		FGT_WW_EXPECTED="0+1 1+524288 persistent 32769+491520 sector0 0x10+32 0x128+4 0x1be+1 0x1ce+1"
+		FGT_WW_EXPECTED="0+1 1+524288 persistent 32768+491520 sector0 0x10+32 0x128+4 0x1be+1 0x1ce+1"
 		;;
 	fortinet,fg90d)
 		FGT_BOARD="FortiGate 90D"
