@@ -1,4 +1,4 @@
-From 78e17b741c3704c63c465ee2a489942db8b8120a Mon Sep 17 00:00:00 2001
+From 1191c69031c640bf09810a47d0d5c3f57574b896 Mon Sep 17 00:00:00 2001
 From: Radeon24 <Radeon24@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 11:40:29 +0200
 Subject: [PATCH 101/101] libfstools: add a volume driver for a device tree
@@ -40,6 +40,8 @@ is not claimed, the overlay is ext4 there. A blank or unknown range is
 left alone, so nothing is ever written to a disk that was not prepared
 for an overlay. Without a volume, mount_root mounts no overlay at all
 (volume_identify() of no volume fails): the root stays the initramfs.
+A disk whose /dev node cannot be opened yet (its sysfs entry may come
+first) gives no volume either, with the open error in the log.
 
 The device tree, sysfs, /dev and witness paths can be overridden at
 build time for host testing.
@@ -47,8 +49,8 @@ build time for host testing.
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
  CMakeLists.txt        |   1 +
- libfstools/fortisoc.c | 578 ++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 579 insertions(+)
+ libfstools/fortisoc.c | 587 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 588 insertions(+)
  create mode 100644 libfstools/fortisoc.c
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -65,10 +67,10 @@ index e138f98..932f6e2 100644
  TARGET_LINK_LIBRARIES(fstools ubox)
 diff --git a/libfstools/fortisoc.c b/libfstools/fortisoc.c
 new file mode 100644
-index 0000000..0dab2e1
+index 0000000..345c30d
 --- /dev/null
 +++ b/libfstools/fortisoc.c
-@@ -0,0 +1,578 @@
+@@ -0,0 +1,587 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Overlay volume described by the device tree as a range of a whole disk.
@@ -504,6 +506,7 @@ index 0000000..0dab2e1
 +{
 +	struct fortisoc_volume *p;
 +	struct fortisoc_desc desc;
++	FILE *f;
 +
 +	if (strcmp(name, "rootfs_data") != 0)
 +		return NULL;
@@ -525,6 +528,14 @@ index 0000000..0dab2e1
 +	p->v.name = "rootfs_data";
 +	p->offset = desc.start * 512;
 +	p->size = desc.count * 512;
++
++	/* the sysfs entry may precede the /dev node: say so, not "no overlay" */
++	f = fopen(p->disk, "r");
++	if (!f) {
++		ULOG_ERR("cannot open %s: %s\n", p->disk, strerror(errno));
++		goto out;
++	}
++	fclose(f);
 +
 +	/* never claim, hence never format, a range that holds nothing known */
 +	switch (fortisoc_volume_identify(&p->v)) {
