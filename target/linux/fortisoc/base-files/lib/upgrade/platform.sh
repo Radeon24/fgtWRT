@@ -19,7 +19,7 @@
 # reports from the same device tree, and rootfs_data must be its
 # persistent window. The slot is made the default one
 # (FGT_SLOT_MAKE_DEFAULT: boot flags 0x1be/0x1ce, allowed by the
-# witness); [B] in the boot menu brings FortiOS back. sysupgrade
+# witness); [B] in the boot menu brings the stock firmware back. sysupgrade
 # keeps the configuration (its backup archive at the head of
 # rootfs_data), sysupgrade -n erases it.
 
