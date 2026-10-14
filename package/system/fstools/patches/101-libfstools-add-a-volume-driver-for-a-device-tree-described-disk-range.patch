@@ -1,4 +1,4 @@
-From 936a7a71ed645248a4f971dc7af7ffee4acd775f Mon Sep 17 00:00:00 2001
+From 9a4970fb4ae8bcdcc0937c4f084ce20718dda758 Mon Sep 17 00:00:00 2001
 From: Radeon24 <Radeon24@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 11:40:29 +0200
 Subject: [PATCH 101/101] libfstools: add a volume driver for a device tree
@@ -24,9 +24,11 @@ Sectors are 512 bytes, absolute on the disk. The disk is the only whole
 block device of N sectors whose vendor and model match when given. The
 rootfs_data volume is the range start..start+count-1, exposed through a
 loop device bounded to it (offset and size limit, autoclear). The loop
-device is backed by the whole disk without direct I/O, and the page
-cache of the disk writes back whole 4 KiB pages: start and count must
-be multiples of 8 sectors, or writes would spill out of the range.
+device is backed by the whole disk and switched to direct I/O: sync(2)
+can otherwise leave its writes dirty in the page cache of the disk until
+writeback. If direct I/O is refused, the loop stays buffered and the
+page cache of the disk writes back whole 4 KiB pages: start and count
+must be multiples of 8 sectors, or writes would spill out of the range.
 
 The kernel of these boards guards the disk and only lets writes through
 its windows; the range must be the one persistent window its witness
@@ -49,8 +51,8 @@ build time for host testing.
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
  CMakeLists.txt        |   1 +
- libfstools/fortisoc.c | 595 ++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 596 insertions(+)
+ libfstools/fortisoc.c | 617 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 618 insertions(+)
  create mode 100644 libfstools/fortisoc.c
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -67,10 +69,10 @@ index e138f98..932f6e2 100644
  TARGET_LINK_LIBRARIES(fstools ubox)
 diff --git a/libfstools/fortisoc.c b/libfstools/fortisoc.c
 new file mode 100644
-index 0000000..39a58b1
+index 0000000..9a3f2c5
 --- /dev/null
 +++ b/libfstools/fortisoc.c
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,617 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Overlay volume described by the device tree as a range of a whole disk.
@@ -88,9 +90,11 @@ index 0000000..39a58b1
 + * All sector values are 512-byte sectors, absolute on the disk. The disk is
 + * the only whole block device whose size is N sectors and whose vendor and
 + * model strings match, when given. The range is exposed through a loop
-+ * device bounded to it, backed by the whole disk without direct I/O: the
-+ * page cache of the disk writes back whole 4 KiB pages, so start and count
-+ * must be multiples of 8 sectors, or a write would spill out of the range.
++ * device bounded to it, backed by the whole disk and switched to direct
++ * I/O, so that a completed write is on the disk, not in its page cache.
++ * If direct I/O is refused, the loop stays buffered and the page cache of
++ * the disk writes back whole 4 KiB pages: start and count must be multiples
++ * of 8 sectors, or a write would spill out of the range.
 + *
 + * The kernel guards that disk: the range must be its one persistent write
 + * window, as the witness of the guard shows it (state "disarmed", "armed"
@@ -560,6 +564,22 @@ index 0000000..39a58b1
 +	return NULL;
 +}
 +
++/*
++ * Direct I/O on the loop: its writes reach the disk as bios of the
++ * range itself, never through the page cache of the whole disk, where
++ * sync(2) can leave them dirty for dirty_expire_centisecs (sync_bdevs()
++ * only waits, in its second pass, on the disk it wrote in the first).
++ * Refused (old kernel, unaligned offset, backing file without O_DIRECT):
++ * keep the buffered loop, as before, and say so.
++ */
++static void fortisoc_loop_dio(int fd, const char *name)
++{
++	if (ioctl(fd, LOOP_SET_DIRECT_IO, 1UL) != 0)
++		ULOG_WARN("%s: no direct I/O (%s), buffered loop: "
++			  "sync is not durable before writeback\n",
++			  name, strerror(errno));
++}
++
 +static int fortisoc_create_loop(struct fortisoc_volume *p)
 +{
 +	struct loop_info64 info;
@@ -589,6 +609,7 @@ index 0000000..39a58b1
 +				continue;
 +			if (info.lo_sizelimit != p->size)
 +				continue;
++			fortisoc_loop_dio(fd, p->loop_name);
 +			ret = 0;
 +			break;
 +		}
@@ -610,6 +631,9 @@ index 0000000..39a58b1
 +			ioctl(fd, LOOP_CLR_FD, 0);
 +			continue;
 +		}
++
++		/* after LOOP_SET_STATUS64, which cannot set the flag (offset known) */
++		fortisoc_loop_dio(fd, p->loop_name);
 +
 +		/*
 +		 * Keep the loop device open until this process exits, to avoid
