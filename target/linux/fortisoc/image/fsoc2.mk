@@ -19,7 +19,8 @@ define Device/fortinet_fg-60d
   # (CONFIG_CMDLINE, forced)
   FORTIGATE_CMDLINE := earlycon=uart8250,mmio32,0xe4100000 \
 	console=ttyS0,9600n8 loglevel=6 panic=10 bonding.max_bonds=0 \
-	fstools_overlay_fstype=ext4 fstools_overlay_nodiscard=1
+	fstools_overlay_fstype=ext4 fstools_overlay_nodiscard=1 \
+	fstools_ignore_partname=1
   DEVICE_DTS := fortinet-fg60d
   DEVICE_PACKAGES := firewall4 kmod-nft-offload kmod-bonding proto-bonding \
 	ethtool ip-full kmod-fortinet-np4lite kmod-fortinet-cp7 \
