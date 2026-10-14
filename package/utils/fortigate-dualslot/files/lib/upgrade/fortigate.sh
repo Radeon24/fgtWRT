@@ -317,9 +317,15 @@ fgt_disk_usb() {
 	[ -n "$found" ] && echo "$found"
 }
 
+# True when <path> is a block device (the one test of the kind of a
+# device, redefined by a test harness on a PC only)
+fgt_is_block() { # <path>
+	[ -b "$1" ]
+}
+
 # The eMMC: the devices given by the board must exist
 fgt_disk_mmc() {
-	[ -b "$FGT_MMC_DISK" ] && [ -b "$FGT_MMC_SLOT" ]
+	fgt_is_block "$FGT_MMC_DISK" && fgt_is_block "$FGT_MMC_SLOT"
 }
 
 # Witness of the write windows, read at every check, one line:
@@ -544,7 +550,7 @@ fgt_check_disk() { # <sector 0 file>
 	fi
 	command -v "$FGT_SECTOR0" > /dev/null ||
 		{ fgt_refuse "$FGT_SECTOR0 is missing"; return 1; }
-	[ -b "$FGT_DISK" ] && [ -b "$FGT_SLOT" ] ||
+	fgt_is_block "$FGT_DISK" && fgt_is_block "$FGT_SLOT" ||
 		{ fgt_refuse "no slot $FGT_SLOT"; return 1; }
 	if [ "$FGT_DISK_KIND" = usb ]; then
 		grep -qs "^$FGT_DISK" "$FGT_PROC_MOUNTS" &&
@@ -830,7 +836,7 @@ fgt_do_upgrade() { # <image>
 	# container only, with persistence), then read back from the disk
 	echo "Writing the target slot ($FGT_SLOT, $len bytes)"
 	get_image "$img" | tail -c +$((ofs + 1)) | head -c $len |
-		dd of="$FGT_SLOT" bs=1M conv=fsync 2>/dev/null ||
+		dd of="$FGT_SLOT" bs=1M conv=fsync,notrunc 2>/dev/null ||
 		{ fgt_refuse "writing the target slot failed"; fgt_ww_done; return 1; }
 	fgt_drop_caches
 	[ "$(head -c $len "$FGT_SLOT" | sha256sum | cut -c1-64)" = "$sum" ] ||
