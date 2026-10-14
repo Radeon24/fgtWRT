@@ -1,4 +1,4 @@
-From 1191c69031c640bf09810a47d0d5c3f57574b896 Mon Sep 17 00:00:00 2001
+From 936a7a71ed645248a4f971dc7af7ffee4acd775f Mon Sep 17 00:00:00 2001
 From: Radeon24 <Radeon24@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 11:40:29 +0200
 Subject: [PATCH 101/101] libfstools: add a volume driver for a device tree
@@ -49,8 +49,8 @@ build time for host testing.
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
  CMakeLists.txt        |   1 +
- libfstools/fortisoc.c | 587 ++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 588 insertions(+)
+ libfstools/fortisoc.c | 595 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 596 insertions(+)
  create mode 100644 libfstools/fortisoc.c
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -67,10 +67,10 @@ index e138f98..932f6e2 100644
  TARGET_LINK_LIBRARIES(fstools ubox)
 diff --git a/libfstools/fortisoc.c b/libfstools/fortisoc.c
 new file mode 100644
-index 0000000..345c30d
+index 0000000..39a58b1
 --- /dev/null
 +++ b/libfstools/fortisoc.c
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,595 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Overlay volume described by the device tree as a range of a whole disk.
@@ -612,10 +612,18 @@ index 0000000..345c30d
 +		}
 +
 +		/*
-+		 * Don't close fd. Leave it open until this process exits, to avoid
-+		 * the autoclear from happening too soon.
++		 * Keep the loop device open until this process exits, to avoid
++		 * the autoclear from happening too soon, but read-only: a kernel
++		 * built without CONFIG_BLK_DEV_WRITE_MOUNTED refuses to mount a
++		 * block device that still has a writer (EBUSY). The writable
++		 * descriptor was only needed to bind the loop read-write.
 +		 */
-+		fd = -1;
++		if (open(p->loop_name, O_RDONLY | O_CLOEXEC) < 0) {
++			ULOG_ERR("cannot reopen %s: %s\n", p->loop_name,
++				 strerror(errno));
++			ioctl(fd, LOOP_CLR_FD, 0);
++			continue;
++		}
 +
 +		ret = 0;
 +		break;
