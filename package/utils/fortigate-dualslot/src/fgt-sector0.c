@@ -3,7 +3,9 @@
  * fgt-sector0: read or write sector 0 of a block device, 512 bytes, with
  * real direct I/O.
  *
- *   fgt-sector0 read  <device> <file>   sector 0 of <device> to <file>
+ *   fgt-sector0 read  <device> <file>   sector 0 of <device> to <file>,
+ *                                       a new file (never an existing
+ *                                       one, nor a symbolic link)
  *   fgt-sector0 write <device> <file>   <file> (512 bytes) to sector 0
  *
  * The kernel guards the boot disk of a dual-slot appliance and lets the
@@ -92,7 +94,8 @@ int main(int argc, char **argv)
 		if (n != SECTOR)
 			return fail("reading", argv[2]);
 		close(fd);
-		f = open(argv[3], O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+		f = open(argv[3], O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+			 O_CLOEXEC, 0600);
 		if (f < 0)
 			return fail("creating", argv[3]);
 		errno = 0;
@@ -102,7 +105,7 @@ int main(int argc, char **argv)
 	}
 
 	/* write: the file must be exactly one sector */
-	f = open(argv[3], O_RDONLY | O_CLOEXEC);
+	f = open(argv[3], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 	if (f < 0)
 		return fail("opening", argv[3]);
 	errno = 0;
