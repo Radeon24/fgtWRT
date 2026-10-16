@@ -727,17 +727,20 @@ fgt_check_container() { # <image>
 fgt_new_header() { # <s0> <new> <name>
 	local s0="$1" new="$2" name="$3" diff
 
-	cp "$s0" "$new"
-	printf '%s' "${name:0:$FGT_NAME_LEN}" |
+	rm -f "$new"
+	cp "$s0" "$new" &&
+		printf '%s' "${name:0:$FGT_NAME_LEN}" |
 		dd of="$new" bs=$FGT_NAME_LEN count=1 conv=sync,notrunc \
-			oflag=seek_bytes seek=$(($FGT_NAME_OFS)) 2>/dev/null
-	dd if=/dev/zero of="$new" bs=$FGT_BUILD_LEN count=1 conv=notrunc \
-		oflag=seek_bytes seek=$(($FGT_BUILD_OFS)) 2>/dev/null
+			oflag=seek_bytes seek=$(($FGT_NAME_OFS)) 2>/dev/null &&
+		dd if=/dev/zero of="$new" bs=$FGT_BUILD_LEN count=1 conv=notrunc \
+			oflag=seek_bytes seek=$(($FGT_BUILD_OFS)) 2>/dev/null ||
+		{ fgt_refuse "cannot prepare the header buffer"; return 1; }
 	if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ]; then
 		printf '\200' | dd of="$new" bs=1 count=1 conv=notrunc \
-			seek=$FGT_FLAG_OFS 2>/dev/null
-		dd if=/dev/zero of="$new" bs=1 count=1 conv=notrunc \
-			seek=$FGT_OTHER_FLAG_OFS 2>/dev/null
+			seek=$FGT_FLAG_OFS 2>/dev/null &&
+			dd if=/dev/zero of="$new" bs=1 count=1 conv=notrunc \
+				seek=$FGT_OTHER_FLAG_OFS 2>/dev/null ||
+			{ fgt_refuse "cannot prepare the header buffer"; return 1; }
 		[ "$(fgt_hex $FGT_FLAG_OFS 1 "$new")$(fgt_hex $FGT_OTHER_FLAG_OFS 1 "$new")" = 8000 ] ||
 			{ fgt_refuse "boot flags not set in the header buffer"; return 1; }
 	fi
@@ -846,6 +849,44 @@ fgt_write_rootfs_data() { # [<backup>]
 	fi
 }
 
+# Right before each write: the boot disk is still the one checked (an
+# USB stick found again by its port, vendor, model and size), nothing
+# of it is mounted, and the write windows are still the expected armed
+# ones
+fgt_recheck_disk() {
+	if [ "$FGT_DISK_KIND" = usb ]; then
+		[ "$FGT_DEV/$(fgt_disk_usb)" = "$FGT_DISK" ] ||
+			{ fgt_refuse "the boot stick changed since the checks"; return 1; }
+		grep -qs "^$FGT_DISK" "$FGT_PROC_MOUNTS" &&
+			{ fgt_refuse "$FGT_DISK is mounted"; return 1; }
+	else
+		fgt_disk_mmc ||
+			{ fgt_refuse "no eMMC slot $FGT_MMC_SLOT"; return 1; }
+		grep -qs "^$FGT_SLOT " "$FGT_PROC_MOUNTS" &&
+			{ fgt_refuse "$FGT_SLOT is mounted"; return 1; }
+	fi
+	fgt_is_block "$FGT_DISK" && fgt_is_block "$FGT_SLOT" ||
+		{ fgt_refuse "no slot $FGT_SLOT"; return 1; }
+	fgt_ww_is armed ||
+		{ fgt_refuse "write windows no longer armed ($(cat "$FGT_WW" 2>/dev/null))"; return 1; }
+}
+
+# After a failed write of sector 0, the windows off: reads it back and
+# tells what the disk holds, the saved copy <s0> or the header <new>
+fgt_s0_state() { # <s0> <new> <read>
+	rm -f "$3"
+	fgt_drop_caches
+	if ! "$FGT_SECTOR0" read "$FGT_DISK" "$3"; then
+		echo "Boot sector: cannot read it back (saved copy $1)" >&2
+	elif cmp -s "$3" "$1"; then
+		echo "Boot sector unchanged" >&2
+	elif cmp -s "$3" "$2"; then
+		echo "Boot sector holds the new header" >&2
+	else
+		echo "Boot sector differs from the saved copy and from the new header: keep the saved copy $1 ($(sha256sum < "$1" | cut -c1-64))" >&2
+	fi
+}
+
 fgt_check_image() { # <image>
 	local s0="$FGT_TMP/fortigate-s0.check"
 
@@ -904,7 +945,10 @@ fgt_do_upgrade() { # <image>
 		sha256sum | cut -c1-64)"
 
 	# Arm the write windows (once per boot), then the stick alone
-	# writable (it may be read-only by user space as well)
+	# writable (it may be read-only by user space as well). What is
+	# dirty is written back first: nothing queued before goes out while
+	# the windows are armed.
+	sync
 	fgt_ww_arm
 	fgt_ww_is armed ||
 		{ fgt_refuse "the write windows do not arm ($(cat "$FGT_WW" 2>/dev/null))"; fgt_ww_done; return 74; }
@@ -917,6 +961,7 @@ fgt_do_upgrade() { # <image>
 
 	# 1. Target slot: the file system of partition 0 of the image (the
 	# container only, with persistence), then read back from the disk
+	fgt_recheck_disk || { fgt_ww_done; return 1; }
 	echo "Writing the target slot ($FGT_SLOT, $len bytes)"
 	get_image "$img" | tail -c +$((ofs + 1)) | head -c $len |
 		dd of="$FGT_SLOT" bs=1M conv=fsync,notrunc 2>/dev/null ||
@@ -927,22 +972,27 @@ fgt_do_upgrade() { # <image>
 
 	# 2. rootfs_data: the backup archive or the marker at its head
 	if [ "$FGT_PERSIST" = 1 ]; then
-		fgt_write_rootfs_data "$backup" ||
+		fgt_recheck_disk && fgt_write_rootfs_data "$backup" ||
 			{ fgt_ww_done; return 1; }
 	fi
 
 	# 3. Header (read-modify-write of sector 0, direct I/O), read
-	# back from the disk
-	fgt_ww_is armed ||
-		{ fgt_refuse "write windows no longer armed, header unchanged"; fgt_ww_done; return 1; }
+	# back from the disk; sector 0 must still be the one saved
+	fgt_recheck_disk ||
+		{ fgt_refuse "header unchanged"; fgt_ww_done; return 1; }
+	rm -f "$rb"
+	"$FGT_SECTOR0" read "$FGT_DISK" "$rb" && cmp -s "$rb" "$s0" ||
+		{ fgt_refuse "the boot sector changed since it was saved, header unchanged"; fgt_ww_done; return 1; }
 	"$FGT_SECTOR0" write "$FGT_DISK" "$new" ||
-		{ fgt_refuse "writing the boot sector failed"; fgt_ww_done; return 1; }
+		{ fgt_refuse "writing the boot sector failed"; fgt_ww_done
+		  fgt_s0_state "$s0" "$new" "$rb"; return 1; }
 	fgt_ww_done
 	fgt_drop_caches
 	rm -f "$rb"
 	"$FGT_SECTOR0" read "$FGT_DISK" "$rb" &&
 		cmp -s "$rb" "$new" ||
-		{ fgt_refuse "boot sector does not read back as written"; return 1; }
+		{ fgt_refuse "boot sector does not read back as written"
+		  fgt_s0_state "$s0" "$new" "$rb"; return 1; }
 
 	echo "Partition $FGT_SLOT_PART written ($sum), image $FGT_SLOT_IMAGE named \"${name:0:$FGT_NAME_LEN}\", build 0."
 	if [ "$FGT_PERSIST" = 1 ]; then
