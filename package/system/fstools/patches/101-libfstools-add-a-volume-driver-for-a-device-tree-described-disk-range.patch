@@ -1,4 +1,4 @@
-From 9a4970fb4ae8bcdcc0937c4f084ce20718dda758 Mon Sep 17 00:00:00 2001
+From e2055d838f3949b3b5d410fa3bd9461f267ce008 Mon Sep 17 00:00:00 2001
 From: Radeon24 <Radeon24@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 11:40:29 +0200
 Subject: [PATCH 101/101] libfstools: add a volume driver for a device tree
@@ -21,7 +21,10 @@ device tree root, of compatible "fortinet,disk-rootfs-data":
 	};
 
 Sectors are 512 bytes, absolute on the disk. The disk is the only whole
-block device of N sectors whose vendor and model match when given. The
+block device of N sectors whose vendor and model match when given. A
+missing required property, or any property present but malformed (an
+over-long or unterminated vendor or model string included), gives no
+volume and is logged as such: it never reads as an absent one. The
 rootfs_data volume is the range start..start+count-1, exposed through a
 loop device bounded to it (offset and size limit, autoclear). The loop
 device is backed by the whole disk and switched to direct I/O: sync(2)
@@ -29,6 +32,17 @@ can otherwise leave its writes dirty in the page cache of the disk until
 writeback. If direct I/O is refused, the loop stays buffered and the
 page cache of the disk writes back whole 4 KiB pages: start and count
 must be multiples of 8 sectors, or writes would spill out of the range.
+
+The status of the existing loop devices is read through read-only
+descriptors: a loop device holding a mounted filesystem refuses to open
+for writing when the kernel is built without
+CONFIG_BLK_DEV_WRITE_MOUNTED. The loop device already bound to the range
+(the mounted overlay, for firstboot or factoryreset) is reused; only a
+free one is opened read-write to be bound. A loop device whose status
+cannot be read, that maps part of the range, or a second binding of the
+range makes the driver fail instead of binding another loop device to
+the same sectors. A disk path that does not fit in lo_file_name is
+refused rather than truncated.
 
 The kernel of these boards guards the disk and only lets writes through
 its windows; the range must be the one persistent window its witness
@@ -40,19 +54,28 @@ The range is only claimed when it already holds an ext4 filesystem
 labelled rootfs_data, an erase marker or a configuration backup; f2fs
 is not claimed, the overlay is ext4 there. A blank or unknown range is
 left alone, so nothing is ever written to a disk that was not prepared
-for an overlay. Without a volume, mount_root mounts no overlay at all
+for an overlay; on the described disk, it is logged as an error (an
+interrupted first format leaves the range so) and not formatted again
+automatically. Without a volume, mount_root mounts no overlay at all
 (volume_identify() of no volume fails): the root stays the initramfs.
 A disk whose /dev node cannot be opened yet (its sysfs entry may come
 first) gives no volume either, with the open error in the log.
 
-The device tree, sysfs, /dev and witness paths can be overridden at
-build time for host testing.
+Outside preinit (PREINIT unset, no /tmp/.preinit), the range is only
+claimed while a loop device bound to it is mounted: a disk that shows
+up after preinit is never formatted nor switched to by "mount_root
+done" under a running system. When preinit left /tmp/.fortisoc_disk_late
+(the disk did not show up in time), that case is logged as an error.
 
+The device tree, sysfs, /dev, witness, mounts and flag paths can be
+overridden at build time for host testing.
+
+Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
  CMakeLists.txt        |   1 +
- libfstools/fortisoc.c | 617 ++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 618 insertions(+)
+ libfstools/fortisoc.c | 881 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 882 insertions(+)
  create mode 100644 libfstools/fortisoc.c
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -69,10 +92,10 @@ index e138f98..932f6e2 100644
  TARGET_LINK_LIBRARIES(fstools ubox)
 diff --git a/libfstools/fortisoc.c b/libfstools/fortisoc.c
 new file mode 100644
-index 0000000..9a3f2c5
+index 0000000..c25ea49
 --- /dev/null
 +++ b/libfstools/fortisoc.c
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,881 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Overlay volume described by the device tree as a range of a whole disk.
@@ -103,7 +126,13 @@ index 0000000..9a3f2c5
 + * A range whose content is not recognised (no ext4 filesystem labelled
 + * rootfs_data, no erase marker, no configuration backup) is never claimed,
 + * so nothing is ever written to a disk that was not prepared for an
-+ * overlay. f2fs is not claimed either: the overlay is ext4 there.
++ * overlay. f2fs is not claimed either: the overlay is ext4 there. Such a
++ * range on the described disk is reported as an error: an interrupted
++ * first format leaves it so, and it is not formatted again automatically.
++ *
++ * Outside preinit, the range is claimed only while it is mounted: a disk
++ * that shows up after preinit is never formatted or switched to under a
++ * running system ("mount_root done").
 + */
 +
 +#include "common.h"
@@ -123,6 +152,16 @@ index 0000000..9a3f2c5
 +#ifndef FORTISOC_WRITE_WINDOWS
 +#define FORTISOC_WRITE_WINDOWS	"/sys/module/block/parameters/write_windows"
 +#endif
++#ifndef FORTISOC_PROC_MOUNTS
++#define FORTISOC_PROC_MOUNTS	"/proc/self/mounts"
++#endif
++#ifndef FORTISOC_PREINIT_FLAG
++#define FORTISOC_PREINIT_FLAG	"/tmp/.preinit"
++#endif
++/* left by preinit when the disk did not show up in time */
++#ifndef FORTISOC_LATE_FLAG
++#define FORTISOC_LATE_FLAG	"/tmp/.fortisoc_disk_late"
++#endif
 +
 +#define FORTISOC_COMPATIBLE	"fortinet,disk-rootfs-data"
 +#define FORTISOC_PATHLEN	256
@@ -132,6 +171,7 @@ index 0000000..9a3f2c5
 +/* ext4 superblock (at 1 KiB): s_volume_name, 16 bytes */
 +#define FORTISOC_EXT4_LABEL	(0x400 + 0x78)
 +#define FORTISOC_LABEL		"rootfs_data"
++#define FORTISOC_LOOPS		8
 +
 +struct fortisoc_volume {
 +	struct volume v;
@@ -159,8 +199,10 @@ index 0000000..9a3f2c5
 +	ssize_t n;
 +	int fd;
 +
-+	if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int)sizeof(path))
++	if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int)sizeof(path)) {
++		errno = ENAMETOOLONG;
 +		return -1;
++	}
 +
 +	fd = open(path, O_RDONLY);
 +	if (fd < 0)
@@ -168,6 +210,8 @@ index 0000000..9a3f2c5
 +
 +	n = read(fd, buf, len);
 +	close(fd);
++	if (n < 0 && errno == ENOENT)
++		errno = EIO;
 +
 +	return n;
 +}
@@ -180,20 +224,28 @@ index 0000000..9a3f2c5
 +		s[--l] = '\0';
 +}
 +
-+/* Device tree string property, NUL terminated; -1 if absent or invalid. */
++/*
++ * Device tree properties: 0 if read, 1 if absent (ENOENT), -1 if present
++ * but invalid. An invalid property must never read as an absent one.
++ */
++
++/* Non-empty string, NUL terminated, at most FORTISOC_STRLEN bytes. */
 +static int fortisoc_dt_string(const char *node, const char *prop, char *buf)
 +{
 +	ssize_t n;
 +
 +	n = fortisoc_read_file(node, prop, buf, FORTISOC_STRLEN + 1);
-+	if (n < 1 || n > FORTISOC_STRLEN || buf[n - 1] != '\0')
++	if (n < 0 && errno == ENOENT)
++		return 1;
++	if (n < 2 || n > FORTISOC_STRLEN || buf[n - 1] != '\0' ||
++	    strlen(buf) != (size_t)n - 1)
 +		return -1;
 +
 +	fortisoc_trim(buf);
-+	return 0;
++	return buf[0] ? 0 : -1;
 +}
 +
-+/* Device tree property of exactly len bytes. */
++/* Property of exactly len bytes. */
 +static int fortisoc_dt_fixed(const char *node, const char *prop, void *buf,
 +			     size_t len)
 +{
@@ -204,11 +256,22 @@ index 0000000..9a3f2c5
 +		return -1;
 +
 +	n = fortisoc_read_file(node, prop, tmp, sizeof(tmp));
++	if (n < 0 && errno == ENOENT)
++		return 1;
 +	if (n != (ssize_t)len)
 +		return -1;
 +
 +	memcpy(buf, tmp, len);
 +	return 0;
++}
++
++static int fortisoc_dt_check(const char *node, const char *prop, int ret)
++{
++	if (ret > 0)
++		ULOG_ERR("%s: missing property %s: no overlay\n", node, prop);
++	else if (ret < 0)
++		ULOG_ERR("%s: invalid property %s: no overlay\n", node, prop);
++	return ret;
 +}
 +
 +static bool fortisoc_dt_compatible(const char *node)
@@ -273,24 +336,32 @@ index 0000000..9a3f2c5
 +	char node[FORTISOC_PATHLEN];
 +	uint64_t sectors;
 +	uint32_t range[2];
++	int ret;
 +
 +	memset(desc, 0, sizeof(*desc));
 +
 +	if (fortisoc_dt_find(node, sizeof(node)))
 +		return -1;
 +
-+	if (fortisoc_dt_fixed(node, "fortinet,disk-sectors", &sectors,
-+			      sizeof(sectors)) ||
-+	    fortisoc_dt_fixed(node, "fortinet,rootfs-data", range,
-+			      sizeof(range))) {
-+		ULOG_ERR("%s: missing or malformed property\n", node);
++	if (fortisoc_dt_check(node, "fortinet,disk-sectors",
++			      fortisoc_dt_fixed(node, "fortinet,disk-sectors",
++						&sectors, sizeof(sectors))) ||
++	    fortisoc_dt_check(node, "fortinet,rootfs-data",
++			      fortisoc_dt_fixed(node, "fortinet,rootfs-data",
++						range, sizeof(range))))
 +		return -1;
-+	}
 +
-+	if (fortisoc_dt_string(node, "fortinet,disk-vendor", desc->vendor))
++	/* optional, but an invalid one must not match any disk */
++	ret = fortisoc_dt_string(node, "fortinet,disk-vendor", desc->vendor);
++	if (ret > 0)
 +		desc->vendor[0] = '\0';
-+	if (fortisoc_dt_string(node, "fortinet,disk-model", desc->model))
++	else if (fortisoc_dt_check(node, "fortinet,disk-vendor", ret))
++		return -1;
++	ret = fortisoc_dt_string(node, "fortinet,disk-model", desc->model);
++	if (ret > 0)
 +		desc->model[0] = '\0';
++	else if (fortisoc_dt_check(node, "fortinet,disk-model", ret))
++		return -1;
 +
 +	desc->disk_sectors = be64_to_cpu(sectors);
 +	desc->start = be32_to_cpu(range[0]);
@@ -470,6 +541,93 @@ index 0000000..9a3f2c5
 +	return found == 1 ? 0 : -1;
 +}
 +
++static bool fortisoc_sys_u64_eq(const char *dir, const char *name,
++				uint64_t want)
++{
++	char buf[32], *end;
++	unsigned long long val;
++	ssize_t n;
++
++	n = fortisoc_read_file(dir, name, buf, sizeof(buf) - 1);
++	if (n <= 0)
++		return false;
++	buf[n] = '\0';
++
++	errno = 0;
++	val = strtoull(buf, &end, 10);
++	return !errno && end != buf && (*end == '\n' || !*end) && val == want;
++}
++
++static bool fortisoc_in_preinit(void)
++{
++	struct stat st;
++
++	return getenv("PREINIT") || !stat(FORTISOC_PREINIT_FLAG, &st);
++}
++
++static bool fortisoc_dev_mounted(const char *dev)
++{
++	char line[512], src[FORTISOC_PATHLEN];
++	bool found = false;
++	FILE *f;
++
++	f = fopen(FORTISOC_PROC_MOUNTS, "r");
++	if (!f)
++		return false;
++
++	while (!found && fgets(line, sizeof(line), f))
++		found = sscanf(line, "%255s", src) == 1 && !strcmp(src, dev);
++
++	fclose(f);
++
++	return found;
++}
++
++/*
++ * A loop device bound to exactly the range, as sysfs shows it (full
++ * backing file path, unlike lo_file_name), is mounted.
++ */
++static bool fortisoc_range_mounted(const struct fortisoc_volume *p)
++{
++	char dir[FORTISOC_PATHLEN], dev[FORTISOC_PATHLEN];
++	char file[FORTISOC_PATHLEN];
++	bool found = false;
++	struct dirent *d;
++	DIR *sys;
++	ssize_t n;
++
++	sys = opendir(FORTISOC_SYS_BLOCK);
++	if (!sys)
++		return false;
++
++	while (!found && (d = readdir(sys)) != NULL) {
++		if (strncmp(d->d_name, "loop", 4))
++			continue;
++
++		if (snprintf(dir, sizeof(dir), "%s/%s/loop", FORTISOC_SYS_BLOCK,
++			     d->d_name) >= (int)sizeof(dir) ||
++		    snprintf(dev, sizeof(dev), "%s/%s", FORTISOC_DEV_DIR,
++			     d->d_name) >= (int)sizeof(dev))
++			continue;
++
++		n = fortisoc_read_file(dir, "backing_file", file,
++				       sizeof(file) - 1);
++		if (n <= 0)
++			continue;
++		file[n] = '\0';
++		fortisoc_trim(file);
++
++		found = !strcmp(file, p->disk) &&
++			fortisoc_sys_u64_eq(dir, "offset", p->offset) &&
++			fortisoc_sys_u64_eq(dir, "sizelimit", p->size) &&
++			fortisoc_dev_mounted(dev);
++	}
++
++	closedir(sys);
++
++	return found;
++}
++
 +static int fortisoc_volume_identify(struct volume *v)
 +{
 +	struct fortisoc_volume *p = container_of(v, struct fortisoc_volume, v);
@@ -510,6 +668,7 @@ index 0000000..9a3f2c5
 +{
 +	struct fortisoc_volume *p;
 +	struct fortisoc_desc desc;
++	struct stat st;
 +	FILE *f;
 +
 +	if (strcmp(name, "rootfs_data") != 0)
@@ -533,6 +692,21 @@ index 0000000..9a3f2c5
 +	p->offset = desc.start * 512;
 +	p->size = desc.count * 512;
 +
++	/*
++	 * Outside preinit, only the overlay mounted at boot is claimed (for
++	 * firstboot, factoryreset, mount_root done): a disk that showed up
++	 * late is never formatted nor switched to under a running system.
++	 */
++	if (!fortisoc_in_preinit() && !fortisoc_range_mounted(p)) {
++		if (!stat(FORTISOC_LATE_FLAG, &st))
++			ULOG_ERR("%s showed up after preinit: no overlay on this boot, changes stay in RAM; reboot to use it\n",
++				 p->disk);
++		else
++			ULOG_INFO("%s: range not mounted, left alone outside preinit\n",
++				  p->disk);
++		goto out;
++	}
++
 +	/* the sysfs entry may precede the /dev node: say so, not "no overlay" */
 +	f = fopen(p->disk, "r");
 +	if (!f) {
@@ -554,8 +728,14 @@ index 0000000..9a3f2c5
 +	case FS_TARGZ:
 +		return &p->v;
 +	default:
-+		ULOG_INFO("%s: no overlay at sector %llu, ignored\n", p->disk,
-+			  (unsigned long long)desc.start);
++		/*
++		 * The described disk and range, but nothing known in it: an
++		 * interrupted first format (mkfs clears the start of the range
++		 * first) or a range never prepared. Say so loudly; formatting
++		 * it would be a new write nobody asked for.
++		 */
++		ULOG_ERR("%s: no overlay at sector %llu (no filesystem, no erase marker): running without persistent storage; restore an erase marker at the start of the range to format it\n",
++			 p->disk, (unsigned long long)desc.start);
 +		break;
 +	}
 +
@@ -580,88 +760,195 @@ index 0000000..9a3f2c5
 +			  name, strerror(errno));
 +}
 +
-+static int fortisoc_create_loop(struct fortisoc_volume *p)
++enum fortisoc_loop_state {
++	FORTISOC_LOOP_ABSENT,	/* no such node */
++	FORTISOC_LOOP_FREE,	/* unbound */
++	FORTISOC_LOOP_OURS,	/* bound to exactly the range */
++	FORTISOC_LOOP_OTHER,	/* bound to something else */
++	FORTISOC_LOOP_CLASH,	/* bound to part of the range, or read-only */
++	FORTISOC_LOOP_UNKNOWN,	/* status unreadable */
++};
++
++/*
++ * Status of a loop device, read through a read-only descriptor: without
++ * CONFIG_BLK_DEV_WRITE_MOUNTED, the loop holding the mounted overlay
++ * refuses to open for writing (EBUSY), and skipping it would bind a
++ * second loop device to the same range.
++ */
++static enum fortisoc_loop_state
++fortisoc_loop_state(const struct fortisoc_volume *p, const char *name)
++{
++	char file[LO_NAME_SIZE + 1];
++	struct loop_info64 info;
++	enum fortisoc_loop_state ret;
++	uint64_t end;
++	int fd;
++
++	fd = open(name, O_RDONLY | O_CLOEXEC);
++	if (fd < 0)
++		return errno == ENOENT || errno == ENXIO || errno == ENODEV ?
++			FORTISOC_LOOP_ABSENT : FORTISOC_LOOP_UNKNOWN;
++
++	if (ioctl(fd, LOOP_GET_STATUS64, &info) != 0) {
++		ret = errno == ENXIO ? FORTISOC_LOOP_FREE : FORTISOC_LOOP_UNKNOWN;
++		close(fd);
++		return ret;
++	}
++	close(fd);
++
++	memcpy(file, info.lo_file_name, LO_NAME_SIZE);
++	file[LO_NAME_SIZE] = '\0';
++	if (strcmp(file, p->disk))
++		return FORTISOC_LOOP_OTHER;
++
++	if (info.lo_offset == p->offset && info.lo_sizelimit == p->size)
++		return info.lo_flags & LO_FLAGS_READ_ONLY ?
++			FORTISOC_LOOP_CLASH : FORTISOC_LOOP_OURS;
++
++	/* same disk: any overlap with the range is an alias of it */
++	end = info.lo_sizelimit ? info.lo_offset + info.lo_sizelimit : UINT64_MAX;
++	if (info.lo_offset < p->offset + p->size && end > p->offset)
++		return FORTISOC_LOOP_CLASH;
++
++	return FORTISOC_LOOP_OTHER;
++}
++
++/* Bind the free loop device name to the range; 0 on success. */
++static int fortisoc_bind_loop(struct fortisoc_volume *p, const char *name)
 +{
 +	struct loop_info64 info;
-+	int ret = -1;
-+	int fd = -1;
-+	int i, ffd;
++	int fd, ffd, ret = -1;
 +
-+	ffd = open(p->disk, O_RDWR);
-+	if (ffd < 0)
++	fd = open(name, O_RDWR | O_CLOEXEC);
++	if (fd < 0)
 +		return -1;
 +
-+	for (i = 0; i < 8; i++) {
-+		snprintf(p->loop_name, sizeof(p->loop_name), "%s/loop%d",
-+			 FORTISOC_DEV_DIR, i);
++	/* still free: never rebind a loop device that got bound meanwhile */
++	if (ioctl(fd, LOOP_GET_STATUS64, &info) == 0 || errno != ENXIO)
++		goto out;
 +
-+		if (fd >= 0)
-+			close(fd);
-+
-+		fd = open(p->loop_name, O_RDWR);
-+		if (fd < 0)
-+			continue;
-+
-+		if (ioctl(fd, LOOP_GET_STATUS64, &info) == 0) {
-+			if (strcmp((char *) info.lo_file_name, p->disk) != 0)
-+				continue;
-+			if (info.lo_offset != p->offset)
-+				continue;
-+			if (info.lo_sizelimit != p->size)
-+				continue;
-+			fortisoc_loop_dio(fd, p->loop_name);
-+			ret = 0;
-+			break;
-+		}
-+
-+		if (errno != ENXIO)
-+			continue;
-+
-+		if (ioctl(fd, LOOP_SET_FD, ffd) != 0)
-+			continue;
-+
-+		memset(&info, 0, sizeof(info));
-+		snprintf((char *) info.lo_file_name, sizeof(info.lo_file_name), "%s",
-+			 p->disk);
-+		info.lo_offset = p->offset;
-+		info.lo_sizelimit = p->size;
-+		info.lo_flags |= LO_FLAGS_AUTOCLEAR;
-+
-+		if (ioctl(fd, LOOP_SET_STATUS64, &info) != 0) {
-+			ioctl(fd, LOOP_CLR_FD, 0);
-+			continue;
-+		}
-+
-+		/* after LOOP_SET_STATUS64, which cannot set the flag (offset known) */
-+		fortisoc_loop_dio(fd, p->loop_name);
-+
-+		/*
-+		 * Keep the loop device open until this process exits, to avoid
-+		 * the autoclear from happening too soon, but read-only: a kernel
-+		 * built without CONFIG_BLK_DEV_WRITE_MOUNTED refuses to mount a
-+		 * block device that still has a writer (EBUSY). The writable
-+		 * descriptor was only needed to bind the loop read-write.
-+		 */
-+		if (open(p->loop_name, O_RDONLY | O_CLOEXEC) < 0) {
-+			ULOG_ERR("cannot reopen %s: %s\n", p->loop_name,
-+				 strerror(errno));
-+			ioctl(fd, LOOP_CLR_FD, 0);
-+			continue;
-+		}
-+
-+		ret = 0;
-+		break;
++	ffd = open(p->disk, O_RDWR | O_CLOEXEC);
++	if (ffd < 0) {
++		ULOG_ERR("cannot open %s: %s\n", p->disk, strerror(errno));
++		goto out;
 +	}
 +
-+	if (fd >= 0)
-+		close(fd);
-+
++	if (ioctl(fd, LOOP_SET_FD, ffd) != 0) {
++		close(ffd);
++		goto out;
++	}
 +	close(ffd);
 +
-+	if (ret)
-+		p->loop_name[0] = 0;
++	memset(&info, 0, sizeof(info));
++	memcpy(info.lo_file_name, p->disk, strlen(p->disk) + 1);
++	info.lo_offset = p->offset;
++	info.lo_sizelimit = p->size;
++	info.lo_flags |= LO_FLAGS_AUTOCLEAR;
 +
++	if (ioctl(fd, LOOP_SET_STATUS64, &info) != 0) {
++		ioctl(fd, LOOP_CLR_FD, 0);
++		goto out;
++	}
++
++	/* after LOOP_SET_STATUS64, which cannot set the flag (offset known) */
++	fortisoc_loop_dio(fd, name);
++
++	/*
++	 * Keep the loop device open until this process exits, to avoid
++	 * the autoclear from happening too soon, but read-only: a kernel
++	 * built without CONFIG_BLK_DEV_WRITE_MOUNTED refuses to mount a
++	 * block device that still has a writer (EBUSY). The writable
++	 * descriptor was only needed to bind the loop read-write.
++	 */
++	if (open(name, O_RDONLY | O_CLOEXEC) < 0) {
++		ULOG_ERR("cannot reopen %s: %s\n", name, strerror(errno));
++		ioctl(fd, LOOP_CLR_FD, 0);
++		goto out;
++	}
++
++	ret = 0;
++out:
++	close(fd);
 +	return ret;
++}
++
++/*
++ * Reuse the loop device already bound to the range (the mounted overlay,
++ * for firstboot or factoryreset), else bind a free one. Never a second
++ * one: a loop device whose status cannot be read, or that maps part of
++ * the range, makes this fail instead.
++ */
++static int fortisoc_create_loop(struct fortisoc_volume *p)
++{
++	enum fortisoc_loop_state state[FORTISOC_LOOPS];
++	char name[FORTISOC_PATHLEN];
++	int i, ours = -1, fd;
++
++	/* the loop device records the path: a truncated one never matches */
++	if (strlen(p->disk) >= LO_NAME_SIZE) {
++		ULOG_ERR("%s: path longer than %d bytes, not bound to a loop device\n",
++			 p->disk, LO_NAME_SIZE - 1);
++		return -1;
++	}
++
++	for (i = 0; i < FORTISOC_LOOPS; i++) {
++		snprintf(name, sizeof(name), "%s/loop%d", FORTISOC_DEV_DIR, i);
++		state[i] = fortisoc_loop_state(p, name);
++
++		switch (state[i]) {
++		case FORTISOC_LOOP_OURS:
++			if (ours >= 0) {
++				ULOG_ERR("%s: range bound to two loop devices\n",
++					 p->disk);
++				return -1;
++			}
++			ours = i;
++			break;
++		case FORTISOC_LOOP_CLASH:
++			ULOG_ERR("%s: maps part of the range of %s, or read-only\n",
++				 name, p->disk);
++			return -1;
++		case FORTISOC_LOOP_UNKNOWN:
++			if (ours < 0)
++				ULOG_WARN("%s: status unreadable (%s)\n", name,
++					  strerror(errno));
++			break;
++		default:
++			break;
++		}
++	}
++
++	if (ours >= 0) {
++		snprintf(p->loop_name, sizeof(p->loop_name), "%s/loop%d",
++			 FORTISOC_DEV_DIR, ours);
++		/* read-only: LOOP_SET_DIRECT_IO only needs CAP_SYS_ADMIN */
++		fd = open(p->loop_name, O_RDONLY | O_CLOEXEC);
++		if (fd >= 0) {
++			fortisoc_loop_dio(fd, p->loop_name);
++			close(fd);
++		}
++		return 0;
++	}
++
++	for (i = 0; i < FORTISOC_LOOPS; i++)
++		if (state[i] == FORTISOC_LOOP_UNKNOWN) {
++			ULOG_ERR("a loop device may hold the range of %s: no second binding\n",
++				 p->disk);
++			return -1;
++		}
++
++	for (i = 0; i < FORTISOC_LOOPS; i++) {
++		if (state[i] != FORTISOC_LOOP_FREE)
++			continue;
++		snprintf(name, sizeof(name), "%s/loop%d", FORTISOC_DEV_DIR, i);
++		if (!fortisoc_bind_loop(p, name)) {
++			snprintf(p->loop_name, sizeof(p->loop_name), "%s", name);
++			return 0;
++		}
++	}
++
++	p->loop_name[0] = 0;
++	return -1;
 +}
 +
 +static int fortisoc_volume_init(struct volume *v)
@@ -691,5 +978,5 @@ index 0000000..9a3f2c5
 +
 +DRIVER(fortisoc_driver);
 -- 
-2.39.5
+2.55.0
 
