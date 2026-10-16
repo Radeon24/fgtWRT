@@ -44,6 +44,29 @@ define KernelPackage/fortinet-np4lite/description
  Once loaded, the module cannot be unloaded.
 endef
 
+# On the FortiSOC2, two fw4 chain includes clamp the TCP MSS of the flows
+# carried by an IPsec SA (see the files). Their "meta secpath" and "rt ipsec"
+# expressions only exist in a kernel built with CONFIG_XFRM, and fw4 loads
+# its ruleset in one transaction: a single rule the kernel rejects ("Not
+# supported") leaves the device with no firewall table at all, flow offload
+# included. Install them only when the kernel this module is built against
+# has XFRM, i.e. when an IPsec package (kmod-ipsec) is part of the build.
+NP4LITE_NFT:=/usr/share/nftables.d/chain-pre
+
+define KernelPackage/fortinet-np4lite/install
+	if [ "$(SUBTARGET)" = fsoc2 ] && \
+	   grep -qx 'CONFIG_XFRM=y' $(LINUX_DIR)/.config; then \
+		$(INSTALL_DIR) $(1)$(NP4LITE_NFT)/mangle_prerouting \
+			$(1)$(NP4LITE_NFT)/mangle_forward && \
+		$(INSTALL_DATA) \
+			./files/nftables.d/chain-pre/mangle_prerouting/10-ipsec-mss.nft \
+			$(1)$(NP4LITE_NFT)/mangle_prerouting/ && \
+		$(INSTALL_DATA) \
+			./files/nftables.d/chain-pre/mangle_forward/10-ipsec-mss.nft \
+			$(1)$(NP4LITE_NFT)/mangle_forward/; \
+	fi
+endef
+
 define KernelPackage/fortinet-np6lite
   SUBMENU:=Network Devices
   TITLE:=Fortinet NP6Lite network processor
