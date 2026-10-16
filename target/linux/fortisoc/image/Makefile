@@ -61,10 +61,12 @@ endef
 # (the kernel uses the copy appended to the zImage). The container is then
 # compressed by gzip-filename with the model as name, which the boot loader
 # checks too. The output only depends on SOURCE_DATE_EPOCH, which e2fsprogs
-# also prefers to E2FSPROGS_FAKE_TIME. The ext2 spans
-# FORTIGATE_CONTAINER_SECTORS (default: the whole partition), while the
-# partition entry always gives FORTIGATE_PART_SECTORS, the size of the
-# firmware slot; the end of the slot then stays out of the container.
+# also prefers to E2FSPROGS_FAKE_TIME: modes are set (not left to the umask
+# of the build host), extended attributes of the host are not copied. The
+# ext2 spans FORTIGATE_CONTAINER_SECTORS (default: the whole partition),
+# while the partition entry always gives FORTIGATE_PART_SECTORS, the size
+# of the firmware slot; the end of the slot then stays out of the
+# container.
 define Build/fortigate-container
 	rm -rf $@.root $@.ext2
 	mkdir -p $@.root
@@ -73,13 +75,15 @@ define Build/fortigate-container
 	$(if $(FORTIGATE_CONTAINER_DTB), \
 		cp $(KDIR)/image-$(firstword $(DEVICE_DTS)).dtb \
 			$@.root/devicetree.dtb)
+	chmod 0644 $@.root/*
+	chmod 0755 $@.root
 	E2FSPROGS_FAKE_TIME=$(FORTIGATE_EPOCH) \
 	SOURCE_DATE_EPOCH=$(FORTIGATE_EPOCH) \
 	$(STAGING_DIR_HOST)/bin/mke2fs -q -F -t ext2 -r 1 -b 1024 -I 128 \
 		-i 4096 -m 5 \
 		-O none,ext_attr,resize_inode,dir_index,filetype,sparse_super \
 		-U clear \
-		-E root_owner=0:0,hash_seed=66727469-7772-7400-0000-000000000309 \
+		-E root_owner=0:0,hash_seed=66727469-7772-7400-0000-000000000309,no_copy_xattrs \
 		-d $@.root $@.ext2 \
 		$$(($(or $(FORTIGATE_CONTAINER_SECTORS),$(FORTIGATE_PART_SECTORS)) / 2))
 	for f in flatkc rootfs.gz $(if $(FORTIGATE_CONTAINER_DTB),devicetree.dtb); do \
