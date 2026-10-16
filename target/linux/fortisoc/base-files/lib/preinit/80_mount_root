@@ -43,9 +43,15 @@ compose_rootfs_mount_options() {
 do_mount_root() {
 	local node
 
+	# A disk that shows up later is left alone until the next boot:
+	# fstools claims no unmounted range outside preinit. The flag lets
+	# it say why the overlay is missing (mount_root done).
+	rm -f /tmp/.fortisoc_disk_late
 	node="$(fortisoc_rootfs_data_node)" &&
-		! fortisoc_rootfs_data_wait "$node" 15 &&
+		! fortisoc_rootfs_data_wait "$node" 15 && {
 		echo "- rootfs_data: no disk of the described size after 15 s, running from RAM -"
+		echo "15 s" > /tmp/.fortisoc_disk_late
+	}
 	mount_root start "$(compose_rootfs_mount_options)"
 	boot_run_hook preinit_mount_root
 	[ -f /sysupgrade.tgz -o -f /tmp/sysupgrade.tar ] && {
