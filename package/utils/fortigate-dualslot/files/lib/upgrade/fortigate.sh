@@ -130,7 +130,8 @@
 # The paths of sysfs, /dev, /proc and of the device tree may be
 # overridden from the environment, for a test harness on a PC only:
 # FGT_SYS_BLOCK, FGT_SYS_CLASS_BLOCK, FGT_SYS_MODULE, FGT_DEV,
-# FGT_PROC_MOUNTS, FGT_DT_BASE, FGT_DROP_CACHES, FGT_SECTOR0.
+# FGT_PROC_MOUNTS, FGT_DT_BASE, FGT_DROP_CACHES, FGT_SECTOR0, and the
+# directory of the temporary files: FGT_TMP.
 
 # Kill switch: set to 0 to refuse every upgrade (not forceable).
 FGT_DUALSLOT_CONFIRMED=1
@@ -157,6 +158,7 @@ FGT_DEV="${FGT_DEV:-/dev}"
 FGT_PROC_MOUNTS="${FGT_PROC_MOUNTS:-/proc/mounts}"
 FGT_DT_BASE="${FGT_DT_BASE:-/sys/firmware/devicetree/base}"
 FGT_DROP_CACHES="${FGT_DROP_CACHES:-/proc/sys/vm/drop_caches}"
+FGT_TMP="${FGT_TMP:-/tmp}"
 
 # Hexadecimal dump of <count> bytes at <offset> of a file or a stream
 fgt_hex() { # <offset> <count> [<file>]
@@ -574,7 +576,7 @@ fgt_check_disk() { # <sector 0 file>
 			{ fgt_refuse "no eMMC slot $FGT_MMC_SLOT"; return 1; }
 		FGT_DISK="$FGT_MMC_DISK"
 		FGT_SLOT="$FGT_MMC_SLOT"
-		part="${FGT_MMC_SLOT#/dev/}"
+		part="${FGT_MMC_SLOT##*/}"
 	fi
 	command -v "$FGT_SECTOR0" > /dev/null ||
 		{ fgt_refuse "$FGT_SECTOR0 is missing"; return 1; }
@@ -672,8 +674,8 @@ fgt_check_disk() { # <sector 0 file>
 # enough to hold it. Prints "<offset> <length>": offset of partition 0,
 # size of its file system (from the superblock).
 fgt_check_container() { # <image>
-	local img="$1" mbr="/tmp/fortigate-image.mbr"
-	local sb="/tmp/fortigate-image.sb" lba sectors blocks logbs len room
+	local img="$1" mbr="$FGT_TMP/fortigate-image.mbr"
+	local sb="$FGT_TMP/fortigate-image.sb" lba sectors blocks logbs len room
 	local incompat
 
 	get_image "$img" | head -c 512 > "$mbr"
@@ -843,7 +845,7 @@ fgt_write_rootfs_data() { # [<backup>]
 }
 
 fgt_check_image() { # <image>
-	local s0="/tmp/fortigate-s0.check"
+	local s0="$FGT_TMP/fortigate-s0.check"
 
 	if [ "$FGT_DUALSLOT_CONFIRMED" != 1 ]; then
 		echo "$FGT_BOARD: installing to the boot disk is disabled."
@@ -861,8 +863,8 @@ fgt_check_image() { # <image>
 
 fgt_do_upgrade() { # <image>
 	local img="$1"
-	local s0="/tmp/fortigate-s0.bak" new="/tmp/fortigate-s0.new"
-	local rb="/tmp/fortigate-s0.read"
+	local s0="$FGT_TMP/fortigate-s0.bak" new="$FGT_TMP/fortigate-s0.new"
+	local rb="$FGT_TMP/fortigate-s0.read"
 	local name part ofs len sum loop backup=""
 
 	[ "$FGT_DUALSLOT_CONFIRMED" = 1 ] ||
