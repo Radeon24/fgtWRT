@@ -10,11 +10,16 @@ PKG_FLAGS:=nonshared
 
 include $(INCLUDE_DIR)/package.mk
 
+# TARGET_x86: the FortiGate 100D, an x86 board with the same boot disk
+# layout, whose support is in progress: nothing calls the installer there
+# yet (its platform.sh does not). blockdev (util-linux, not in the
+# default busybox) keeps the internal USB stick of the fsoc2 boards
+# read-only outside an installation.
 define Package/fortigate-dualslot
   SECTION:=utils
   CATEGORY:=Base system
   TITLE:=Installer for the second firmware slot of a dual-slot FortiGate
-  DEPENDS:=@(TARGET_fortisoc||TARGET_x86)
+  DEPENDS:=@(TARGET_fortisoc||TARGET_x86) +TARGET_fortisoc_fsoc2:blockdev
 endef
 
 define Package/fortigate-dualslot/description
