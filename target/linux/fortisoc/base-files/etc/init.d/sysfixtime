@@ -1,5 +1,6 @@
 #!/bin/sh /etc/rc.common
 # SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2013-2014 OpenWrt.org
 #
 # Read only version of sysfixtime: the clock of these appliances is battery
 # backed and shared with the boot loader and the stock firmware. It is
@@ -14,7 +15,10 @@ boot() {
 	hwclock_load
 	local maxtime="$(find_max_time)"
 	local curtime="$(date +%s)"
-	[ $curtime -lt $maxtime ] && date -s @$maxtime
+	if [ -n "$maxtime" ] && [ "$curtime" -lt "$maxtime" ]; then
+		date -s @$maxtime
+	fi
+	return 0
 }
 
 start() {
@@ -22,7 +26,8 @@ start() {
 }
 
 hwclock_load() {
-	[ -e "$RTC_DEV" ] && [ -e "$HWCLOCK" ] && $HWCLOCK -s -u -f $RTC_DEV
+	[ -e "$RTC_DEV" ] && [ -e "$HWCLOCK" ] || return 0
+	$HWCLOCK -s -u -f $RTC_DEV
 }
 
 find_max_time() {
