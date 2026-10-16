@@ -45,11 +45,24 @@ fortisoc_disk_node() {
 	return 1
 }
 
-# Wait, at most $2 seconds (default 15), for a disk of the size given by
-# the node $1 (fortinet,disk-sectors, a big-endian 64-bit cell pair), as
-# USB storage is probed asynchronously, and make sure the /dev node of
-# each disk of that size exists (fstools picks among them by vendor and
-# model). Fail if none shows up.
+# True when the string property $2 of the node $1 is absent or empty,
+# or equals the sysfs attribute $3 (SCSI pads vendor and model with
+# spaces, which read drops), as fstools compares them
+fortisoc_dt_string_matches() {
+	local want got
+
+	want="$(tr -d '\0' < "$1/$2" 2>/dev/null)"
+	[ -n "$want" ] || return 0
+	read -r got < "$3" 2>/dev/null || return 1
+	[ "$got" = "$want" ]
+}
+
+# Wait, at most $2 seconds (default 15), for a disk of the size, vendor
+# and model given by the node $1 (fortinet,disk-sectors, a big-endian
+# 64-bit cell pair; fortinet,disk-vendor and fortinet,disk-model, when
+# present), as USB storage is probed asynchronously, and make sure the
+# /dev node of each such disk exists (fstools picks the one disk among
+# them). Fail if none shows up.
 fortisoc_rootfs_data_wait() {
 	local node="$1" timeout="${2:-15}" hex sectors dev found n=0
 
@@ -64,6 +77,10 @@ fortisoc_rootfs_data_wait() {
 			loop*|ram*|mtdblock*|zram*) continue ;;
 			esac
 			[ "$(cat "$dev/size" 2>/dev/null)" = "$sectors" ] || continue
+			fortisoc_dt_string_matches "$node" fortinet,disk-vendor \
+				"$dev/device/vendor" &&
+				fortisoc_dt_string_matches "$node" fortinet,disk-model \
+					"$dev/device/model" || continue
 			fortisoc_disk_node "${dev##*/}"
 			found=1
 		done
