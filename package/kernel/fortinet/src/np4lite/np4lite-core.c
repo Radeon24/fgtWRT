@@ -697,8 +697,8 @@ struct fnp4l_sse_hdr {
 struct fnp4l_sse_key {
 	__be32 saddr;
 	__be32 daddr;
-	__be16 sport;
-	__be16 dport;
+	/* Ports, or the SPI of an inbound SA (fnp4l_sse_spi()) */
+	struct_group(ports, __be16 sport; __be16 dport;);
 	u8 proto;
 	u8 vid_lo;
 	__le16 lif;
@@ -7817,7 +7817,7 @@ int fnp4l_sse_spi(struct fnp4l *np, unsigned int id, __be32 saddr,
 
 	key->saddr = saddr;
 	key->daddr = daddr;
-	memcpy(&key->sport, &spi, sizeof(spi));
+	memcpy(&key->ports, &spi, sizeof(spi));
 	key->proto = IPPROTO_ESP;
 	key->lif = cpu_to_le16(FIELD_PREP(NP4L_SSE_KEY_LIF, port->lif));
 	if (!add)
