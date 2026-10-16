@@ -60,8 +60,12 @@
  *    described above.
  *
  * Refused whatever the state: discard, secure erase, write zeroes, zone
- * operations on the guarded disk (bios), and SCSI pass-through (SG_IO and
- * friends, see sd_ioctl()). Other disks are not affected at all.
+ * operations on the guarded disk (bios), and SCSI pass-through through its
+ * block device (SG_IO and friends, see sd_ioctl()). Only the sd block
+ * device refuses them: the SCSI generic and bsg character devices
+ * (CHR_DEV_SG, BLK_DEV_BSG) reach the disk without a bio and are not
+ * guarded; the configurations that use the guard leave them out. Other
+ * disks are not affected at all.
  *
  * PERSISTENT RESERVE OUT (IOC_PR_* ioctls) is refused as well.
  * Not covered (no medium data): MODE SELECT issued by the sd sysfs
@@ -476,13 +480,16 @@ bool blk_wrwin_refuse(struct bio *bio)
 
 	if (!op_is_write(bio_op(bio)))
 		return false;
-	/* an empty flush carries no data */
-	if (bio_op(bio) == REQ_OP_WRITE && !nr)
+	/* an empty flush carries no data (no byte, not "under a sector") */
+	if (bio_op(bio) == REQ_OP_WRITE && !bio->bi_iter.bi_size)
 		return false;
 	end = start + nr;
 
 	why = "not a plain write";
 	if (bio_op(bio) != REQ_OP_WRITE)
+		goto refuse;
+	why = "not whole sectors";
+	if (bio->bi_iter.bi_size & (WRWIN_SECTOR - 1))
 		goto refuse;
 	why = "logical block size not 512";
 	if (bdev_logical_block_size(bio->bi_bdev) != WRWIN_SECTOR)

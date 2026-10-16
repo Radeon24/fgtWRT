@@ -11,7 +11,7 @@
  *   +0x08 status, bit 1 = update in progress (polled before reading)
  *   +0x14..+0x2c  time to load (the time-set registers, not written)
  *   +0x4c sec, +0x50 min, +0x54 hour, +0x58 wday, +0x5c mday,
- *   +0x60 month (1-12), +0x64 year (00-99, < 70 means 20xx)
+ *   +0x60 month (1-12), +0x64 year (00-99, 2000-2099)
  *
  * The block keeps time on battery: it is NEVER written here. No set_time,
  * no alarm, no ioctl; with RTC_HCTOSYS the system clock is read from it,
@@ -78,9 +78,7 @@ static int fsoc3_rtc_read_time(struct device *dev, struct rtc_time *tm)
 	tm->tm_mday = bcd2bin(mday & 0x3f);
 	tm->tm_mon = bcd2bin(mon & 0x1f) - 1;
 	tm->tm_wday = bcd2bin(wday & 0x07);
-	tm->tm_year = bcd2bin(year);
-	if (tm->tm_year < 70)
-		tm->tm_year += 100;
+	tm->tm_year = bcd2bin(year) + 100;
 
 	return 0;
 }
@@ -113,7 +111,7 @@ static int fsoc3_rtc_probe(struct platform_device *pdev)
 
 	r->rtc->ops = &fsoc3_rtc_ops;
 	r->rtc->range_min = RTC_TIMESTAMP_BEGIN_2000;
-	r->rtc->range_max = mktime64(2069, 12, 31, 23, 59, 59);
+	r->rtc->range_max = mktime64(2099, 12, 31, 23, 59, 59);
 
 	return devm_rtc_register_device(r->rtc);
 }

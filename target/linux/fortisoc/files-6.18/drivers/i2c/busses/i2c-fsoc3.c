@@ -25,9 +25,10 @@
  * (initial value 0x86, set 0x03 before a start, clear bit 1 before a read).
  * A multi-byte read acknowledges every byte but the last.
  *
- * Only master mode, 7-bit addresses. By default the driver refuses any
- * write but the one-byte register pointer of a combined write-then-read
- * transfer, and zero-length messages (no SMBus quick command): the bus can
+ * Only master mode, 7-bit addresses (a 10-bit message is refused). By
+ * default the driver refuses any write but the one-byte register pointer
+ * of a combined write-then-read transfer to the same address, and
+ * zero-length messages (no SMBus quick command): the bus can
  * be scanned with "i2cdetect -r" and registers read with i2cget, nothing
  * can be written to a device (module parameter "allow_write" to lift it).
  */
@@ -213,12 +214,21 @@ static int fsoc3_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 	struct fsoc3_i2c *priv = i2c_get_adapdata(adap);
 	int i, ret;
 
-	/* Read-only guard: a write only as the register pointer of a read */
+	/* 7-bit addresses only: a 10-bit one would reach another device */
+	for (i = 0; i < num; i++)
+		if (msgs[i].flags & I2C_M_TEN)
+			return -EOPNOTSUPP;
+
+	/*
+	 * Read-only guard: a write only as the register pointer of a read
+	 * of the same device
+	 */
 	for (i = 0; i < num && !allow_write; i++) {
 		if (msgs[i].flags & I2C_M_RD)
 			continue;
 		if (msgs[i].len != 1 || i + 1 >= num ||
-		    !(msgs[i + 1].flags & I2C_M_RD)) {
+		    !(msgs[i + 1].flags & I2C_M_RD) ||
+		    msgs[i + 1].addr != msgs[i].addr) {
 			dev_warn_ratelimited(priv->dev,
 					     "write to %#04x refused (read-only)\n",
 					     msgs[i].addr);

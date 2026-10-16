@@ -319,6 +319,7 @@ struct fnp4l_ipsec {
 	atomic_long_t tx_nosa;		/* dropped: no SA in service */
 	atomic_long_t tx_nomac;		/* dropped: next hop not resolved */
 	atomic_long_t tx_block;		/* dropped: "block" policy */
+	atomic_long_t tx_opts;		/* dropped: IP options, ESP policy */
 	/* Flows kept off the flow engine by the policies */
 	atomic_long_t ft_refused;	/* directions refused */
 	atomic_long_t sse_purged;	/* deleted on a policy or inbound SA added */
@@ -1399,6 +1400,7 @@ static const char fnp4l_ipsec_stats[][ETH_GSTRING_LEN] = {
 	"ft_refused_ipsec",	/* flow directions refused: policy, SA */
 	"flow_purged_ipsec",	/* flow directions deleted: policy, SA added */
 	"rx_ipsec_sel",		/* decrypted, dropped: not covered by the selector */
+	"tx_ipsec_opts",	/* dropped: IP options under an ESP policy */
 #ifdef CONFIG_FORTINET_NP4LITE_IPSEC_FLOWS
 	"flow_chained_ipsec",	/* flow directions chained to an SA */
 	"flow_purged_sa",	/* of them, deleted for their SA */
@@ -1447,9 +1449,10 @@ unsigned int fnp4l_ipsec_get_stats(const struct fnp4l_ipsec *ips,
 	data[18] = atomic_long_read(&ips->ft_refused);
 	data[19] = atomic_long_read(&ips->sse_purged);
 	data[20] = atomic_long_read(&ips->rx_sel);
+	data[21] = atomic_long_read(&ips->tx_opts);
 #ifdef CONFIG_FORTINET_NP4LITE_IPSEC_FLOWS
-	data[21] = atomic_long_read(&ips->sse_chained);
-	data[22] = atomic_long_read(&ips->sse_purged_sa);
+	data[22] = atomic_long_read(&ips->sse_chained);
+	data[23] = atomic_long_read(&ips->sse_purged_sa);
 #endif
 
 	return ARRAY_SIZE(fnp4l_ipsec_stats);
@@ -1872,7 +1875,10 @@ static struct fnp4l_sa *fnp4l_tx_sa(struct fnp4l_ipsec *ips,
  * Frame through port @id, MAC header in front: whether an outbound
  * policy of the port takes it, and with which SA. Returns 0 to send it as
  * it is, the SA index with its MAC header rewritten, or an error to drop
- * it. The packet must be IPv4 without options, as xfrm checks it.
+ * it. The engine encrypts IPv4 without options only, as xfrm offloads
+ * it: xfrm drops a frame with options under an offloaded state
+ * (xfrm_dev_offload_ok()), but a frame that did not go through xfrm and
+ * that an ESP policy takes is dropped here, never sent in the clear.
  *
  * xfrm sends no SA with an offloaded frame (no sec_path): the frame is
  * looked up in the offloaded policies, as the hardware of other devices
@@ -1904,13 +1910,13 @@ int fnp4l_ipsec_xmit(struct fnp4l_ipsec *ips, unsigned int id,
 		return 0;
 
 	iph = ip_hdr(skb);
-	if (iph->version != 4 || iph->ihl != 5)
+	if (iph->version != 4)
 		return 0;
 	tuple.saddr = iph->saddr;
 	tuple.daddr = iph->daddr;
 	tuple.proto = iph->protocol;
 	/* Where the stack left the transport header is not relied upon. */
-	thoff = ETH_HLEN + sizeof(*iph);
+	thoff = ETH_HLEN + max_t(unsigned int, iph->ihl, 5) * 4;
 	if (!ip_is_fragment(iph)) {
 		switch (iph->protocol) {
 		case IPPROTO_TCP:
@@ -1945,6 +1951,11 @@ int fnp4l_ipsec_xmit(struct fnp4l_ipsec *ips, unsigned int id,
 		goto out;
 	case NP4L_POL_ESP:
 		break;
+	}
+	if (iph->ihl != 5) {
+		atomic_long_inc(&ips->tx_opts);
+		ret = -EPERM;
+		goto out;
 	}
 	sa = fnp4l_tx_sa(ips, id, &pol->xp->xfrm_vec[0], &tuple);
 	if (!sa) {
@@ -2213,8 +2224,10 @@ static void fnp4l_xdo_state_update_stats(struct xfrm_state *x)
 }
 
 /*
- * Inner IPv4 only: the engine has no IPv6 encoding of its own. Nothing
- * once the engine stalled: xfrm drops the frame.
+ * Inner IPv4 without options only, as fnp4l_ipsec_xmit() takes it: the
+ * engine has no IPv6 encoding of its own. Nothing once the engine
+ * stalled. xfrm drops and counts a frame refused here (packet offload
+ * has no software path).
  */
 static bool fnp4l_xdo_offload_ok(struct sk_buff *skb,
 				 struct xfrm_state *x)
@@ -2228,7 +2241,7 @@ static bool fnp4l_xdo_offload_ok(struct sk_buff *skb,
 		stalled = READ_ONCE(sa->ips->stalled);
 	rcu_read_unlock();
 
-	return !stalled && ip_hdr(skb)->version == 4;
+	return !stalled && ip_hdr(skb)->version == 4 && ip_hdr(skb)->ihl == 5;
 }
 
 static const struct xfrmdev_ops fnp4l_xfrmdev_ops = {
