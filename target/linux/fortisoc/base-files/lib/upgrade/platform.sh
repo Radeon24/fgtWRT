@@ -6,9 +6,10 @@
 # through the write windows of the kernel: an internal USB stick, or
 # the eMMC.
 #
-# 90D and 60E: the slot that is not the default one; the default slot
-# is left unchanged ([B] in the boot menu switches to OpenWrt), and
-# nothing of the system is kept (sysupgrade -n).
+# 90D and 60E: the slot that is not the default one, refused when it
+# is the default one (FGT_SLOT_NONDEFAULT); the default slot is left
+# unchanged ([B] in the boot menu switches to OpenWrt), and nothing of
+# the system is kept (sysupgrade -n).
 #
 # 60D: persistence (FGT_PERSIST). Its slot (partition 1, sectors
 # 1-524288 of the stick) holds the container (the ext file system the
@@ -70,13 +71,14 @@ fgt_board() {
 	fortinet,fg60e)
 		FGT_BOARD="FortiGate 60E"
 		FGT_DISK_KIND=mmc
-		FGT_MMC_DISK=/dev/mmcblk0
-		FGT_MMC_SLOT=/dev/mmcblk0p2
+		FGT_MMC_DISK="${FGT_DEV:-/dev}/mmcblk0"
+		FGT_MMC_SLOT="${FGT_DEV:-/dev}/mmcblk0p2"
 		FGT_SLOT_PART=2
 		FGT_SLOT_LBA=786440
 		FGT_SLOT_SIZE=524288
 		FGT_SLOT_IMAGE=1
 		FGT_IMAGE_NAME=FGT60E-OpenWrt
+		FGT_SLOT_NONDEFAULT=1
 		FGT_HEADER_FORBIDDEN="0xdc:1 0x170:1"
 		FGT_WW_EXPECTED="0+1 786440+524288"
 		;;
