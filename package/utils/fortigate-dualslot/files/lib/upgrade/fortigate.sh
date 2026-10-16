@@ -25,7 +25,12 @@
 # target slot become the default one (FGT_SLOT_MAKE_DEFAULT): the boot
 # flags are then switched (target 0x80, other 0x00) in the same write
 # of sector 0 as the name and the build number, and [B] in the boot
-# menu brings the stock firmware back.
+# menu brings the stock firmware back. The target slot must then be
+# the one that is not the default one, or already the default one with
+# an OpenWrt image (its name in the header is FGT_IMAGE_NAME or
+# FGT_IMAGE_NAME_ENV): a default slot holding anything else is the
+# stock firmware in use, never overwritten. The other image must have
+# a name (the stock firmware [B] brings back).
 #
 # Persistence (FGT_PERSIST): the slot then holds two areas,
 #
@@ -196,6 +201,20 @@ fgt_image_offsets() { # <image>
 	1) echo "0x30 0x12c" ;;
 	*) return 1 ;;
 	esac
+}
+
+# True when the name of the image at <offset> of the header <file> is
+# exactly <name> (cut to 32 bytes, padded with zeros); never for an
+# empty <name>
+fgt_name_is() { # <file> <offset> <name>
+	local n="${3:0:$FGT_NAME_LEN}" want
+
+	[ -n "$n" ] || return 1
+	want="$(printf '%s' "$n" | fgt_hex 0 $FGT_NAME_LEN)"
+	while [ ${#want} -lt $((2 * FGT_NAME_LEN)) ]; do
+		want="${want}00"
+	done
+	[ "$(fgt_hex "$2" $FGT_NAME_LEN "$1")" = "$want" ]
 }
 
 # First offset of the MBR entry of partition <1 or 2>: the boot flag is
@@ -584,11 +603,23 @@ fgt_check_disk() { # <sector 0 file>
 			{ fgt_refuse "partition $FGT_SLOT_PART is the default slot (or no default): switch to partition $((3 - FGT_SLOT_PART)) with [B] first"; return 1; }
 	fi
 	# Exactly one default slot before the switch, when the board makes
-	# the target slot the default one
+	# the target slot the default one. The target slot may already be
+	# the default one only when its image is OpenWrt (a name this
+	# installer writes): any other image there is the stock firmware in
+	# use. The other image must have a name: the stock firmware that
+	# [B] brings back.
 	if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ]; then
 		case "$flags" in
-		8000|0080) ;;
+		0080) ;;
+		8000)
+			fgt_name_is "$s0" "$FGT_NAME_OFS" "$FGT_IMAGE_NAME" ||
+				fgt_name_is "$s0" "$FGT_NAME_OFS" "$FGT_IMAGE_NAME_ENV" ||
+				{ fgt_refuse "partition $FGT_SLOT_PART is the default slot and image $FGT_SLOT_IMAGE is not OpenWrt: switch to partition $((3 - FGT_SLOT_PART)) with [B] first"; return 1; }
+			;;
 		*) fgt_refuse "boot flags of partitions $FGT_SLOT_PART and $((3 - FGT_SLOT_PART)) are $flags, neither 8000 nor 0080: switch with [B] first"; return 1 ;;
+		esac
+		case "$(fgt_hex $FGT_OTHER_NAME_OFS 1 "$s0")" in
+		""|00) fgt_refuse "image $((1 - FGT_SLOT_IMAGE)) has no name: no stock firmware for [B] to bring back"; return 1 ;;
 		esac
 	fi
 
