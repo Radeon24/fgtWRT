@@ -12,7 +12,7 @@ define Device/fortinet_fg-60e
   FORTIGATE_PART_SECTORS := 524288
   DEVICE_DTS := fortinet-fg60e
   DEVICE_PACKAGES := firewall4 kmod-nft-offload kmod-bonding proto-bonding \
-	ethtool ip-full kmod-fortinet-np6lite fortigate-dualslot luci
+	ethtool ip-full kmod-fortinet-np6lite fortigate-dualslot
   SUPPORTED_DEVICES := fortinet,fg60e
 endef
 TARGET_DEVICES += fortinet_fg-60e
