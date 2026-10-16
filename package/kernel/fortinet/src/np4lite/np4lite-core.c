@@ -1325,6 +1325,7 @@ struct fnp4l_port {
 	u32 priv_flags;			/* NP4L_PRIV_*, read locklessly */
 	bool ipopt_flag;		/* "ip-options-host" offered */
 	bool lif_mtu_fixed;		/* DSA conduit: LIF MTU NP4L_LIF_MTU */
+	unsigned int ft_blocks;		/* flow tables bound, under sse_lock */
 };
 
 #ifdef CONFIG_FORTINET_NP4LITE_DSA
@@ -1505,6 +1506,8 @@ struct fnp4l_flow {
 	u8 tae;				/* counter entry, 0 = none */
 	bool vlan_act;			/* holds a VLAN action entry of in_port */
 	u16 sa_idx;			/* IPsec SA it is chained to, 0 = none */
+	/* Block of the flow table that offered it: compared, never followed */
+	const struct flow_block *table;
 #ifdef CONFIG_FORTINET_NP4LITE_DSA
 	u8 dsa_out_lif;			/* switch port of the output, 0: none */
 	u8 h_dest[ETH_ALEN];		/* next hop, for the bridge FDB */
@@ -7117,6 +7120,7 @@ static int fnp4l_ft_ipsec_admit(struct fnp4l *np, unsigned int in,
 }
 
 static int fnp4l_ft_replace(struct fnp4l_port *port,
+			    const struct flow_block *table,
 			    struct flow_cls_offload *cls)
 {
 	struct fnp4l *np = port->np;
@@ -7141,6 +7145,7 @@ static int fnp4l_ft_replace(struct fnp4l_port *port,
 	flow->key = cmd.key;
 	flow->in_port = port->id;
 	flow->out_port = oport->id;
+	flow->table = table;
 #ifdef CONFIG_FORTINET_NP4LITE_DSA
 	/* Through a switch port: followed in the FDB of its bridge */
 	if (cmd.out_lif <= NP4L_DSA_LIF_LAST &&
@@ -7334,10 +7339,23 @@ static int fnp4l_ft_stats(struct fnp4l_port *port,
 	return 0;
 }
 
+/*
+ * Several flow tables may be bound to a port at a time: nf_tables binds a
+ * new table before it unbinds the one the same transaction deletes (a
+ * reload), and a check-only transaction binds a table of its own, then
+ * unbinds it. Each binding of a table to a port has its callback, whose
+ * data says which table its flows come from.
+ */
+struct fnp4l_ft_block {
+	struct fnp4l_port *port;
+	const struct flow_block *table;
+};
+
 static int fnp4l_ft_cb(enum tc_setup_type type, void *type_data,
 		       void *cb_priv)
 {
-	struct fnp4l_port *port = cb_priv;
+	const struct fnp4l_ft_block *blk = cb_priv;
+	struct fnp4l_port *port = blk->port;
 	struct flow_cls_offload *cls = type_data;
 
 	if (type != TC_SETUP_CLSFLOWER)
@@ -7347,7 +7365,7 @@ static int fnp4l_ft_cb(enum tc_setup_type type, void *type_data,
 	case FLOW_CLS_REPLACE:
 		if (!tc_can_offload(port->ndev))
 			return -EOPNOTSUPP;
-		return fnp4l_ft_replace(port, cls);
+		return fnp4l_ft_replace(port, blk->table, cls);
 	case FLOW_CLS_DESTROY:
 		return fnp4l_ft_destroy(port->np, cls->cookie);
 	case FLOW_CLS_STATS:
@@ -7355,6 +7373,33 @@ static int fnp4l_ft_cb(enum tc_setup_type type, void *type_data,
 	default:
 		return -EOPNOTSUPP;
 	}
+}
+
+static void fnp4l_ft_block_free(void *cb_priv)
+{
+	kfree(cb_priv);
+}
+
+/* The callback of flow table @f->block on @port, identified by the port */
+static struct flow_block_cb *
+fnp4l_ft_block_alloc(struct fnp4l_port *port,
+		     const struct flow_block_offload *f)
+{
+	struct flow_block_cb *block_cb;
+	struct fnp4l_ft_block *blk;
+
+	blk = kzalloc_obj(*blk);
+	if (!blk)
+		return ERR_PTR(-ENOMEM);
+	blk->port = port;
+	blk->table = f->block;
+
+	block_cb = flow_block_cb_alloc(fnp4l_ft_cb, port, blk,
+				       fnp4l_ft_block_free);
+	if (IS_ERR(block_cb))
+		kfree(blk);
+
+	return block_cb;
 }
 
 static int fnp4l_ft_bind(struct fnp4l_port *port,
@@ -7387,6 +7432,13 @@ static int fnp4l_ft_bind(struct fnp4l_port *port,
 		goto out;
 	}
 
+	/* Bound for another flow table already: nothing more to set up */
+	if (port->ft_blocks) {
+		port->ft_blocks++;
+		ret = 0;
+		goto out;
+	}
+
 	ret = fnp4l_lif_rx_action(port, NP4L_RX_ACTION_FLOW);
 	if (ret) {
 		fnp4l_lif_rx_action(port, NP4L_RX_ACTION_HOST);
@@ -7395,6 +7447,7 @@ static int fnp4l_ft_bind(struct fnp4l_port *port,
 		goto out;
 	}
 	set_bit(port->id, &np->ft_ports);
+	port->ft_blocks = 1;
 out:
 	mutex_unlock(&np->sse_lock);
 
@@ -7402,11 +7455,12 @@ out:
 }
 
 /*
- * The flow table no longer reaches the callback of this port: send its
- * frames, tagged ones included, to the host again and delete the entries
- * that go through it.
+ * Delete the engine entries of the flows through @port, in or out, that
+ * flow table @table offered, or any table if NULL. Their packets go to
+ * the host again. Under sse_lock.
  */
-static void fnp4l_ft_unbind(struct fnp4l_port *port)
+static void fnp4l_ft_purge_port(struct fnp4l_port *port,
+				const struct flow_block *table)
 {
 	struct fnp4l *np = port->np;
 	struct fnp4l_flow *flow;
@@ -7414,15 +7468,11 @@ static void fnp4l_ft_unbind(struct fnp4l_port *port)
 	bool failed = false;
 	unsigned int bkt;
 
-	mutex_lock(&np->sse_lock);
-	/* The ESP of an inbound IPsec SA is looked up in the flow table. */
-	if (!(fnp4l_ipsec_ports(np->ipsec) & BIT(port->id)))
-		fnp4l_lif_rx_action(port, NP4L_RX_ACTION_HOST);
-	fnp4l_vlan_act_clear(port);
-	clear_bit(port->id, &np->ft_ports);
-
+	lockdep_assert_held(&np->sse_lock);
 	hash_for_each_safe(np->ft_flows, bkt, tmp, flow, node) {
 		if (flow->in_port != port->id && flow->out_port != port->id)
+			continue;
+		if (table && flow->table != table)
 			continue;
 		if (np->sse_state == NP4L_SSE_UP && !failed) {
 			int ret = fnp4l_sse_delete(np, &flow->key);
@@ -7435,6 +7485,35 @@ static void fnp4l_ft_unbind(struct fnp4l_port *port)
 	}
 	if (failed)
 		fnp4l_sse_fail(np);
+}
+
+/*
+ * Flow table @table no longer reaches the callback of this port. While
+ * other tables stay bound, delete the entries of its flows through the
+ * port only. After the last one, send the frames of the port, tagged ones
+ * included, to the host again and delete the entries that go through it.
+ */
+static void fnp4l_ft_unbind(struct fnp4l_port *port,
+			    const struct flow_block *table)
+{
+	struct fnp4l *np = port->np;
+
+	mutex_lock(&np->sse_lock);
+	if (port->ft_blocks > 1) {
+		port->ft_blocks--;
+		fnp4l_ft_purge_port(port, table);
+		mutex_unlock(&np->sse_lock);
+		return;
+	}
+	port->ft_blocks = 0;
+
+	/* The ESP of an inbound IPsec SA is looked up in the flow table. */
+	if (!(fnp4l_ipsec_ports(np->ipsec) & BIT(port->id)))
+		fnp4l_lif_rx_action(port, NP4L_RX_ACTION_HOST);
+	fnp4l_vlan_act_clear(port);
+	clear_bit(port->id, &np->ft_ports);
+
+	fnp4l_ft_purge_port(port, NULL);
 	fnp4l_lag_unbind_port(port);
 
 	if (fnp4l_ft_idle(np))
@@ -7446,37 +7525,21 @@ static LIST_HEAD(fnp4l_block_cb_list);
 
 #ifdef CONFIG_FORTINET_NP4LITE_DSA
 /*
- * A user port of the switch leaves the flow table, others stay: the
+ * A user port of the switch leaves flow table @table, others stay: the
  * conduit cannot tell which one left (the flow table only passes its
- * block), so delete the engine entries of every flow through the
- * conduit. Their packets go through the host from then on: the flow
- * table keeps them as offloaded, and offers them anew only once they
- * have expired. Neither is anything torn down by the flow table while
- * the port stays up.
+ * block), so delete the engine entries of every flow of that table
+ * through the conduit. Their packets go through the host from then on:
+ * the flow table keeps them as offloaded, and offers them anew only once
+ * they have expired. Neither is anything torn down by the flow table
+ * while the port stays up.
  */
-static void fnp4l_ft_purge_conduit(struct fnp4l_port *port)
+static void fnp4l_ft_purge_conduit(struct fnp4l_port *port,
+				   const struct flow_block *table)
 {
 	struct fnp4l *np = port->np;
-	struct fnp4l_flow *flow;
-	struct hlist_node *tmp;
-	bool failed = false;
-	unsigned int bkt;
 
 	mutex_lock(&np->sse_lock);
-	hash_for_each_safe(np->ft_flows, bkt, tmp, flow, node) {
-		if (flow->in_port != port->id && flow->out_port != port->id)
-			continue;
-		if (np->sse_state == NP4L_SSE_UP && !failed) {
-			int ret = fnp4l_sse_delete(np, &flow->key);
-
-			failed = ret && ret != -ENOENT;
-		}
-		fnp4l_ft_unlink(np, flow);
-		fnp4l_ft_release(np, flow);
-		kfree(flow);
-	}
-	if (failed)
-		fnp4l_sse_fail(np);
+	fnp4l_ft_purge_port(port, table);
 	/* And those through it and a bond */
 	fnp4l_lag_unbind_port(port);
 	mutex_unlock(&np->sse_lock);
@@ -7527,7 +7590,8 @@ static unsigned int fnp4l_dsa_purge_lifs(struct fnp4l *np,
  * The conduit has a single callback per flow table, bound with the first
  * user port and unbound with the last, and takes the flows that enter
  * through any of them (fnp4l_dsa_in()). The LIFs of the switch ports
- * then look frames up in the flow table (fnp4l_dsa_rx_action()).
+ * then look frames up in the flow table (fnp4l_dsa_rx_action()). Another
+ * flow table gets a callback of its own (see struct fnp4l_ft_block).
  */
 static int fnp4l_setup_ft_conduit(struct fnp4l_port *port,
 				  struct flow_block_offload *f)
@@ -7543,16 +7607,14 @@ static int fnp4l_setup_ft_conduit(struct fnp4l_port *port,
 			flow_block_cb_incref(block_cb);
 			return 0;
 		}
-		if (flow_block_cb_is_busy(cb, port, &fnp4l_block_cb_list))
-			return -EBUSY;
 
 		ret = fnp4l_ft_bind(port, f->extack);
 		if (ret)
 			return ret;
 
-		block_cb = flow_block_cb_alloc(cb, port, port, NULL);
+		block_cb = fnp4l_ft_block_alloc(port, f);
 		if (IS_ERR(block_cb)) {
-			fnp4l_ft_unbind(port);
+			fnp4l_ft_unbind(port, f->block);
 			return PTR_ERR(block_cb);
 		}
 		flow_block_cb_incref(block_cb);
@@ -7565,13 +7627,13 @@ static int fnp4l_setup_ft_conduit(struct fnp4l_port *port,
 		if (!block_cb)
 			return -ENOENT;
 		if (flow_block_cb_decref(block_cb)) {
-			fnp4l_ft_purge_conduit(port);
+			fnp4l_ft_purge_conduit(port, f->block);
 			return 0;
 		}
 
 		flow_block_cb_remove(block_cb, f);
 		list_del(&block_cb->driver_list);
-		fnp4l_ft_unbind(port);
+		fnp4l_ft_unbind(port, f->block);
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -7608,18 +7670,24 @@ static int fnp4l_setup_ft(struct fnp4l_port *port,
 					   "flow offload not available on this port");
 			return -EOPNOTSUPP;
 		}
-		if (flow_block_cb_is_busy(cb, port, &fnp4l_block_cb_list))
-			return -EBUSY;
+		/* Bound twice to this port by the same table */
+		block_cb = flow_block_cb_lookup(f->block, cb, port);
+		if (block_cb) {
+			flow_block_cb_incref(block_cb);
+			return 0;
+		}
 
+		/* One callback per table, others bound or not */
 		ret = fnp4l_ft_bind(port, f->extack);
 		if (ret)
 			return ret;
 
-		block_cb = flow_block_cb_alloc(cb, port, port, NULL);
+		block_cb = fnp4l_ft_block_alloc(port, f);
 		if (IS_ERR(block_cb)) {
-			fnp4l_ft_unbind(port);
+			fnp4l_ft_unbind(port, f->block);
 			return PTR_ERR(block_cb);
 		}
+		flow_block_cb_incref(block_cb);
 		flow_block_cb_add(block_cb, f);
 		list_add_tail(&block_cb->driver_list, &fnp4l_block_cb_list);
 		return 0;
@@ -7627,10 +7695,12 @@ static int fnp4l_setup_ft(struct fnp4l_port *port,
 		block_cb = flow_block_cb_lookup(f->block, cb, port);
 		if (!block_cb)
 			return -ENOENT;
+		if (flow_block_cb_decref(block_cb))
+			return 0;
 
 		flow_block_cb_remove(block_cb, f);
 		list_del(&block_cb->driver_list);
-		fnp4l_ft_unbind(port);
+		fnp4l_ft_unbind(port, f->block);
 		return 0;
 	default:
 		return -EOPNOTSUPP;
