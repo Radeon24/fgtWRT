@@ -38,8 +38,9 @@ endef
 define KernelPackage/fortinet-np4lite/description
  Ethernet driver for the NP4Lite network processor: one network interface
  per port, routed IPv4 flows offloaded through a netfilter flow table with
- the "offload" flag and, where the SoC has them, IPsec ESP offload and the
- ports of the switch behind the network processor's links.
+ the "offload" flag and, where the SoC has them, the ports of the switch
+ behind the network processor's links. IPsec ESP offload is not part of
+ this package.
  Once loaded, the module cannot be unloaded.
 endef
 
