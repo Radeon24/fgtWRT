@@ -7,8 +7,9 @@ board_config_update
 case "$(board_name)" in
 fortinet,fg60d|\
 fortinet,fg60e)
-	# No DHCP or RA server in these images: the internal ports are bridged
-	# to a static LAN only, dmz and wan2 are left unconfigured.
+	# The internal ports are bridged to the LAN, with the usual defaults
+	# of OpenWrt (static address, DHCP and RA servers), wan1 is the WAN,
+	# dmz and wan2 are left unconfigured.
 	# As usual in OpenWrt, all seven internal ports are bridged: before
 	# cabling several of them to the same switch (link aggregation on the
 	# other side, for instance), take them out of br-lan, or a loop may
