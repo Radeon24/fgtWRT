@@ -176,9 +176,11 @@
 		};
 
 		/*
-		 * Register layout of its own (not the FortiSOC1 one). Keep it
-		 * off until its use with the DMA masters and the table walker
-		 * is validated: a board variant enables it.
+		 * Register layout of its own (not the FortiSOC1 one). Off here,
+		 * each board decides: on in the FortiGate 60D (validated with
+		 * its DMA masters), off in the FortiGate 90D. The page tables
+		 * are not kept in it (OUTER_CACHE_PGTABLES is not selected for
+		 * this SoC).
 		 */
 		l2: cache-controller@e4b00000 {
 			compatible = "fortinet,fsoc2-l2cc";

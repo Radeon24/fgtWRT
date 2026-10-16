@@ -5,22 +5,21 @@ Add NET_DSA_B53_LAG: trunk groups of the BCM53128.
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/net/dsa/b53/Kconfig      |  14 ++
+ drivers/net/dsa/b53/Kconfig      |  13 ++
  drivers/net/dsa/b53/b53_common.c | 224 ++++++++++++++++++++++++++++++++
  drivers/net/dsa/b53/b53_priv.h   |  17 ++
  drivers/net/dsa/b53/b53_regs.h   |  23 +++
- 4 files changed, 278 insertions(+)
+ 4 files changed, 277 insertions(+)
 
 --- a/drivers/net/dsa/b53/Kconfig
 +++ b/drivers/net/dsa/b53/Kconfig
-@@ -12,6 +12,20 @@ menuconfig B53
+@@ -12,6 +12,19 @@ menuconfig B53
  	  BCM5325E, BCM5365, BCM539x, BCM53115 and BCM53125 as well as BCM63XX
  	  integrated switches.
  
 +config NET_DSA_B53_LAG
 +	bool "B53 link aggregation offload (BCM53128 only)"
 +	depends on B53
-+	default n
 +	help
 +	  Offload hash based link aggregation groups (bonding balance-xor
 +	  and 802.3ad, the LACP state machine staying in software) to the

@@ -54,7 +54,7 @@ properties:
           minimum: 1
         - description: Number of sectors of the area
           minimum: 1
-    description:
+    description: |
       Area of the disk that holds the writable file system of the running
       system. It is reached through a loop device backed by the whole disk,
       whose page cache writes back whole 4 KiB pages: start and count are

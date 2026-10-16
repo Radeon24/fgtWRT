@@ -28,8 +28,8 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 +	  SCU, global and private timers), a PL310 L2 cache controller and
 +	  an Emma Mobile compatible 8250 console UART.
 +
-+	  The platform needs no mach- directory: the generic DT machine
-+	  descriptor is enough. The stock boot loader is not known to pass
++	  Its machine (secondary core start, L2 cache and ACP set-up) is in
++	  arch/arm/mach-fsoc3. The stock boot loader is not known to pass
 +	  a usable device tree, so a bootable kernel is built with
 +	  ARM_APPENDED_DTB.
 +

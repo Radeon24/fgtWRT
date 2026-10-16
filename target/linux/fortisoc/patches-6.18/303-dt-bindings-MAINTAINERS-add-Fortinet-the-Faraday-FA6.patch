@@ -9,8 +9,8 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
  Documentation/devicetree/bindings/arm/cpus.yaml    |  3 +
  ...tation/devicetree/bindings/vendor-prefixes.yaml |  2 +
- MAINTAINERS                                        | 35 +++++++++++++++
- 3 files changed, 40 insertions(+)
+ MAINTAINERS                                        | 33 +++++++++++++++
+ 3 files changed, 38 insertions(+)
 
 --- a/Documentation/devicetree/bindings/arm/cpus.yaml
 +++ b/Documentation/devicetree/bindings/arm/cpus.yaml
@@ -44,7 +44,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
    "^foxlink,.*":
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
-@@ -2695,6 +2695,41 @@ W:	http://www.armlinux.org.uk/
+@@ -2695,6 +2695,39 @@ W:	http://www.armlinux.org.uk/
  F:	arch/arm/include/asm/hardware/dec21285.h
  F:	arch/arm/mach-footbridge/
  
@@ -59,6 +59,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 +F:	Documentation/devicetree/bindings/crypto/fortinet,fsoc1-crypto.yaml
 +F:	Documentation/devicetree/bindings/gpio/fortinet,fsoc3-gpio.yaml
 +F:	Documentation/devicetree/bindings/i2c/fortinet,fsoc3-i2c.yaml
++F:	Documentation/devicetree/bindings/misc/fortinet,disk-rootfs-data.yaml
 +F:	Documentation/devicetree/bindings/misc/fortinet,usb-disk-write-windows.yaml
 +F:	Documentation/devicetree/bindings/mmc/fortinet,fsoc3-sdhi.yaml
 +F:	Documentation/devicetree/bindings/net/fortinet,fsoc1-np.yaml
@@ -72,16 +73,13 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 +F:	arch/arm/mach-fsoc3/
 +F:	arch/arm/mm/cache-fsoc1-l2.c
 +F:	block/blk-write-windows.c
-+F:	drivers/crypto/fortinet/
 +F:	drivers/gpio/gpio-fsoc3.c
 +F:	drivers/i2c/busses/i2c-fsoc3.c
-+F:	drivers/net/ethernet/fortinet/
 +F:	drivers/nvmem/fsoc3-boot-flash.c
 +F:	drivers/power/reset/fsoc3-reboot.c
 +F:	drivers/rtc/rtc-fsoc*.c
 +F:	drivers/spi/spi-fsoc2-ssp.c
 +F:	include/linux/blk-write-windows.h
-+F:	include/linux/soc/fortinet/
 +
  ARM/FREESCALE IMX / MXC ARM ARCHITECTURE
  M:	Shawn Guo <shawnguo@kernel.org>

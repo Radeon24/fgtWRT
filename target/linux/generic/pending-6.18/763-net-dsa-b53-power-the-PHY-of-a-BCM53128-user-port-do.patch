@@ -6,21 +6,20 @@ down.
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/net/dsa/b53/Kconfig      | 17 ++++++
+ drivers/net/dsa/b53/Kconfig      | 16 ++++++
  drivers/net/dsa/b53/b53_common.c | 90 +++++++++++++++++++++++++++++++++
  drivers/net/dsa/b53/b53_priv.h   |  7 +++
- 3 files changed, 114 insertions(+)
+ 3 files changed, 113 insertions(+)
 
 --- a/drivers/net/dsa/b53/Kconfig
 +++ b/drivers/net/dsa/b53/Kconfig
-@@ -26,6 +26,23 @@ config NET_DSA_B53_LAG
+@@ -25,6 +25,22 @@ config NET_DSA_B53_LAG
  	  Without this option, the driver never accesses the trunk
  	  registers. If unsure, say N.
  
 +config NET_DSA_B53_LAG_PHY_PDOWN
 +	bool "Power the PHY of a BCM53128 user port down while it is down"
 +	depends on NET_DSA_B53_LAG
-+	default n
 +	help
 +	  Power the internal PHY of a BCM53128 user port down (BMCR power
 +	  down bit) while the port is administratively down, so that the

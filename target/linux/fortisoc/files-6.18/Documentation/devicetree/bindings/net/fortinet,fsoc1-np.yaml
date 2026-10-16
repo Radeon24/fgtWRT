@@ -127,13 +127,17 @@ properties:
 
           fortinet,logical-interface:
             $ref: /schemas/types.yaml#/definitions/uint32
-            maximum: 63
+            maximum: 19
             description:
               Logical interface (LIF), the index the NP classes the frames
               received on the link to, and that the frames sent through the
               port target. Defaults to the port number; set on boards whose
               wiring numbers them apart (wan1 and wan2 on links 0 and 1 but
               LIFs 2 and 3, for instance). Each port has a LIF of its own.
+              The LIFs of the ports stay below the traffic counters of the
+              flows, 8 at most, 19 when switch ports take LIFs of their own
+              (fortinet,switch-logical-interfaces); a port of a bond needs a
+              LIF below the number of ports when no switch port takes one.
               On a DSA conduit with fortinet,switch-logical-interfaces, the
               LIF of the frames of the switch that the NP does not class by
               switch port.

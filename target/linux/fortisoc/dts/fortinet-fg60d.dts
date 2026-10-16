@@ -117,8 +117,9 @@
 
 		/*
 		 * Security associations of the IPsec engine of the network
-		 * processor (they survive a reboot). Not used by the driver yet, only kept out of the
-		 * memory of the kernel.
+		 * processor (they survive a reboot), written by the driver when
+		 * it offers IPsec offload; kept out of the memory of the kernel
+		 * in every case.
 		 */
 		np_sa: np-sa@3fc00000 {
 			reg = <0x3fc00000 0x00400000>;
