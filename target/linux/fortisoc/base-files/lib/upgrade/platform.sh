@@ -9,7 +9,7 @@
 # 90D and 60E: the slot that is not the default one, refused when it
 # is the default one (FGT_SLOT_NONDEFAULT); the default slot is left
 # unchanged ([B] in the boot menu switches to OpenWrt), and nothing of
-# the system is kept (sysupgrade -n).
+# the system is kept: sysupgrade without -n is refused.
 #
 # 60D: persistence (FGT_PERSIST). Its slot (partition 1, sectors
 # 1-524288 of the stick) holds the container (the ext file system the

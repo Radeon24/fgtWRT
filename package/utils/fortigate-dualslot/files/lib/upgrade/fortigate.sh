@@ -110,8 +110,10 @@
 # its superblock, never a 64bit one), the whole slot or only the
 # container.
 #
-# Configuration, without FGT_PERSIST: use sysupgrade -n, nothing of
-# the RAM system is kept. With FGT_PERSIST, the order is: container,
+# Configuration, without FGT_PERSIST: nothing of the RAM system is
+# kept, and sysupgrade without -n is refused (SAVE_CONFIG=1 at the
+# image check, a backup archive, UPGRADE_BACKUP, in stage2): use
+# sysupgrade -n. With FGT_PERSIST, the order is: container,
 # then rootfs_data, then sector 0. sysupgrade (keep the configuration)
 # hands over its backup archive (UPGRADE_BACKUP, /tmp/sysupgrade.tgz,
 # set by procd, visible in platform_do_upgrade): it is written at the
@@ -857,6 +859,13 @@ fgt_check_image() { # <image>
 		  return 74; }
 	fgt_check_writable_list ||
 		{ fgt_refuse "bad list of writable header bytes"; return 74; }
+	# Without persistence nothing is kept: sysupgrade -n only
+	if [ "$FGT_PERSIST" != 1 ]; then
+		command -v notify_firmware_no_backup > /dev/null &&
+			notify_firmware_no_backup
+		[ "$SAVE_CONFIG" != 1 ] ||
+			{ fgt_refuse "no configuration is kept on this board: use sysupgrade -n"; return 74; }
+	fi
 	fgt_check_disk "$s0" || return 74
 	fgt_check_container "$1" > /dev/null || return 1
 }
@@ -873,6 +882,8 @@ fgt_do_upgrade() { # <image>
 		{ fgt_refuse "bad installer settings (platform.sh)"; return 74; }
 	fgt_check_writable_list ||
 		{ fgt_refuse "bad list of writable header bytes"; return 74; }
+	[ "$FGT_PERSIST" = 1 ] || [ -z "$UPGRADE_BACKUP" ] ||
+		{ fgt_refuse "no configuration is kept on this board: use sysupgrade -n"; return 74; }
 	fgt_check_disk "$s0" || return 74
 	name="$(fgt_image_name)"
 	part="$(fgt_check_container "$img")" || return 1
