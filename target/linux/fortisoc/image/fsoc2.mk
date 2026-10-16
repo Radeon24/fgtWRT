@@ -24,7 +24,7 @@ define Device/fortinet_fg-60d
   DEVICE_DTS := fortinet-fg60d
   DEVICE_PACKAGES := firewall4 kmod-nft-offload kmod-bonding proto-bonding \
 	ethtool ip-full kmod-fortinet-np4lite kmod-fortinet-cp7 \
-	fortigate-dualslot e2fsprogs
+	kmod-ipsec kmod-ipsec4 fortigate-dualslot e2fsprogs
   SUPPORTED_DEVICES := fortinet,fg60d
 endef
 TARGET_DEVICES += fortinet_fg-60d
@@ -40,7 +40,7 @@ define Device/fortinet_fg-90d
   DEVICE_DTS := fortinet-fg90d
   DEVICE_PACKAGES := firewall4 kmod-nft-offload kmod-bonding proto-bonding \
 	ethtool ip-full kmod-fortinet-np4lite kmod-fortinet-cp7 \
-	fortigate-dualslot
+	kmod-ipsec kmod-ipsec4 fortigate-dualslot
   SUPPORTED_DEVICES := fortinet,fg90d
 endef
 TARGET_DEVICES += fortinet_fg-90d
