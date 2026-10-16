@@ -32,7 +32,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  };
 --- a/net/netfilter/Kconfig
 +++ b/net/netfilter/Kconfig
-@@ -740,6 +740,18 @@ config NF_FLOW_TABLE_PROCFS
+@@ -738,6 +738,18 @@ config NF_FLOW_TABLE_PROCFS
  	  This option enables for the flow table offload statistics
  	  to be shown in procfs under net/netfilter/nf_flowtable.
  
