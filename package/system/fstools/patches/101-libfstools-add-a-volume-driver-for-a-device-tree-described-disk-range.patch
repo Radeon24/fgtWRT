@@ -1,4 +1,4 @@
-From e2055d838f3949b3b5d410fa3bd9461f267ce008 Mon Sep 17 00:00:00 2001
+From 64bd1a465c926ed9346a289bdddacca8da90e807 Mon Sep 17 00:00:00 2001
 From: Radeon24 <Radeon24@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 11:40:29 +0200
 Subject: [PATCH 101/101] libfstools: add a volume driver for a device tree
@@ -74,8 +74,8 @@ Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
  CMakeLists.txt        |   1 +
- libfstools/fortisoc.c | 881 ++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 882 insertions(+)
+ libfstools/fortisoc.c | 893 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 894 insertions(+)
  create mode 100644 libfstools/fortisoc.c
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -92,10 +92,10 @@ index e138f98..932f6e2 100644
  TARGET_LINK_LIBRARIES(fstools ubox)
 diff --git a/libfstools/fortisoc.c b/libfstools/fortisoc.c
 new file mode 100644
-index 0000000..c25ea49
+index 0000000..05786a1
 --- /dev/null
 +++ b/libfstools/fortisoc.c
-@@ -0,0 +1,881 @@
+@@ -0,0 +1,893 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Overlay volume described by the device tree as a range of a whole disk.
@@ -583,9 +583,19 @@ index 0000000..c25ea49
 +	return found;
 +}
 +
++static const char *fortisoc_basename(const char *path)
++{
++	const char *b = strrchr(path, '/');
++
++	return b ? b + 1 : path;
++}
++
 +/*
-+ * A loop device bound to exactly the range, as sysfs shows it (full
-+ * backing file path, unlike lo_file_name), is mounted.
++ * A loop device bound to exactly the range (offset and size limit) of the
++ * disk is mounted. The disk is matched by the base name of the backing
++ * file: sysfs shows the path as seen from the current root, and a loop
++ * device bound in preinit on the tmpfs /dev reads "/sda" once the root
++ * has been pivoted, not "/dev/sda".
 + */
 +static bool fortisoc_range_mounted(const struct fortisoc_volume *p)
 +{
@@ -617,7 +627,9 @@ index 0000000..c25ea49
 +		file[n] = '\0';
 +		fortisoc_trim(file);
 +
-+		found = !strcmp(file, p->disk) &&
++		found = *fortisoc_basename(file) &&
++			!strcmp(fortisoc_basename(file),
++				fortisoc_basename(p->disk)) &&
 +			fortisoc_sys_u64_eq(dir, "offset", p->offset) &&
 +			fortisoc_sys_u64_eq(dir, "sizelimit", p->size) &&
 +			fortisoc_dev_mounted(dev);
