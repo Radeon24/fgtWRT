@@ -193,16 +193,19 @@ In `make menuconfig`, select:
 | Target Profile | `FortiGate 60D` |
 
 The device profile brings the drivers, the firewall with hardware flow offload, IPsec (IPv4 and IPv6, with
-the NP4Lite offload) and the installer. It does **not** select a web interface or VPN packages; add the
-ones you want as built-in (`*`), for instance:
+the NP4Lite offload) and the installer. On the 60D, it also **includes** the web interface and the VPN
+packages, so that the profile alone builds the image that was measured; nothing else has to be selected:
 
-| Package | For |
+| Package (included in the 60D profile) | For |
 |---|---|
-| `luci` (LuCI → Collections) | web interface |
+| `luci` | web interface |
 | `kmod-wireguard`, `wireguard-tools` | WireGuard |
 | `openvpn-openssl`, `kmod-ovpn-backports` | OpenVPN, with its kernel data channel (DCO) |
+| `openssl-util` | the `openssl` command line tool |
 
-All the measurements below were made with these packages built in.
+On FortiSOC2, the ramdisk compression also defaults to gzip, which the boot loader requires (see
+[Image layout](#image-layout)) and which the build checks. All the measurements below were made with these
+packages built in.
 
 Then build:
 
@@ -791,6 +794,13 @@ harness: the numbers in [Devices](#devices) come from it.
   saving it, and restores the configuration afterwards.
 - Each test is run **three times**, and the median is reported, unless noted otherwise.
 - Each table states the build revision (`/etc/openwrt_release`).
+- The measured builds (`r37414` to `r37420`) were built with the low-level early debug console of the kernel
+  enabled (`DEBUG_LL`, `EARLY_PRINTK`, options of the local build configuration), and with a few test tools
+  from the same configuration (in `r37420`: `iperf3`, the `devmem`, `blockdev` and `od` applets of BusyBox,
+  `/dev/mem`). That console only prints
+  boot messages before the serial driver starts; no effect on the throughputs is expected. The published
+  image is built from the device profile alone: it has neither that console nor these tools (the generic
+  `earlycon` of the kernel command line is the same in both).
 - Model caveat: on the 60D, hardware offload is measured between `wan1` and `wan2`, the two offload
   entry points of the current device tree; on the 60E, the switch side is a bond of switch ports.
 
