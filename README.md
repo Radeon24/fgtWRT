@@ -116,7 +116,7 @@ Routing/NAT Offloading → Hardware flow offloading* (`flow_offloading_hw` in `/
 | 802.1Q VLAN (one tag) | 🧪 | 🧪 | 🧪 | NP4Lite: needs `rx-vlan-offload` and `tx-vlan-offload`, off by default |
 | QinQ / 802.1ad | — | — | ❌ | NPLite / NP4Lite flow entries carry a single tag. NP6Lite: hardware support not established |
 | PPPoE | — | — | ❌ | NP6Lite: hardware support not established |
-| Flows through the ports of the switch | ❌ | 🧪 | 🧪 | NP4Lite: needs one logical interface per switch port in the device tree — enabled on the 90D, left out of the current 60D device tree (see [Known limitations](#known-limitations)). NP6Lite: through a bond of switch ports only |
+| Flows through the ports of the switch | ❌ | ✅ | 🧪 | NP4Lite: one logical interface per switch port in the device tree (60D and 90D), validated on the 60D; frames from the CPU to the switch ports are dropped when offloaded traffic saturates the NP–switch link (see [Known limitations](#known-limitations)). NP6Lite: through a bond of switch ports only |
 | Link aggregation (bonding) endpoints | ❌ | 🧪 | 🧪 | no aggregation in the NP itself: the bond is handled by the driver. NPLite: driver code, not tested. NP4Lite: active-backup, balance-xor, 802.3ad. NP6Lite: bonds of switch ports |
 | Offloaded connections | 8192 flows | **4096 connections** (8192 flow entries, one per direction) | 8192 flows | driver limit; further connections stay on the CPU |
 | Per-flow byte / packet counters | 🧪 | 🧪 | ❌ | NPLite: about a hundred counters only. NP4Lite: limited number of counters. NP6Lite: activity only |
@@ -346,9 +346,11 @@ flowchart LR
   SW -- "ports 1–7" --- INT(["internal7 … internal1"])
 ```
 
-**Hardware offload scope in the current device tree.** The switch ports have no logical interface of their
-own on the NP. Hardware flow offload therefore covers flows between `wan1` and `wan2`. Flows through the
-switch (`internal*`, `dmz`) are forwarded by the CPU.
+**Hardware offload scope.** Each switch port (`dmz`, `internal1`…`internal7`) has its own logical interface
+on the NP, so hardware flow offload covers flows between `wan1`, `wan2` and the switch ports, bonds of switch
+ports included. The offloaded directions through the switch ports follow the `switch_offload` parameter of
+the NP driver (`full`, the default: both directions); see [Known limitations](#known-limitations) for the
+behaviour when offloaded traffic saturates the link between the NP and the switch.
 
 ### Image layout
 
@@ -388,6 +390,9 @@ one TCP stream unless noted. The CPU is at 100 % on every software path.
 | Routing, UDP, 940 Mbit/s offered | **940 / 940**, no loss | 374.1 / 371.6, 59.4 % / 58.5 % lost | 340.4 / 336.9, 63.1 % / 62.0 % lost |
 | SNAT (masquerade), TCP | **941.3 / 941.4** | 352.2 / 283.1 | 287.4 / 208.2 |
 | DNAT (port forward), TCP | **941.4 / 941.4** | 351.9 / 282.5 | 283.9 / 205.8 |
+
+Through the switch ports, *hw* mode: routing between `wan2` and a two-port LACP bond of switch ports
+(`internal1` + `internal2`), TCP, one stream, **939 / 939** Mbit/s, CPU about 99 % idle (30 s runs).
 
 #### Routing and NAT, IPv6
 
@@ -444,7 +449,7 @@ holds 65536 entries):
 
 | Cipher | Path | in / out (Mbit/s) | CPU |
 |---|---|---|---|
-| AES-128-CBC + HMAC-SHA1 | **NP offload** | 405.1 / **883.5** | in 100 %, out 86–88 % |
+| AES-128-CBC + HMAC-SHA1 | **NP offload** | 396.2 / **883.3** | in 100 %, out about 91 % |
 | AES-128-CBC + HMAC-SHA1 | software, VPN engine (`fortinet-cp7`) | 123.2 / 105.0 | 100 % |
 | AES-128-GCM | software (generic) | 41.3 / 35.1 | 100 % |
 | ChaCha20-Poly1305 | software (generic) | 94.4 / 70.1 | 100 % |
@@ -480,7 +485,7 @@ CPU at 100 % in every case. The peer runs OpenVPN without DCO.
 |---|---|
 | Power, idle | 11 W |
 | Power, offloaded load (≈ 900 Mbit/s both ways) | 11 W |
-| Power-on to first LuCI response | 71.4 s (one cold boot) |
+| Power-on to first LuCI response | 71.6 s (one cold boot) |
 | Kernel start to `/init` | 1.58 s |
 | Available RAM after boot | 1707.6 MiB of 1813.7 MiB |
 
@@ -496,6 +501,7 @@ is spent in the boot loader, which reads the image from the boot disk with a 960
 | VLANs on switch ports | ✅ Validated on a bond of switch ports (802.1Q) |
 | Link aggregation (LACP) on switch ports (BCM53128 trunk) | ✅ Validated |
 | Hardware flow offload (`wan1` ↔ `wan2`), IPv4 routing, SNAT, DNAT | ✅ Validated |
+| Hardware flow offload through the switch ports (`dmz`, `internal*`, bonds of switch ports) | ✅ Validated, with the limitation under saturation listed in [Known limitations](#known-limitations) |
 | IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated |
 | IPsec in software (IPv4 and IPv6, tunnel and transport) | ✅ Validated |
 | `fortinet-cp7` crypto | ✅ Validated with software IPsec (AES-CBC + HMAC-SHA1) |
@@ -622,7 +628,8 @@ flowchart TB
 ```
 
 Each switch port has its own logical interface on the NP, so flows through the `internal*` ports can be
-offloaded.
+offloaded, with the limitation of the 60D under saturation of the NP–switch links (expected, not yet measured
+on the 90D; see [Known limitations](#known-limitations)).
 
 ### Benchmarks
 
@@ -753,10 +760,17 @@ Benchmarks and installation notes: _to be completed_.
   (software flowtable). Raising it is planned.
 - **IPv6 is never offloaded**: the NP4Lite does not parse IPv6 headers. IPv6 routing and NAT run on the CPU
   (about 350 / 290 Mbit/s).
-- **Switch ports are not offload end points** in the 60D device tree. With them enabled, frames sent by the
-  CPU toward the switch ports (LACP frames, for instance) were lost while offloaded traffic saturated the
-  link between the NP and the switch. Until this is fixed, flows through `internal*` and `dmz` are forwarded
-  by the CPU.
+- **Switch port offload limitation (60D and 90D).** When offloaded traffic from the WAN ports to the built-in
+  switch ports saturates the single 1 Gbit/s link between the NP4Lite and the switch, frames sent by the CPU
+  to the switch ports share the same queue and are dropped (31–54 % in our tests: ping, ARP, LACPDUs). With a
+  LACP partner using a short timeout, aggregated switch ports can then lose members (up to 5 times per 120 s
+  at 960 Mbit/s UDP, gaps up to 3 s), and the failover of such a bond is slower: up to 1.4 s when a member
+  goes down, one gap of 6.3 s in 5 tests when it comes back, and isolated gaps of about 0.5 s on a saturated
+  offloaded bond. The NP rate limiter has no effect on this path, so this is a hardware architecture limit.
+  Workaround: `echo oneway > /sys/module/fortinet_np4lite/parameters/switch_offload` keeps the switch → WAN
+  direction offloaded and routes WAN → switch through the CPU (no CPU-frame loss, about 340 Mbit/s
+  WAN → switch); it can be changed at run time. The 90D has the same NP and switches (one link per switch):
+  the same behaviour is expected there, not yet measured.
 - With hardware offload, fewer new connections per second are accepted than with software offload
   (about 2100–2300/s instead of 3300–3600/s), and the lossless IMIX rate (133 kpps) is below what the
   single-size results suggest. Both are being investigated.
@@ -765,7 +779,7 @@ Benchmarks and installation notes: _to be completed_.
 
 - IPv4 **tunnel mode only**, with the AES-CBC / 3DES-CBC and HMAC ciphers listed above. Transport mode,
   ESN, NAT-T, AES-GCM, ChaCha20-Poly1305 and all IPv6 IPsec run in software.
-- **Inbound** traffic is decrypted by the NP but forwarded by the CPU: about 405 Mbit/s, against
+- **Inbound** traffic is decrypted by the NP but forwarded by the CPU: about 396 Mbit/s, against
   about 883 Mbit/s outbound.
 - An ESP packet **fragmented on the outside** (an inner packet larger than the path MTU, encrypted by the
   peer and then fragmented) is dropped by the NP. The image clamps the TCP MSS of IPsec flows (1398 bytes) in
@@ -809,8 +823,9 @@ harness: the numbers in [Devices](#devices) come from it.
   prints boot messages before the serial driver starts; no effect on the throughputs is expected. The published
   image is built from the device profile alone: it has neither that console nor these tools (the generic
   `earlycon` of the kernel command line is the same in both).
-- Model caveat: on the 60D, hardware offload is measured between `wan1` and `wan2`, the two offload
-  entry points of the current device tree; on the 60E, the switch side is a bond of switch ports.
+- Model caveat: on the 60D, the benchmark tables are measured between `wan1` and `wan2`; flows through the
+  switch ports are offloaded too (one bond measurement is given); on the 60E, the switch side is a bond of
+  switch ports.
 
 | Test | Tool / method | Variants |
 |---|---|---|
