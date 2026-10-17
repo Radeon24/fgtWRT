@@ -491,6 +491,52 @@ module_param_cb(bridge_offload, &fnp4l_bridge_ops, &bridge_offload,
 		0644);
 MODULE_PARM_DESC(bridge_offload,
 		 "FortiSOC2 switch ports: offload flows routed through a bridge of ports of the switches of one DSA tree (0: such ports refused, routed by the host)");
+
+/*
+ * Directions of the flows through the switch ports offloaded, on a conduit
+ * with a LIF per switch port ("fortinet,switch-logical-interfaces";
+ * without it, none whatever the value). The link to the switch carries
+ * each frame towards a switch port with the 4 bytes of the switch tag:
+ * with a port of the NP receiving at line rate, the flows towards the
+ * switch fill that link, and the frames of the host to the switch are
+ * lost in the NP (measured).
+ *   full:   both directions (default);
+ *   oneway: from a switch port only, those towards a switch port refused
+ *           and routed by the host (the flow table keeps a flow offloaded
+ *           in one direction);
+ *   off:    neither, routed by the host.
+ * Read at each insertion. Live: the flows through the switch ports are
+ * torn down, offloaded again under the new value.
+ */
+enum fnp4l_sw_mode {
+	FNP4L_SW_OFF,
+	FNP4L_SW_ONEWAY,
+	FNP4L_SW_FULL,
+};
+
+static const char * const fnp4l_sw_modes[] = {
+	[FNP4L_SW_OFF] = "off",
+	[FNP4L_SW_ONEWAY] = "oneway",
+	[FNP4L_SW_FULL] = "full",
+};
+
+static int switch_offload = FNP4L_SW_FULL;
+static int fnp4l_sw_param_set(const char *val,
+			      const struct kernel_param *kp);
+
+static int fnp4l_sw_param_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+			 fnp4l_sw_modes[READ_ONCE(switch_offload)]);
+}
+
+static const struct kernel_param_ops fnp4l_sw_ops = {
+	.set = fnp4l_sw_param_set,
+	.get = fnp4l_sw_param_get,
+};
+module_param_cb(switch_offload, &fnp4l_sw_ops, &switch_offload, 0644);
+MODULE_PARM_DESC(switch_offload,
+		 "FortiSOC2 switch ports: offloaded flow directions, full (default), oneway (from the switch ports only) or off");
 #endif /* CONFIG_FORTINET_NP4LITE_DSA */
 
 /*
@@ -3178,6 +3224,32 @@ static unsigned int fnp4l_dsa_purge_lifs(struct fnp4l *np,
 					 unsigned long lifs);
 
 /*
+ * Have the flow tables tear down the flows through the user ports of the
+ * LIFs @lifs, and through their bonds. Under RTNL, outside sse_lock: the
+ * cleanup waits for the work of the flow table, whose callbacks take it.
+ */
+static void fnp4l_dsa_ft_cleanup(struct fnp4l *np, unsigned long lifs)
+{
+	struct net_device *dev, *bond, *last = NULL;
+	unsigned int lif;
+
+	ASSERT_RTNL();
+	if (!IS_ENABLED(CONFIG_NF_FLOW_TABLE))
+		return;
+	for_each_set_bit(lif, &lifs, NP4L_DSA_LIF_LAST + 1) {
+		dev = np->dsa_user[lif];
+		if (!dev)
+			continue;
+		nf_flow_table_cleanup(dev);
+		bond = netdev_master_upper_dev_get(dev);
+		if (bond && netif_is_bond_master(bond) && bond != last) {
+			nf_flow_table_cleanup(bond);
+			last = bond;
+		}
+	}
+}
+
+/*
  * LIFs of switch ports that have just gone promiscuous (dsa_purge): the
  * MAC filter of the LIF no longer stops the unicast frames to other
  * addresses, which the flow engine, whose key has no address, forwards if
@@ -3193,8 +3265,7 @@ static unsigned int fnp4l_dsa_purge_lifs(struct fnp4l *np,
  */
 static void fnp4l_dsa_purge(struct fnp4l *np)
 {
-	struct net_device *dev, *bond, *last = NULL;
-	unsigned int lif, n = 0;
+	unsigned int n = 0;
 	unsigned long lifs;
 
 	ASSERT_RTNL();
@@ -3212,20 +3283,7 @@ static void fnp4l_dsa_purge(struct fnp4l *np)
 	atomic_long_add(n, &np->dsa_promisc_purged);
 	dev_info(np->dev, "switch port LIFs %#lx promiscuous: %u offloaded flow directions back to the host\n",
 		 lifs, n);
-
-	if (!IS_ENABLED(CONFIG_NF_FLOW_TABLE))
-		return;
-	for_each_set_bit(lif, &lifs, NP4L_DSA_LIF_LAST + 1) {
-		dev = np->dsa_user[lif];
-		if (!dev)
-			continue;
-		nf_flow_table_cleanup(dev);
-		bond = netdev_master_upper_dev_get(dev);
-		if (bond && netif_is_bond_master(bond) && bond != last) {
-			nf_flow_table_cleanup(bond);
-			last = bond;
-		}
-	}
+	fnp4l_dsa_ft_cleanup(np, lifs);
 }
 
 /* The purge of a LIF gone promiscuous outside the notifier */
@@ -3320,6 +3378,58 @@ static int fnp4l_bridge_param(const char *val,
 	mutex_unlock(&fnp4l_dsa_np_lock);
 
 	return 0;
+}
+
+/* switch_offload changed: the flows through the switch ports torn down */
+static int fnp4l_sw_param_set(const char *val,
+			      const struct kernel_param *kp)
+{
+	int mode = sysfs_match_string(fnp4l_sw_modes, val);
+
+	if (mode < 0)
+		return mode;
+	WRITE_ONCE(switch_offload, mode);
+	mutex_lock(&fnp4l_dsa_np_lock);
+	if (fnp4l_dsa_np) {
+		dev_info(fnp4l_dsa_np->dev, "switch ports: offloaded flow directions %s\n",
+			 fnp4l_sw_modes[mode]);
+		rtnl_lock();
+		fnp4l_dsa_ft_cleanup(fnp4l_dsa_np,
+				     READ_ONCE(fnp4l_dsa_np->dsa_lifs));
+		rtnl_unlock();
+	}
+	mutex_unlock(&fnp4l_dsa_np_lock);
+
+	return 0;
+}
+
+/* @lif as a bit of a LIF mask of the switch ports, 0 past them */
+static unsigned long fnp4l_sw_lif(unsigned int lif)
+{
+	return lif <= NP4L_DSA_LIF_LAST ? BIT(lif) : 0;
+}
+
+/*
+ * switch_offload: why one direction of a flow entering through the LIFs
+ * @in and leaving through the LIFs @out is refused, NULL if it is not.
+ */
+static const char *fnp4l_sw_refused(const struct fnp4l *np,
+				    unsigned long in, unsigned long out)
+{
+	unsigned long sw = READ_ONCE(np->dsa_lifs);
+
+	switch (READ_ONCE(switch_offload)) {
+	case FNP4L_SW_OFF:
+		if ((in | out) & sw)
+			return "through a switch port (switch_offload off)";
+		break;
+	case FNP4L_SW_ONEWAY:
+		if (out & sw)
+			return "towards a switch port (switch_offload oneway)";
+		break;
+	}
+
+	return NULL;
 }
 
 /*
@@ -7174,6 +7284,14 @@ static int fnp4l_ft_replace(struct fnp4l_port *port,
 				      "LIF of the switch port promiscuous");
 		goto err;
 	}
+	why = fnp4l_sw_refused(np,
+			       fnp4l_sw_lif(FIELD_GET(NP4L_SSE_KEY_LIF,
+						      le16_to_cpu(flow->key.lif))),
+			       fnp4l_sw_lif(cmd.out_lif));
+	if (why) {
+		ret = fnp4l_ft_refuse(port, cls->common.extack, why);
+		goto err;
+	}
 #endif
 	/*
 	 * The engine would forward the flow past the IPsec policies, in the
@@ -9144,6 +9262,21 @@ static int fnp4l_lag_replace(struct fnp4l_lag *lag,
 	ret = fnp4l_lag_parse(lag, cls, lf);
 	if (ret)
 		goto out_free;
+#ifdef CONFIG_FORTINET_NP4LITE_DSA
+	{
+		const char *why;
+
+		why = fnp4l_sw_refused(np,
+				       lf->in_lag ? lf->in_lag->members :
+						    BIT(lf->in_lif),
+				       lf->out_lag ? lf->out_lag->members :
+						     BIT(lf->out_lif));
+		if (why) {
+			ret = fnp4l_lag_refuse(lag, cls->common.extack, why);
+			goto out_free;
+		}
+	}
+#endif
 	if (fnp4l_lag_flow_find(np, lf->cookie)) {
 		ret = -EEXIST;
 		goto out_free;
