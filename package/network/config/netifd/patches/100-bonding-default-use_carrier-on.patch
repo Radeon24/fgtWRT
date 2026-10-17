@@ -1,0 +1,15 @@
+--- a/bonding.c
++++ b/bonding.c
+@@ -408,6 +408,12 @@
+ 	cfg->ad_actor_sys_prio = 65535;
+ 	cfg->lp_interval = 1;
+ 	cfg->num_peer_notif = 1;
++	/*
++	 * Linux 6.18 made use_carrier obsolete: only "on" (1) is accepted
++	 * and writing 0 logs "option use_carrier: invalid value (0)".
++	 * 1 is also the kernel default on older kernels, so default to it.
++	 */
++	cfg->use_carrier = true;
+ 
+ #define cfg_item(_type, _field, _attr)				\
+ 	do {							\
