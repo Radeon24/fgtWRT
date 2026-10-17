@@ -5,7 +5,7 @@ include $(INCLUDE_DIR)/image.mk
 
 DEVICE_VARS += FORTIGATE_CMDLINE FORTIGATE_MODEL
 DEVICE_VARS += FORTIGATE_PART_LBA FORTIGATE_PART_SECTORS FORTIGATE_CONTAINER_DTB
-DEVICE_VARS += FORTIGATE_CONTAINER_SECTORS
+DEVICE_VARS += FORTIGATE_CONTAINER_SECTORS FORTIGATE_FLATKC_MAX
 
 FORTIGATE_EPOCH := $(if $(SOURCE_DATE_EPOCH),$(SOURCE_DATE_EPOCH),0)
 
@@ -25,7 +25,10 @@ fortigate-le32 = v=$$(printf "%08x" $(1)); printf "\x$${v:6:2}\x$${v:4:2}\x$${v:
 #   0x05c  command line  terminated by "\n\0" (ignored by the kernel, which
 #                        is built with CONFIG_CMDLINE_FORCE)
 #
-# A copy is kept next to the images.
+# A copy is kept next to the images. With FORTIGATE_FLATKC_MAX, both the
+# flatkc and its inflated payload must not exceed that many bytes: the
+# build fails otherwise (the boot loader of some models crashes on a
+# larger kernel, see the device definitions).
 define Build/fortigate-flatkc
 	$(STAGING_DIR_HOST)/bin/gzip -9 -n -c $@ > $@.gz
 	( \
@@ -44,6 +47,14 @@ define Build/fortigate-flatkc
 		head -c $$((420 - len)) /dev/zero; \
 		cat $@.gz; \
 	) > $@.new
+	max="$(FORTIGATE_FLATKC_MAX)"; [ -z "$$max" ] || { \
+		k=$$(stat -c %s $@); f=$$(stat -c %s $@.new); \
+		if [ $$k -gt $$max ] || [ $$f -gt $$max ]; then \
+			echo "flatkc too large for the boot loader: $$f bytes" \
+				"($$k inflated), at most $$max" >&2; \
+			rm -f $@.new $@.gz; exit 1; \
+		fi; \
+	}
 	mv $@.new $@
 	rm -f $@.gz
 	mkdir -p $(BIN_DIR)
@@ -131,6 +142,9 @@ define Device/Default
   FORTIGATE_CONTAINER_SECTORS :=
   # Also put the device tree in the container (FortiSOC3)
   FORTIGATE_CONTAINER_DTB :=
+  # Largest flatkc (and inflated payload) the boot loader is known to
+  # take, in bytes; empty: no check
+  FORTIGATE_FLATKC_MAX :=
   # No OpenWrt-style sysupgrade image is defined here: the container
   # built above is also the image the installer package writes to a
   # firmware slot.
