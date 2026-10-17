@@ -81,8 +81,8 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 | FortiGate 60E | SoC3 | about 1 GHz | NP6Lite | on-chip engine (no driver) | BCM53128 | 🔜 **Coming soon** |
 | FortiGate 100D | x86 PC (no Fortinet SoC) | 1.8 GHz | none | CP8 (no driver) | BCM53314 | 🚧 **Work in progress** |
 
-- **Available**: image built from this repository, installable with persistent storage (60D). The 60D
-  reference build is revision `r37420-313a83071a5`.
+- **Available**: image built from this repository, installable with persistent storage (60D). The published
+  60D image is built from revision `r37424-a863c6d009f` of the `fgtwrt` branch.
 - **Coming soon**: OpenWrt runs in our lab, installed into the **non-default** firmware slot without
   persistent storage; LEDs, storage and other items are still to be done. Not published as supported yet.
 - **Planned**: no OpenWrt profile in the tree yet.
@@ -236,7 +236,8 @@ Pre-built images may be published later; until then, build from source.
    | WAN | `wan1` | DHCP client |
    | — | `dmz`, `wan2` | not configured |
 
-   Log in with `ssh root@192.168.1.1`, or at `http://192.168.1.1` if you built LuCI in.
+   Log in with `ssh root@192.168.1.1`, or with the web interface at `http://192.168.1.1` (LuCI is in the
+   60D profile; on the other models, add `luci` at build time).
 
 Everything runs in RAM: **nothing is written to the appliance**, and all changes are lost at the next reboot.
 This is the recommended way to check that your unit works before installing.
@@ -367,16 +368,9 @@ checks that the decompressed kernel stays below the ramdisk.
 
 ### Benchmarks
 
-Measured on our test setup (see [Benchmark methodology](#benchmark-methodology)), October 2026, on builds of
-this repository with the packages listed in [Build the image](#1-build-the-image). Four successive builds were
-measured, with the same kernel drivers; each result names its build:
-
-| Build | Difference with the previous one |
-|---|---|
-| `r37414-9c0e40af727` | — |
-| `r37415-31e908332c2` | adds `kmod-crypto-seqiv` (needed by AES-GCM ESP) |
-| `r37418-cf62d2e7dc2` | separate ramdisk (see [Image layout](#image-layout)); adds WireGuard, OpenVPN and ChaCha20-Poly1305 |
-| `r37420-313a83071a5` | adds `kmod-ipsec6` (IPv6 IPsec); current reference build |
+Measured on our test setup in October 2026, on lab images equivalent to the published profile (same kernel
+drivers and packages), plus the early debug console of the kernel and a few test tools, which are not expected
+to affect the throughputs (see [Benchmark methodology](#benchmark-methodology)).
 
 **Firewall modes.** *hw*: hardware flow offloading (`flow_offloading_hw=1`, the default of our
 configuration); *sw*: software flow offloading only (`flow_offloading=1`); *none*: no flow offloading.
@@ -385,20 +379,17 @@ For tunnels the appliance is a tunnel end point: *in* = the appliance receives a
 *out* = it encrypts and sends. Throughputs are TCP goodput in Mbit/s, median of 3 runs of 10 s,
 one TCP stream unless noted. The CPU is at 100 % on every software path.
 
-#### Routing and NAT, IPv4 (`r37414-9c0e40af727`)
+#### Routing and NAT, IPv4
 
 | Test | hw (fwd / rev) | sw (fwd / rev) | none (fwd / rev) |
 |---|---|---|---|
-| Routing, TCP, 1 stream | **941.4 / 941.4** (CPU ≤ 0.4 %) | 356.2 / 287.5 | 292.6 / 213.3 |
+| Routing, TCP, 1 stream | **941.3 / 941.4** (CPU ≤ 0.7 %) | 356.2 / 287.5 | 292.6 / 213.3 |
 | Routing, TCP, 8 streams | **941.0 / 941.1** | 338.9 / 274.0 | 265.2 / 189.2 |
 | Routing, UDP, 940 Mbit/s offered | **940 / 940**, no loss | 374.1 / 371.6, 59.4 % / 58.5 % lost | 340.4 / 336.9, 63.1 % / 62.0 % lost |
-| SNAT (masquerade), TCP | **941.4 / 941.4** | 352.2 / 283.1 | 287.4 / 208.2 |
+| SNAT (masquerade), TCP | **941.3 / 941.4** | 352.2 / 283.1 | 287.4 / 208.2 |
 | DNAT (port forward), TCP | **941.4 / 941.4** | 351.9 / 282.5 | 283.9 / 205.8 |
 
-Routing, SNAT and DNAT in *hw* mode measured again on `r37418-cf62d2e7dc2`: 941.3–941.4 Mbit/s in both
-directions, CPU 0.1–0.7 %.
-
-#### Routing and NAT, IPv6 (`r37414-9c0e40af727`)
+#### Routing and NAT, IPv6
 
 The NP4Lite cannot offload IPv6: in *hw* mode, IPv6 flows use the software flowtable.
 
@@ -409,7 +400,7 @@ The NP4Lite cannot offload IPv6: in *hw* mode, IPv6 flows use the software flowt
 | Routing, UDP, 940 Mbit/s offered | 388.9 / 387.2, 58.2 % / 57.0 % lost | 386.9 / 384.8, 58.0 % / 57.2 % lost | 365.3 / 363.2, 60.7 % / 59.4 % lost |
 | SNAT (masquerade), TCP | 346.3 / 282.5 | 341.6 / 278.4 | 284.2 / 207.2 |
 
-#### Packet rate, IPv4 routing (`r37414-9c0e40af727`)
+#### Packet rate, IPv4 routing
 
 Highest lossless rate (kernel `pktgen`, binary search, one run), kpps (Mbit/s):
 
@@ -422,7 +413,7 @@ Highest lossless rate (kernel `pktgen`, binary search, one run), kpps (Mbit/s):
 | 1518 B | 81.3 | line rate (987.0) | 32.4 (392.9) | 30.5 (370.1) |
 | IMIX 7:4:1 | 332.6 | 133.1 (378.9) | 38.6 (109.8) | 30.8 (87.6) |
 
-#### Latency through the appliance (`r37414-9c0e40af727`)
+#### Latency through the appliance
 
 `ping` at 10 ms interval through the appliance, p50 / p99, IPv4:
 
@@ -435,13 +426,13 @@ Highest lossless rate (kernel `pktgen`, binary search, one run), kpps (Mbit/s):
 
 New TCP connections per second (8 client threads, 10 s, no failure; CPU at 100 % in every mode):
 
-| Test | Build | hw (IPv4 / IPv6) | sw (IPv4 / IPv6) | none (IPv4 / IPv6) |
-|---|---|---|---|---|
-| Routed | `r37414-9c0e40af727` | 2232 / 2857 | 3589 / 3544 | 3342 / 3330 |
-| With SNAT (mean of 3) | `r37420-313a83071a5` | 2143 / 2401 | 3354 / 2831 | 3186 / 2614 |
+| Test | hw (IPv4 / IPv6) | sw (IPv4 / IPv6) | none (IPv4 / IPv6) |
+|---|---|---|---|
+| Routed | 2232 / 2857 | 3589 / 3544 | 3342 / 3330 |
+| With SNAT (mean of 3) | 2143 / 2401 | 3354 / 2831 | 3186 / 2614 |
 
-Highest number of concurrent NATed TCP connections held open without failure (`r37420-313a83071a5`; the
-connection tracking table holds 65536 entries):
+Highest number of concurrent NATed TCP connections held open without failure (the connection tracking table
+holds 65536 entries):
 
 | Mode | IPv4 | IPv6 | Of which offloaded to the NP |
 |---|---|---|---|
@@ -449,24 +440,20 @@ connection tracking table holds 65536 entries):
 | sw | 50386 (table limit) | 32768 | — |
 | none | 32768 | 28627 (table limit) | — |
 
-The same *hw* test on `r37418-cf62d2e7dc2` held 32768 (IPv4) and 43464 (IPv6) connections; the cause of
-the difference has not been established.
-
 #### IPsec, IPv4, tunnel mode
 
-| Cipher | Path | Build | in / out (Mbit/s) | CPU |
-|---|---|---|---|---|
-| AES-128-CBC + HMAC-SHA1 | **NP offload** | `r37414-9c0e40af727` | 388.6 / **883.3** | in 100 %, out 88–91 % |
-| AES-128-CBC + HMAC-SHA1 | **NP offload** | `r37418-cf62d2e7dc2` | 405.1 / **883.5** | in 100 %, out 86–88 % |
-| AES-128-CBC + HMAC-SHA1 | software, VPN engine (`fortinet-cp7`) | `r37414-9c0e40af727` | 123.2 / 105.0 | 100 % |
-| AES-128-GCM | software (generic) | `r37415-31e908332c2` | 41.3 / 35.1 | 100 % |
-| ChaCha20-Poly1305 | software (generic) | `r37418-cf62d2e7dc2` | 94.4 / 70.1 | 100 % |
+| Cipher | Path | in / out (Mbit/s) | CPU |
+|---|---|---|---|
+| AES-128-CBC + HMAC-SHA1 | **NP offload** | 405.1 / **883.5** | in 100 %, out 86–88 % |
+| AES-128-CBC + HMAC-SHA1 | software, VPN engine (`fortinet-cp7`) | 123.2 / 105.0 | 100 % |
+| AES-128-GCM | software (generic) | 41.3 / 35.1 | 100 % |
+| ChaCha20-Poly1305 | software (generic) | 94.4 / 70.1 | 100 % |
 
 Transport mode, software: AES-128-CBC + HMAC-SHA1 118.0 / 111.8, AES-128-GCM 39.3 / 41.8,
 ChaCha20-Poly1305 91.6 / 87.9 Mbit/s. In the NP offload, AES-GCM and ChaCha20-Poly1305 tunnel tests, a counter on
 the host saw no clear-text packet of the protected flows leave the appliance.
 
-#### IPsec, IPv6, software (`r37420-313a83071a5`)
+#### IPsec, IPv6, software
 
 | Cipher | tunnel, in / out | transport, in / out |
 |---|---|---|
@@ -476,27 +463,26 @@ the host saw no clear-text packet of the protected flows leave the appliance.
 
 #### WireGuard and OpenVPN (appliance as tunnel end point)
 
-| Tunnel | Outer IP | Build | 1 stream, in / out | 8 streams, in / out |
-|---|---|---|---|---|
-| WireGuard | IPv4 | `r37418-cf62d2e7dc2` | 69.4 / 53.8 | 64.9 / 52.3 |
-| WireGuard | IPv6 | `r37420-313a83071a5` | 68.6 / 52.6 | 63.5 / 50.8 |
-| OpenVPN, ChaCha20-Poly1305, kernel data channel (DCO) | IPv4 | `r37418-cf62d2e7dc2` | 78.5 / 56.2 | 74.6 / 54.3 |
-| OpenVPN, ChaCha20-Poly1305, DCO | IPv6 | `r37418-cf62d2e7dc2` | 76.6 / 53.9 | 70.7 / 52.2 |
-| OpenVPN, AES-256-CBC + HMAC-SHA256, user space | IPv4 | `r37418-cf62d2e7dc2` | 18.3 / 16.6 | 17.2 / 16.1 |
-| OpenVPN, AES-256-CBC + HMAC-SHA256, user space | IPv6 | `r37418-cf62d2e7dc2` | 16.8 / 14.7 | 15.5 / 14.2 |
+| Tunnel | Outer IP | 1 stream, in / out | 8 streams, in / out |
+|---|---|---|---|
+| WireGuard | IPv4 | 69.4 / 53.8 | 64.9 / 52.3 |
+| WireGuard | IPv6 | 68.6 / 52.6 | 63.5 / 50.8 |
+| OpenVPN, ChaCha20-Poly1305, kernel data channel (DCO) | IPv4 | 78.5 / 56.2 | 74.6 / 54.3 |
+| OpenVPN, ChaCha20-Poly1305, DCO | IPv6 | 76.6 / 53.9 | 70.7 / 52.2 |
+| OpenVPN, AES-256-CBC + HMAC-SHA256, user space | IPv4 | 18.3 / 16.6 | 17.2 / 16.1 |
+| OpenVPN, AES-256-CBC + HMAC-SHA256, user space | IPv6 | 16.8 / 14.7 | 15.5 / 14.2 |
 
 CPU at 100 % in every case. The peer runs OpenVPN without DCO.
 
 #### System
 
-| Metric | Result | Build |
-|---|---|---|
-| Power, idle | 11 W | `r37415-31e908332c2` |
-| Power, offloaded load (≈ 900 Mbit/s both ways) | 11 W | `r37415-31e908332c2` |
-| Power-on to first LuCI response | 63.5 s (median of 3 cold boots) | `r37415-31e908332c2` |
-| Power-on to first LuCI response | 71.3 s / 71.4 s (one cold boot each) | `r37418-cf62d2e7dc2` / `r37420-313a83071a5` |
-| Kernel start to `/init` | 3.47 s / 1.58 s | `r37415-31e908332c2` / `r37418-cf62d2e7dc2` |
-| Available RAM after boot | 1725.5 MiB / 1707.6 MiB of 1813.7 MiB | `r37415-31e908332c2` / `r37418-cf62d2e7dc2` |
+| Metric | Result |
+|---|---|
+| Power, idle | 11 W |
+| Power, offloaded load (≈ 900 Mbit/s both ways) | 11 W |
+| Power-on to first LuCI response | 71.4 s (one cold boot) |
+| Kernel start to `/init` | 1.58 s |
+| Available RAM after boot | 1707.6 MiB of 1813.7 MiB |
 
 Power is read from a smart plug with a 1 W resolution: an order of magnitude only. About 58 s of the boot time
 is spent in the boot loader, which reads the image from the boot disk with a 9600 baud console.
@@ -513,7 +499,7 @@ is spent in the boot loader, which reads the image from the boot disk with a 960
 | IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated |
 | IPsec in software (IPv4 and IPv6, tunnel and transport) | ✅ Validated |
 | `fortinet-cp7` crypto | ✅ Validated with software IPsec (AES-CBC + HMAC-SHA1) |
-| WireGuard, OpenVPN (with DCO) | ✅ Validated (packages to select at build time) |
+| WireGuard, OpenVPN (with DCO) | ✅ Validated (packages included in the 60D profile) |
 | STATUS LED (boot / running / upgrade) | 🧪 Partial: LED aliases declared and boot LED observed; the full cycle has not been re-tested |
 | WAN speed and activity LEDs | ✅ Validated |
 | Reset button / failsafe | ❓ Not tested |
@@ -613,20 +599,25 @@ _To be completed._
 ### Hardware topology
 
 ```mermaid
-flowchart LR
+flowchart TB
   CPU["CPU<br/>Faraday FA726TE"]
   CP7["VPN engine<br/>on-chip crypto"]
   NP["NP4Lite<br/>network processor"]
+  PA["BCM54616S<br/>PHY"]
+  PB["BCM54616S<br/>PHY"]
   SW0["BCM53128 #1"]
   SW1["BCM53128 #2"]
   CPU --- CP7
   CPU --- NP
-  NP -- "port 0 · RGMII" --- PA["BCM54616S<br/>PHY"] --- WAN1(["wan1"])
-  NP -- "port 1 · RGMII" --- PB["BCM54616S<br/>PHY"] --- WAN2(["wan2"])
+  NP -- "port 0 · RGMII" --- PA
+  NP -- "port 1 · RGMII" --- PB
   NP -- "port 2 · RGMII" --- SW0
   NP -- "port 3 · RGMII" --- SW1
-  SW0 -- "port 0 ↔ port 7 · cascade" --- SW1
+  PA --- WAN1(["wan1"])
+  PB --- WAN2(["wan2"])
   SW0 -- "ports 7–1" --- I1(["internal1 … internal7"])
+  SW0 -- "port 0" --- CAS["cascade link"]
+  SW1 -- "port 7" --- CAS
   SW1 -- "ports 6–0" --- I2(["internal8 … internal14"])
 ```
 
@@ -717,10 +708,28 @@ _To be completed._
 <details>
 <summary><b>FortiGate 100D</b> — x86 PC · no network processor — 🚧 Work in progress</summary>
 
-An x86 PC rather than a Fortinet SoC appliance: Intel Atom D525 (2 cores / 4 threads @ 1.8 GHz),
-Intel ICH8M chipset, 4 GiB RAM, no network processor. 22 × 1 GbE ports: two on Intel 82574L NICs, twenty on a
-Broadcom BCM53314 switch that needs a custom driver. Boot disk: 16 GB SATA SSD. The on-board CP8 crypto chip
-has no driver.
+An x86 PC rather than a Fortinet SoC appliance.
+
+### Specifications
+
+| Item | Value |
+|---|---|
+| Platform | x86 PC, Intel ICH8M chipset (no Fortinet SoC); no ACPI, no device tree |
+| CPU | Intel Atom D525 (x86-64, 2 cores / 4 threads) @ 1.8 GHz |
+| RAM | 4 GiB |
+| Network processor | none |
+| Crypto | Fortinet CP8 (PCI); no driver |
+| Switch | Broadcom BCM53314 (PCI), 20 ports; needs a custom driver, not supported yet |
+| Direct NICs | 4 × Intel 82574L (`e1000e`): `wan1`, `dmz`, and two that are probably the links to the switch |
+| Ethernet ports | 22 × 1 GbE: `wan1`, `dmz` (Intel NICs); `wan2`, `mgmt`, `ha1`, `ha2`, `port1`…`port16` (switch) |
+| Boot disk | internal SATA SSD, 16 GB |
+| Boot flash | SPI flash, 512 KiB, holds the BIOS (read-only) |
+| USB | chipset USB host controllers (driver loaded; no device tested) |
+| Console | serial (COM1), 9600 8N1 |
+| Hardware monitoring | Winbond W83627DHG-P super-IO: fan speed readable; the fan is regulated by the chip itself |
+| LEDs / buttons | not identified yet |
+| RTC | CMOS; not used by our kernels yet |
+| Power | about 28–30 W under the stock firmware (smart plug reading) |
 
 ### Status
 
@@ -756,7 +765,7 @@ Benchmarks and installation notes: _to be completed_.
 
 - IPv4 **tunnel mode only**, with the AES-CBC / 3DES-CBC and HMAC ciphers listed above. Transport mode,
   ESN, NAT-T, AES-GCM, ChaCha20-Poly1305 and all IPv6 IPsec run in software.
-- **Inbound** traffic is decrypted by the NP but forwarded by the CPU: about 390–405 Mbit/s, against
+- **Inbound** traffic is decrypted by the NP but forwarded by the CPU: about 405 Mbit/s, against
   about 883 Mbit/s outbound.
 - An ESP packet **fragmented on the outside** (an inner packet larger than the path MTU, encrypted by the
   peer and then fragmented) is dropped by the NP. The image clamps the TCP MSS of IPsec flows (1398 bytes) in
@@ -770,7 +779,8 @@ Benchmarks and installation notes: _to be completed_.
 
 - **WireGuard and OpenVPN run on the CPU** (about 50–80 Mbit/s). OpenVPN uses its kernel data channel for
   ChaCha20-Poly1305 only; AES-256-CBC stays in user space (about 17 Mbit/s).
-- LuCI, WireGuard and OpenVPN are **not in the default device profile**: select them at build time.
+- LuCI, WireGuard and OpenVPN are **in the default device profile of the 60D**. The 90D and 60E profiles do
+  not include them yet: select them at build time on those models.
 - **Clock**: without a reachable NTP server, the clock was found days behind after reboots; the RTC driver
   has not been re-tested under OpenWrt. Keep NTP (the OpenWrt default) enabled, and check the time before
   relying on certificates.
@@ -789,16 +799,14 @@ harness: the numbers in [Devices](#devices) come from it.
 - **One Linux host** with gigabit NICs, wired to the appliance on both sides: a separate network
   namespace plays the second host. CPU and NIC are therefore shared — fine at 1 Gbit/s, but it has to be
   kept in mind when reading software-path numbers.
-- The appliance runs a build of this repository with the packages used for the tests (see each table) and
-  a test network configuration (static addresses, no DHCP); each test then sets only what it needs, without
-  saving it, and restores the configuration afterwards.
+- The appliance runs a build of this repository with the packages of the device profile and a test network
+  configuration (static addresses, no DHCP); each test then sets only what it needs, without saving it, and
+  restores the configuration afterwards.
 - Each test is run **three times**, and the median is reported, unless noted otherwise.
-- Each table states the build revision (`/etc/openwrt_release`).
-- The measured builds (`r37414` to `r37420`) were built with the low-level early debug console of the kernel
-  enabled (`DEBUG_LL`, `EARLY_PRINTK`, options of the local build configuration), and with a few test tools
-  from the same configuration (in `r37420`: `iperf3`, the `devmem`, `blockdev` and `od` applets of BusyBox,
-  `/dev/mem`). That console only prints
-  boot messages before the serial driver starts; no effect on the throughputs is expected. The published
+- The measured images were built with the low-level early debug console of the kernel enabled (`DEBUG_LL`,
+  `EARLY_PRINTK`, options of the local build configuration), and with a few test tools from the same
+  configuration (`iperf3`, the `devmem`, `blockdev` and `od` applets of BusyBox, `/dev/mem`). That console only
+  prints boot messages before the serial driver starts; no effect on the throughputs is expected. The published
   image is built from the device profile alone: it has neither that console nor these tools (the generic
   `earlycon` of the kernel command line is the same in both).
 - Model caveat: on the 60D, hardware offload is measured between `wan1` and `wan2`, the two offload
