@@ -15,6 +15,10 @@ define Device/fortinet_fg-60d
   # boot. The container (from sector 1) must end before it, page
   # included: 32760 sectors, 4095 pages of the slot
   FORTIGATE_CONTAINER_SECTORS := 32760
+  # The boot loader inflates the flatkc into low memory, below its own
+  # stack and data: a 9.0 MB flatkc makes it fault and reset in a loop,
+  # flatkc files up to 7.5 MB boot. Keep a margin: 7 MiB at most
+  FORTIGATE_FLATKC_MAX := 7340032
   # Kernel command line of the flatkc header: the one of the kernel
   # (CONFIG_CMDLINE, forced)
   FORTIGATE_CMDLINE := earlycon=uart8250,mmio32,0xe4100000 \
