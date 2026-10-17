@@ -277,6 +277,13 @@
 		reg = <30>;
 
 		/*
+		 * Traffic class 7 on every user port: the network processor
+		 * classes the frames of the switch on their tag (port and
+		 * class) and never matches port 0 (dmz) in class 0.
+		 */
+		brcm,port-traffic-class = <7>;
+
+		/*
 		 * Front panel ports in reverse order, DMZ on port 0. Factory
 		 * MAC addresses: base + 1 for dmz, base + 0 for internal1,
 		 * base + 4 to base + 9 for internal2 to internal7 (base + 2 and
@@ -374,15 +381,20 @@
 };
 
 /*
- * RGMII link to the IMP port of the switch, DSA conduit, on its own LIF.
- * The switch ports are not offloaded: without
- * "fortinet,switch-logical-interfaces" (a LIF per switch port, see the
- * binding), their frames reach the host through the conduit.
+ * RGMII link to the IMP port of the switch, DSA conduit. The network
+ * processor classes the frames of each switch port on a LIF of its own:
+ * dmz on LIF 1, internal7 to internal1 (ports 1 to 7) on LIFs 10 to 4, so
+ * that the flows through the switch ports are offloaded (directions set by
+ * the switch_offload parameter of the driver). The conduit takes LIF 11
+ * for the frames of the switch the network processor does not class by
+ * port.
  */
 &np_port0 {
 	/* No delay on this side: the switch adds them. */
 	phy-mode = "rgmii";
 	status = "okay";
+	fortinet,logical-interface = <11>;
+	fortinet,switch-logical-interfaces = <1 10 9 8 7 6 5 4>;
 
 	fixed-link {
 		speed = <1000>;
