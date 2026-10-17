@@ -82,7 +82,7 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 | FortiGate 100D | x86 PC (no Fortinet SoC) | 1.8 GHz | none | CP8 (no driver) | BCM53314 | 🚧 **Work in progress** |
 
 - **Available**: image built from this repository, installable with persistent storage (60D). The published
-  60D image is built from revision `r37424-a863c6d009f` of the `fgtwrt` branch.
+  60D image is built from revision `r37428-f7220c1d5ae` of the `fgtwrt` branch.
 - **Coming soon**: OpenWrt runs in our lab, installed into the **non-default** firmware slot without
   persistent storage; LEDs, storage and other items are still to be done. Not published as supported yet.
 - **Planned**: no OpenWrt profile in the tree yet.
