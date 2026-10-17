@@ -19,6 +19,9 @@ define Device/fortinet_fg-60d
   # stack and data: a 9.0 MB flatkc makes it fault and reset in a loop,
   # flatkc files up to 7.5 MB boot. Keep a margin: 7 MiB at most
   FORTIGATE_FLATKC_MAX := 7340032
+  # The boot loader loads the rootfs.gz of the container at 16 MiB: with
+  # a separate ramdisk, the kernel and its decompressor must stay below
+  FORTIGATE_INITRD_ADDR := 0x1000000
   # Kernel command line of the flatkc header: the one of the kernel
   # (CONFIG_CMDLINE, forced)
   FORTIGATE_CMDLINE := earlycon=uart8250,mmio32,0xe4100000 \
@@ -42,6 +45,8 @@ define Device/fortinet_fg-90d
   # Geometry of the firmware slots of the boot stick (256 MiB partition):
   # the container is also the image of the installer
   FORTIGATE_PART_SECTORS := 524288
+  # Same boot loader family as the 60D: rootfs.gz loaded at 16 MiB
+  FORTIGATE_INITRD_ADDR := 0x1000000
   DEVICE_DTS := fortinet-fg90d
   DEVICE_PACKAGES := firewall4 kmod-nft-offload kmod-bonding proto-bonding \
 	ethtool ip-full kmod-fortinet-np4lite kmod-fortinet-cp7 \
