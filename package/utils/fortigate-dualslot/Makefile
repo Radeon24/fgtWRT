@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=fortigate-dualslot
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_FLAGS:=nonshared
@@ -14,12 +14,13 @@ include $(INCLUDE_DIR)/package.mk
 # layout, whose support is in progress: nothing calls the installer there
 # yet (its platform.sh does not). blockdev (util-linux, not in the
 # default busybox) keeps the internal USB stick of the fsoc2 boards
-# read-only outside an installation.
+# read-only outside an installation, and the partitions of the eMMC
+# of the fsoc3 boards the installer never writes.
 define Package/fortigate-dualslot
   SECTION:=utils
   CATEGORY:=Base system
   TITLE:=Installer for the second firmware slot of a dual-slot FortiGate
-  DEPENDS:=@(TARGET_fortisoc||TARGET_x86) +TARGET_fortisoc_fsoc2:blockdev
+  DEPENDS:=@(TARGET_fortisoc||TARGET_x86) +TARGET_fortisoc_fsoc2:blockdev +TARGET_fortisoc_fsoc3:blockdev
 endef
 
 define Package/fortigate-dualslot/description
