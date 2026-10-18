@@ -6,24 +6,20 @@
 # through the write windows of the kernel: an internal USB stick, or
 # the eMMC.
 #
-# 60E: the slot that is not the default one, refused when it is the
-# default one (FGT_SLOT_NONDEFAULT); the default slot is left unchanged
-# ([B] in the boot menu switches to OpenWrt), and nothing of the system
-# is kept: sysupgrade without -n is refused.
-#
-# 60D and 90D: persistence (FGT_PERSIST). The slot (60D: partition 1,
-# sectors 1-524288 of the stick; 90D: partition 2, sectors
-# 524289-1048576) holds the container (the ext file system the boot
-# loader reads, smaller than the slot) followed by rootfs_data, the
-# upper layer of the overlay. The place of rootfs_data is read
-# from the device tree (node fortinet,disk-rootfs-data), never set
-# here: the expected witness below only repeats what the kernel
-# reports from the same device tree, and rootfs_data must be its
-# persistent window. The slot is made the default one
-# (FGT_SLOT_MAKE_DEFAULT: boot flags 0x1be/0x1ce, allowed by the
-# witness); [B] in the boot menu brings the stock firmware back. sysupgrade
-# keeps the configuration (its backup archive at the head of
-# rootfs_data), sysupgrade -n erases it.
+# 60D, 90D and 60E: persistence (FGT_PERSIST). The slot (60D:
+# partition 1, sectors 1-524288 of the stick; 90D: partition 2, sectors
+# 524289-1048576 of the stick; 60E: partition 2, sectors
+# 786440-1310727 of the eMMC) holds the container (the ext file
+# system the boot loader reads, smaller than the slot) followed by
+# rootfs_data, the upper layer of the overlay. The place of
+# rootfs_data is read from the device tree (node
+# fortinet,disk-rootfs-data), never set here: the expected witness
+# below only repeats what the kernel reports from the same device
+# tree, and rootfs_data must be its persistent window. The slot is
+# made the default one (FGT_SLOT_MAKE_DEFAULT: boot flags 0x1be/0x1ce,
+# allowed by the witness); [B] in the boot menu brings the stock
+# firmware back. sysupgrade keeps the configuration (its backup
+# archive at the head of rootfs_data), sysupgrade -n erases it.
 
 # Sets the disk, the target slot and the image name of the board named
 # by board_name, for the fgt_* functions of fortigate.sh. Fails on any
@@ -81,11 +77,16 @@ fgt_board() {
 		FGT_SLOT_PART=2
 		FGT_SLOT_LBA=786440
 		FGT_SLOT_SIZE=524288
+		FGT_DISK_SECTORS=7471104
 		FGT_SLOT_IMAGE=1
 		FGT_IMAGE_NAME=FGT60E-OpenWrt
-		FGT_SLOT_NONDEFAULT=1
+		# As on the 60D and the 90D: OpenWrt becomes the default
+		# slot, rootfs_data persistent (its place comes from the
+		# device tree)
+		FGT_SLOT_MAKE_DEFAULT=1
+		FGT_PERSIST=1
 		FGT_HEADER_FORBIDDEN="0xdc:1 0x170:1"
-		FGT_WW_EXPECTED="0+1 786440+524288"
+		FGT_WW_EXPECTED="0+1 786440+524288 persistent 819208+491520 sector0 0x30+32 0x12c+4 0x1be+1 0x1ce+1"
 		;;
 	*)
 		return 1
