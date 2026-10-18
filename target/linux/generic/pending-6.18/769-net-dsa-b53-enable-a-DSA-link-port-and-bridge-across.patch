@@ -18,8 +18,8 @@ a DSA link (60D, 60E).
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/net/dsa/b53/b53_common.c | 84 +++++++++++++++++++++++++++++++++
- 1 file changed, 84 insertions(+)
+ drivers/net/dsa/b53/b53_common.c | 121 ++++++++++++++++++++++++++++++++
+ 1 file changed, 121 insertions(+)
 
 --- a/drivers/net/dsa/b53/b53_common.c
 +++ b/drivers/net/dsa/b53/b53_common.c
@@ -79,7 +79,49 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	if (!dsa_is_user_port(ds, port))
  		return 0;
  
-@@ -2634,12 +2676,28 @@ int b53_mdb_del(struct dsa_switch *ds, i
+@@ -1619,6 +1661,41 @@ static int b53_lag_change(struct dsa_swi
+ 
+ 	return 0;
+ }
++
++/* A LAG of the other switch of the tree is reached through the cascade,
++ * as a bridge spanning it is: there is nothing to program on this switch
++ * (each switch writes only the groups of its own ports, b53_lag_sync()).
++ * Without these operations the notifier chain breaks on this switch and
++ * the LAG is never offloaded on its own switch either.
++ *
++ * A LAG that also has a port on this switch would span the cascade: no
++ * trunk can, refuse it (-EOPNOTSUPP: software aggregation).
++ */
++static int b53_crosschip_lag_join(struct dsa_switch *ds, int sw_index,
++				  int port, struct dsa_lag lag,
++				  struct netdev_lag_upper_info *info,
++				  struct netlink_ext_ack *extack)
++{
++	struct dsa_port *dp;
++
++	dsa_lag_foreach_port(dp, ds->dst, &lag)
++		if (dp->ds == ds) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Cannot offload a LAG across the switch cascade");
++			return -EOPNOTSUPP;
++		}
++
++	return 0;
++}
++
++/* Must not fail either: the chain would stop before the switch of the
++ * LAG and leave its trunk group set.
++ */
++static int b53_crosschip_lag_leave(struct dsa_switch *ds, int sw_index,
++				   int port, struct dsa_lag lag)
++{
++	return 0;
++}
+ #else
+ static inline void b53_lag_clear(struct b53_device *dev, bool setup)
+ {
+@@ -2634,12 +2711,28 @@ int b53_mdb_del(struct dsa_switch *ds, i
  }
  EXPORT_SYMBOL(b53_mdb_del);
  
@@ -108,7 +150,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	u16 pvlan, reg, pvid;
  	unsigned int i;
  
-@@ -2649,6 +2707,12 @@ int b53_br_join(struct dsa_switch *ds, i
+@@ -2649,6 +2742,12 @@ int b53_br_join(struct dsa_switch *ds, i
  	if (dev->chip_id == BCM7278_DEVICE_ID && port == 7)
  		return -EINVAL;
  
@@ -121,7 +163,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	pvid = b53_default_pvid(dev);
  	vl = &dev->vlans[pvid];
  
-@@ -2695,6 +2759,17 @@ int b53_br_join(struct dsa_switch *ds, i
+@@ -2695,6 +2794,17 @@ int b53_br_join(struct dsa_switch *ds, i
  		pvlan |= BIT(i);
  	}
  
@@ -139,7 +181,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	/* Disable redirection of unknown SA to the CPU port */
  	b53_set_eap_mode(dev, port, EAP_MODE_BASIC);
  
-@@ -2713,6 +2788,7 @@ void b53_br_leave(struct dsa_switch *ds,
+@@ -2713,6 +2823,7 @@ void b53_br_leave(struct dsa_switch *ds,
  	struct b53_device *dev = ds->priv;
  	struct b53_vlan *vl;
  	s8 cpu_port = dsa_to_port(ds, port)->cpu_dp->index;
@@ -147,7 +189,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	unsigned int i;
  	u16 pvlan, reg, pvid;
  
-@@ -2733,6 +2809,14 @@ void b53_br_leave(struct dsa_switch *ds,
+@@ -2733,6 +2844,14 @@ void b53_br_leave(struct dsa_switch *ds,
  			pvlan &= ~BIT(i);
  	}
  
@@ -161,4 +203,13 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 +
  	/* Enable redirection of unknown SA to the CPU port */
  	b53_set_eap_mode(dev, port, EAP_MODE_SIMPLIFIED);
+ 
+@@ -3114,6 +3233,8 @@ static const struct dsa_switch_ops b53_s
+ 	.port_lag_join		= b53_lag_join,
+ 	.port_lag_leave		= b53_lag_leave,
+ 	.port_lag_change	= b53_lag_change,
++	.crosschip_lag_join	= b53_crosschip_lag_join,
++	.crosschip_lag_leave	= b53_crosschip_lag_leave,
+ #endif
+ };
  

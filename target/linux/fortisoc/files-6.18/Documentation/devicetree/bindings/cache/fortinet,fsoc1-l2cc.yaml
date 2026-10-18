@@ -20,6 +20,13 @@ description:
 
 allOf:
   - $ref: /schemas/cache-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          const: fortinet,fsoc1-l2cc
+    then:
+      properties:
+        fortinet,auxiliary-control: false
 
 properties:
   compatible:
@@ -44,6 +51,14 @@ properties:
   cache-line-size:
     const: 32
 
+  fortinet,auxiliary-control:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      FortiSOC2 only. Value written to the auxiliary control register
+      before the cache is enabled, when the board needs another one than
+      the default, 0x00012023 (FortiGate 60D). The FortiGate 90D uses
+      0x00012033.
+
 required:
   - compatible
   - reg
@@ -62,4 +77,15 @@ examples:
         cache-size = <262144>;
         cache-sets = <1024>;
         cache-line-size = <32>;
+    };
+  - |
+    cache-controller@e4b00000 {
+        compatible = "fortinet,fsoc2-l2cc";
+        reg = <0xe4b00000 0x1000>;
+        cache-level = <2>;
+        cache-unified;
+        cache-size = <262144>;
+        cache-sets = <1024>;
+        cache-line-size = <32>;
+        fortinet,auxiliary-control = <0x00012033>;
     };

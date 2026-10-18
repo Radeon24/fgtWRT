@@ -31,8 +31,11 @@
  * FortiSOC2 ("fortinet,fsoc2-l2cc"), where this driver touches only the
  * registers at 0x00, 0x08, 0x40, 0x44, 0x4c and 0x50:
  *
- *   0x08 AUXCTRL written with 0x00012023 before enabling (not a
- *                read-modify-write)
+ *   0x08 AUXCTRL written with a board specific value before enabling (not
+ *                a read-modify-write): 0x00012023 by default (FortiGate
+ *                60D), or the "fortinet,auxiliary-control" property of the
+ *                node (FortiGate 90D: 0x00012033, bit 4 in addition, its
+ *                effect not known)
  *   0x40 RANGE_ADDR range maintenance: physical start address, 32-byte
  *                aligned
  *   0x44 RANGE_LINES number of lines of the range operation minus one
@@ -95,6 +98,7 @@
 #define FSOC1_L2_INIT		0x90
 
 #define FSOC2_L2_AUXCTRL	0x08
+/* Default auxiliary control value, see "fortinet,auxiliary-control" */
 #define FSOC2_L2_AUXCTRL_VAL	0x00012023
 #define FSOC2_L2_RANGE_ADDR		0x40
 #define FSOC2_L2_RANGE_LINES		0x44
@@ -148,6 +152,7 @@ struct fsoc1_l2_variant {
 };
 
 static const struct fsoc1_l2_variant *fsoc1_l2_v;
+static u32 fsoc2_l2_aux = FSOC2_L2_AUXCTRL_VAL;
 static void __iomem *fsoc1_l2_base;
 static DEFINE_RAW_SPINLOCK(fsoc1_l2_lock);
 static bool fsoc1_l2_on;
@@ -370,7 +375,7 @@ static int fsoc1_l2_enable_fsoc1(void)
 static int fsoc1_l2_enable_fsoc2(void)
 {
 	writel_relaxed(FSOC1_L2_CTRL_OFF, fsoc1_l2_base + FSOC1_L2_CTRL);
-	writel_relaxed(FSOC2_L2_AUXCTRL_VAL, fsoc1_l2_base + FSOC2_L2_AUXCTRL);
+	writel_relaxed(fsoc2_l2_aux, fsoc1_l2_base + FSOC2_L2_AUXCTRL);
 
 	writel_relaxed(FSOC1_L2_CTRL_INV, fsoc1_l2_base + FSOC1_L2_CTRL);
 	if (!fsoc1_l2_wait(FSOC1_L2_CTRL, FSOC1_L2_CTRL_INV)) {
@@ -443,6 +448,15 @@ static int __init fsoc1_l2_init(void)
 	}
 
 	fsoc1_l2_v = match->data;
+
+	/*
+	 * FortiSOC2: auxiliary control value of the board, if it differs
+	 * from the default. Ignored when the boot loader left the cache on.
+	 */
+	if (fsoc1_l2_v == &fsoc1_l2_fsoc2)
+		of_property_read_u32(np, "fortinet,auxiliary-control",
+				     &fsoc2_l2_aux);
+
 	fsoc1_l2_base = of_iomap(np, 0);
 	of_node_put(np);
 	if (!fsoc1_l2_base) {
@@ -473,6 +487,14 @@ static int __init fsoc1_l2_init(void)
 	}
 
 	fsoc1_l2_on = true;
+
+	/* The value written must read back, or the board value is wrong. */
+	if (!was_on && fsoc1_l2_v == &fsoc1_l2_fsoc2) {
+		aux = readl_relaxed(fsoc1_l2_base + FSOC2_L2_AUXCTRL);
+		if (aux != fsoc2_l2_aux)
+			pr_warn("AUXCTRL reads back %#010x, %#010x written\n",
+				aux, fsoc2_l2_aux);
+	}
 
 	/*
 	 * Taken over: everything written so far, page tables included, may
