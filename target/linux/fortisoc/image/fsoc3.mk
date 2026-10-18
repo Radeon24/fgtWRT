@@ -18,6 +18,10 @@ define Device/fortinet_fg-60e
   # on the 4 KiB pages of its page cache), formatted with mkfs.ext4 at
   # the first boot. Sectors 819200 to 819207 stay unused
   FORTIGATE_CONTAINER_SECTORS := 32760
+  # The boot loader loads the rootfs.gz of the container at 416 MiB, as
+  # the initrd of the stock firmware: with a separate ramdisk, the kernel
+  # and its decompressor must stay below
+  FORTIGATE_INITRD_ADDR := 0x1A000000
   # Kernel command line of the flatkc header: the one of the kernel
   # (CONFIG_CMDLINE, forced)
   FORTIGATE_CMDLINE := earlycon=em_uart,mmio32,0xfb000000 \
