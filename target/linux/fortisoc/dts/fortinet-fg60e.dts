@@ -64,6 +64,13 @@
 		};
 	};
 
+	/* Writable file system of the slot of image 1, on the eMMC, for user space */
+	rootfs-data {
+		compatible = "fortinet,disk-rootfs-data";
+		fortinet,disk-sectors = /bits/ 64 <7471104>;
+		fortinet,rootfs-data = <819208 491520>;
+	};
+
 	/*
 	 * Input clock of the eMMC controller, fixed at 90 909 090 Hz
 	 * (1 GHz / 11); the card clock derives from it through the TMIO
@@ -95,10 +102,19 @@
 		no-sd;
 		fortinet,force-ro;
 		/*
-		 * Writes the installer may make once armed: sector 0 and
-		 * partition 2, the second firmware slot.
+		 * Writes the installer may make once armed: sector 0, where only
+		 * the name and build number of image 1 and the active flags of
+		 * partitions 1 and 2 may change, and partition 2, the slot of
+		 * image 1 (sectors 786440 to 1310727). Open without arming: the
+		 * writable file system of that slot (rootfs_data, sectors 819208
+		 * to 1310727, after the 16 380 KiB boot image at sectors 786440
+		 * to 819199), aligned on the 4 KiB pages of the page cache of
+		 * the disk, through which its loop device writes; sectors 819200
+		 * to 819207 of the slot stay unused.
 		 */
 		fortinet,write-windows = <0 1>, <786440 524288>;
+		fortinet,sector0-bytes = <0x30 32>, <0x12c 4>, <0x1be 1>, <0x1ce 1>;
+		fortinet,persistent-windows = <819208 491520>;
 	};
 
 	/*
