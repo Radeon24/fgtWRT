@@ -113,11 +113,13 @@
 };
 
 /*
- * L2 cache left off for now: the auxiliary control value found on the 90D
- * (0x12033) differs from the one the driver writes (0x12023).
+ * The boot loader leaves the L2 cache off; the driver turns it on, with
+ * the auxiliary control value of this board (bit 4 set in addition to the
+ * 60D value, its effect not known).
  */
 &l2 {
-	status = "disabled";
+	fortinet,auxiliary-control = <0x00012033>;
+	status = "okay";
 };
 
 /*
@@ -242,11 +244,12 @@
 	status = "okay";
 };
 
+/* Internal 8 GB USB boot disk, read only (see the rootfs) */
 &usb0 {
 	status = "okay";
 };
 
-/* Internal USB flash drive, read only (see the rootfs) */
+/* USB hub of the rear panel "USB" type A port */
 &usb1 {
 	status = "okay";
 };
