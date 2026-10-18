@@ -76,7 +76,13 @@
 	/*
 	 * Internal 8 GB USB boot disk: write windows of its installer, armed
 	 * from user space (sector 0, where only the name and build number of
-	 * image 1 may change, and partition 2, the slot of image 1).
+	 * image 1 and the active flags of partitions 1 and 2 may change, and
+	 * partition 2, the slot of image 1), and the persistent window of the
+	 * writable file system of that slot (rootfs_data, sectors 557056 to
+	 * 1048575, after the 16 380 KiB boot image at sectors 524289 to
+	 * 557048), open without arming. rootfs_data is aligned on the 4 KiB
+	 * pages of the page cache of the disk, through which its loop device
+	 * writes; sectors 557049 to 557055 and 1048576 of the slot stay unused.
 	 */
 	write-windows {
 		compatible = "fortinet,usb-disk-write-windows";
@@ -84,7 +90,17 @@
 		fortinet,disk-model = "61_V030910_008";
 		fortinet,disk-sectors = /bits/ 64 <15654912>;
 		fortinet,write-windows = <0 1>, <524289 524288>;
-		fortinet,sector0-bytes = <0x30 32>, <0x12c 4>;
+		fortinet,sector0-bytes = <0x30 32>, <0x12c 4>, <0x1be 1>, <0x1ce 1>;
+		fortinet,persistent-windows = <557056 491520>;
+	};
+
+	/* Writable file system of the slot of image 1, for user space */
+	rootfs-data {
+		compatible = "fortinet,disk-rootfs-data";
+		fortinet,disk-vendor = "FORTINET";
+		fortinet,disk-model = "61_V030910_008";
+		fortinet,disk-sectors = /bits/ 64 <15654912>;
+		fortinet,rootfs-data = <557056 491520>;
 	};
 };
 
