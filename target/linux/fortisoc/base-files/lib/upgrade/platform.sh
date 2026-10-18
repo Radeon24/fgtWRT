@@ -6,15 +6,16 @@
 # through the write windows of the kernel: an internal USB stick, or
 # the eMMC.
 #
-# 90D and 60E: the slot that is not the default one, refused when it
-# is the default one (FGT_SLOT_NONDEFAULT); the default slot is left
-# unchanged ([B] in the boot menu switches to OpenWrt), and nothing of
-# the system is kept: sysupgrade without -n is refused.
+# 60E: the slot that is not the default one, refused when it is the
+# default one (FGT_SLOT_NONDEFAULT); the default slot is left unchanged
+# ([B] in the boot menu switches to OpenWrt), and nothing of the system
+# is kept: sysupgrade without -n is refused.
 #
-# 60D: persistence (FGT_PERSIST). Its slot (partition 1, sectors
-# 1-524288 of the stick) holds the container (the ext file system the
-# boot loader reads, smaller than the slot) followed by rootfs_data,
-# the upper layer of the overlay. The place of rootfs_data is read
+# 60D and 90D: persistence (FGT_PERSIST). The slot (60D: partition 1,
+# sectors 1-524288 of the stick; 90D: partition 2, sectors
+# 524289-1048576) holds the container (the ext file system the boot
+# loader reads, smaller than the slot) followed by rootfs_data, the
+# upper layer of the overlay. The place of rootfs_data is read
 # from the device tree (node fortinet,disk-rootfs-data), never set
 # here: the expected witness below only repeats what the kernel
 # reports from the same device tree, and rootfs_data must be its
@@ -64,9 +65,13 @@ fgt_board() {
 		FGT_SLOT_SIZE=524288
 		FGT_SLOT_IMAGE=1
 		FGT_IMAGE_NAME=FGT90D-OpenWrt
-		FGT_SLOT_NONDEFAULT=1
+		# As on the 60D: OpenWrt becomes the default slot,
+		# rootfs_data persistent (its place comes from the device
+		# tree)
+		FGT_SLOT_MAKE_DEFAULT=1
+		FGT_PERSIST=1
 		FGT_HEADER_FORBIDDEN="0xdc:1"
-		FGT_WW_EXPECTED="0+1 524289+524288 sector0 0x30+32 0x12c+4"
+		FGT_WW_EXPECTED="0+1 524289+524288 persistent 557056+491520 sector0 0x30+32 0x12c+4 0x1be+1 0x1ce+1"
 		;;
 	fortinet,fg60e)
 		FGT_BOARD="FortiGate 60E"
