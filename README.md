@@ -76,9 +76,9 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 | Model | SoC | CPU clock | Network processor | Crypto | Switch | Status |
 |---|---|---|---|---|---|---|
 | FortiGate 60D | SoC2 | 800 MHz | NP4Lite | on-chip VPN engine | BCM53128 | ✅ **Available** |
-| FortiGate 60C | SoC1 (FS1) | 525 MHz | NPLite | VPN_LITE | Marvell 88E6161 | 📋 **Planned** |
 | FortiGate 90D | SoC2 | 900 MHz | NP4Lite | on-chip VPN engine | 2 × BCM53128 | ✅ **Available** |
 | FortiGate 60E | SoC3 | about 1 GHz | NP6Lite | on-chip engine (no driver) | BCM53128 | 🔜 **Coming soon** |
+| FortiGate 60C | SoC1 (FS1) | 525 MHz | NPLite | VPN_LITE | Marvell 88E6161 | 📋 **Planned** |
 | FortiGate 100D | x86 PC (no Fortinet SoC) | 1.8 GHz | none | CP8 (no driver) | BCM53314 | 🚧 **Work in progress** |
 
 - **Available**: image built from this repository, installable with persistent storage (60D, 90D). The
@@ -533,58 +533,6 @@ is spent in the boot loader, which reads the image from the boot disk with a 960
 </details>
 
 <details>
-<summary><b>FortiGate 60C</b> — SoC1 (FS1) · NPLite · VPN_LITE — 📋 Planned</summary>
-
-### Specifications
-
-| Item | Value |
-|---|---|
-| SoC | SoC1 (FS1) |
-| CPU | Faraday FA626TE (ARMv5) @ 525 MHz |
-| RAM | 1 GiB |
-| Network processor | NPLite (first generation) |
-| Crypto | VPN_LITE engine |
-| Switch | Marvell 88E6161 |
-| Ethernet ports | `wan1`, `wan2`, `dmz`, `lan1`…`lan5` |
-| Boot disk | internal disk on module, behind a USB 2.0 hub |
-| USB | front USB port, ExpressCard slot (USB side), through the same hub |
-| LEDs | STATUS, ALARM (bicolour); WAN1, WAN2, DMZ speed (100 / 1000) |
-| Buttons | reset |
-| RTC | on-chip |
-| Power | 12 V DC input; to be measured |
-
-### Hardware topology
-
-```mermaid
-flowchart LR
-  CPU["CPU<br/>Faraday FA626TE"]
-  CP7["VPN_LITE<br/>crypto engine"]
-  NP["NPLite<br/>network processor"]
-  SW["Marvell 88E6161 switch"]
-  CPU --- CP7
-  CPU --- NP
-  NP -- "port 0 · RGMII" --- SW
-  NP -- "port 1 · RGMII" --- P3["PHY"] --- WAN1(["wan1"])
-  NP -- "port 2 · RGMII" --- P0["PHY"] --- WAN2(["wan2"])
-  NP -- "port 3 · RGMII" --- P2["PHY"] --- DMZ(["dmz"])
-  SW -- "ports 0–4" --- LAN(["lan5 … lan1"])
-```
-
-### Benchmarks
-
-_To be measured._
-
-### OpenWrt features
-
-Not started: no profile in the tree yet.
-
-### Installation notes
-
-_To be completed._
-
-</details>
-
-<details>
 <summary><b>FortiGate 90D</b> — SoC2 · NP4Lite · on-chip VPN engine — ✅ Available</summary>
 
 ### Specifications
@@ -760,6 +708,58 @@ OpenWrt runs in our lab, but this model is not published as supported yet. The i
 the default boot, and **[B]** in the boot loader menu switches between slots. Hardware flow offload
 (IPv4 and IPv6), bonds of switch ports and LuCI have been exercised; LEDs, buttons, usable USB, crypto and
 the remaining items still have to be done.
+
+### Installation notes
+
+_To be completed._
+
+</details>
+
+<details>
+<summary><b>FortiGate 60C</b> — SoC1 (FS1) · NPLite · VPN_LITE — 📋 Planned</summary>
+
+### Specifications
+
+| Item | Value |
+|---|---|
+| SoC | SoC1 (FS1) |
+| CPU | Faraday FA626TE (ARMv5) @ 525 MHz |
+| RAM | 1 GiB |
+| Network processor | NPLite (first generation) |
+| Crypto | VPN_LITE engine |
+| Switch | Marvell 88E6161 |
+| Ethernet ports | `wan1`, `wan2`, `dmz`, `lan1`…`lan5` |
+| Boot disk | internal disk on module, behind a USB 2.0 hub |
+| USB | front USB port, ExpressCard slot (USB side), through the same hub |
+| LEDs | STATUS, ALARM (bicolour); WAN1, WAN2, DMZ speed (100 / 1000) |
+| Buttons | reset |
+| RTC | on-chip |
+| Power | 12 V DC input; to be measured |
+
+### Hardware topology
+
+```mermaid
+flowchart LR
+  CPU["CPU<br/>Faraday FA626TE"]
+  CP7["VPN_LITE<br/>crypto engine"]
+  NP["NPLite<br/>network processor"]
+  SW["Marvell 88E6161 switch"]
+  CPU --- CP7
+  CPU --- NP
+  NP -- "port 0 · RGMII" --- SW
+  NP -- "port 1 · RGMII" --- P3["PHY"] --- WAN1(["wan1"])
+  NP -- "port 2 · RGMII" --- P0["PHY"] --- WAN2(["wan2"])
+  NP -- "port 3 · RGMII" --- P2["PHY"] --- DMZ(["dmz"])
+  SW -- "ports 0–4" --- LAN(["lan5 … lan1"])
+```
+
+### Benchmarks
+
+_To be measured._
+
+### OpenWrt features
+
+Not started: no profile in the tree yet.
 
 ### Installation notes
 
