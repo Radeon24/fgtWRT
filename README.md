@@ -61,14 +61,14 @@ The CPU clock depends on the model: the 60D and the 90D share the same SoC2 but 
 1. The OpenWrt image is first **booted from RAM** through the stock boot loader (TFTP). Nothing is written,
    so you can try OpenWrt without touching the appliance.
 2. From that RAM system, **`sysupgrade` installs the same image** into a firmware slot of the internal boot
-   disk. On the **60D**, the target slot becomes the default one and the rest of the slot is kept as
-   persistent storage (overlay). On the **90D** and the **60E**, the image goes into the **non-default**
-   slot only (`sysupgrade -n`), with nothing kept: the stock firmware stays the default boot.
+   disk. On the **60D** and the **90D**, the target slot becomes the default one and the rest of the slot is
+   kept as persistent storage (overlay). On the **60E**, the image goes into the **non-default** slot only
+   (`sysupgrade -n`), with nothing kept: the stock firmware stays the default boot.
 3. The stock firmware stays in its other slot. The boot loader menu (**[B]**) switches between slots at any
    time, so you can always go back to it.
 
 The running kernel keeps the boot disk **read-only**, except for write windows declared in the device tree:
-the persistent storage area (60D), which the kernel keeps writable at all times, and the target slot plus
+the persistent storage area (60D, 90D), which the kernel keeps writable at all times, and the target slot plus
 a few listed bytes of the boot sector, which the installer opens for the duration of the installation only.
 
 ## Supported devices
@@ -77,12 +77,12 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 |---|---|---|---|---|---|---|
 | FortiGate 60D | SoC2 | 800 MHz | NP4Lite | on-chip VPN engine | BCM53128 | ✅ **Available** |
 | FortiGate 60C | SoC1 (FS1) | 525 MHz | NPLite | VPN_LITE | Marvell 88E6161 | 📋 **Planned** |
-| FortiGate 90D | SoC2 | 900 MHz | NP4Lite | on-chip VPN engine | 2 × BCM53128 | 🔜 **Coming soon** |
+| FortiGate 90D | SoC2 | 900 MHz | NP4Lite | on-chip VPN engine | 2 × BCM53128 | ✅ **Available** |
 | FortiGate 60E | SoC3 | about 1 GHz | NP6Lite | on-chip engine (no driver) | BCM53128 | 🔜 **Coming soon** |
 | FortiGate 100D | x86 PC (no Fortinet SoC) | 1.8 GHz | none | CP8 (no driver) | BCM53314 | 🚧 **Work in progress** |
 
-- **Available**: image built from this repository, installable with persistent storage (60D). The published
-  60D image is built from revision `r37428-f7220c1d5ae` of the `fgtwrt` branch.
+- **Available**: image built from this repository, installable with persistent storage (60D, 90D). The
+  published 60D and 90D images are built from revision `r37432-59b1585d5e1` of the `fgtwrt` branch.
 - **Coming soon**: OpenWrt runs in our lab, installed into the **non-default** firmware slot without
   persistent storage; LEDs, storage and other items are still to be done. Not published as supported yet.
 - **Planned**: no OpenWrt profile in the tree yet.
@@ -116,14 +116,14 @@ Routing/NAT Offloading → Hardware flow offloading* (`flow_offloading_hw` in `/
 | 802.1Q VLAN (one tag) | 🧪 | 🧪 | 🧪 | NP4Lite: needs `rx-vlan-offload` and `tx-vlan-offload`, off by default |
 | QinQ / 802.1ad | — | — | ❌ | NPLite / NP4Lite flow entries carry a single tag. NP6Lite: hardware support not established |
 | PPPoE | — | — | ❌ | NP6Lite: hardware support not established |
-| Flows through the ports of the switch | ❌ | ✅ | 🧪 | NP4Lite: one logical interface per switch port in the device tree (60D and 90D), validated on the 60D; frames from the CPU to the switch ports are dropped when offloaded traffic saturates the NP–switch link (see [Known limitations](#known-limitations)). NP6Lite: through a bond of switch ports only |
-| Link aggregation (bonding) endpoints | ❌ | 🧪 | 🧪 | no aggregation in the NP itself: the bond is handled by the driver. NPLite: driver code, not tested. NP4Lite: active-backup, balance-xor, 802.3ad. NP6Lite: bonds of switch ports |
+| Flows through the ports of the switch | ❌ | ✅ | 🧪 | NP4Lite: one logical interface per switch port in the device tree, validated on the 60D and the 90D; frames from the CPU to the switch ports are dropped when offloaded traffic saturates the NP–switch link (see [Known limitations](#known-limitations)). NP6Lite: through a bond of switch ports only |
+| Link aggregation (bonding) endpoints | ❌ | 🧪 | 🧪 | no aggregation in the NP itself: the bond is handled by the driver. NPLite: driver code, not tested. NP4Lite: active-backup, balance-xor, 802.3ad; the switch chips aggregate their own ports (90D: groups within one switch chip, two groups at most for both chips). NP6Lite: bonds of switch ports |
 | Offloaded connections | 8192 flows | **4096 connections** (8192 flow entries, one per direction) | 8192 flows | driver limit; further connections stay on the CPU |
 | Per-flow byte / packet counters | 🧪 | 🧪 | ❌ | NPLite: about a hundred counters only. NP4Lite: limited number of counters. NP6Lite: activity only |
 | L2 bridge / FDB offload in the NP | — | — | ❌ | bridging is done by the switch chip |
 | QoS / shaping offload | ❌ | ❌ | ❌ | |
 | **Inline IPsec (ESP) in the NP** | | | | |
-| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | ❌ | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on the 60D only |
+| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | ❌ | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on both |
 | ESP ciphers | — | AES-CBC 128/192/256, 3DES-CBC | ❌ | as implemented in the NP4Lite driver; measured with AES-128-CBC |
 | ESP integrity | — | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 | ❌ | as implemented in the NP4Lite driver; measured with HMAC-SHA1-96 |
 | ESN, NAT-T, transport mode | — | ❌ | ❌ | handled in software |
@@ -162,8 +162,8 @@ the NP4Lite adds inline IPsec and switch-port offload. The IPsec limitations are
 
 The exact steps depend on the model: the boot loader menus and their keys differ between BIOS versions.
 The procedure below is the common outline; read the **installation notes** of your model in
-[Devices](#devices) before you start. The notes for the 60D describe the validated path; for the other
-models they are _to be completed_.
+[Devices](#devices) before you start. The notes for the 60D and the 90D describe the validated path; for
+the other models they are _to be completed_.
 
 ### Requirements
 
@@ -186,17 +186,18 @@ make menuconfig
 
 In `make menuconfig`, select:
 
-| Option | FortiGate 60D |
-|---|---|
-| Target System | `Fortinet FortiSOC` |
-| Subtarget | `FortiSOC2` |
-| Target Profile | `FortiGate 60D` |
+| Option | FortiGate 60D | FortiGate 90D |
+|---|---|---|
+| Target System | `Fortinet FortiSOC` | `Fortinet FortiSOC` |
+| Subtarget | `FortiSOC2` | `FortiSOC2` |
+| Target Profile | `FortiGate 60D` | `FortiGate 90D` |
 
 The device profile brings the drivers, the firewall with hardware flow offload, IPsec (IPv4 and IPv6, with
-the NP4Lite offload) and the installer. On the 60D, it also **includes** the web interface and the VPN
-packages, so that the profile alone builds the image that was measured; nothing else has to be selected:
+the NP4Lite offload) and the installer. On the 60D and the 90D, it also **includes** the web interface and
+the VPN packages, so that the profile alone builds the image that was measured; nothing else has to be
+selected:
 
-| Package (included in the 60D profile) | For |
+| Package (included in the 60D and 90D profiles) | For |
 |---|---|
 | `luci` | web interface |
 | `kmod-wireguard`, `wireguard-tools` | WireGuard |
@@ -214,10 +215,11 @@ make -j"$(nproc)"
 ```
 
 The image is `bin/targets/fortisoc/<subtarget>/openwrt-fortisoc-<subtarget>-<device>-initramfs-kernel.bin`;
-for the 60D, `bin/targets/fortisoc/fsoc2/openwrt-fortisoc-fsoc2-fortinet_fg-60d-initramfs-kernel.bin`.
+for the 60D, `bin/targets/fortisoc/fsoc2/openwrt-fortisoc-fsoc2-fortinet_fg-60d-initramfs-kernel.bin`
+(90D: `…-fortinet_fg-90d-initramfs-kernel.bin`).
 
 This **single file** is used for both steps: the TFTP boot to RAM and the installation with `sysupgrade`.
-On the 60D, the build refuses a kernel file too large for the boot loader (see the 60D section).
+On the 60D and the 90D, the build refuses a kernel file too large for the boot loader (see the 60D section).
 
 Pre-built images may be published later; until then, build from source.
 
@@ -237,7 +239,7 @@ Pre-built images may be published later; until then, build from source.
    | — | `dmz`, `wan2` | not configured |
 
    Log in with `ssh root@192.168.1.1`, or with the web interface at `http://192.168.1.1` (LuCI is in the
-   60D profile; on the other models, add `luci` at build time).
+   60D and 90D profiles; on the 60E, add `luci` at build time).
 
 Everything runs in RAM: **nothing is written to the appliance**, and all changes are lost at the next reboot.
 This is the recommended way to check that your unit works before installing.
@@ -251,10 +253,10 @@ scp -O openwrt-fortisoc-fsoc2-fortinet_fg-60d-initramfs-kernel.bin root@192.168.
 ssh root@192.168.1.1 sysupgrade -n /tmp/openwrt-fortisoc-fsoc2-fortinet_fg-60d-initramfs-kernel.bin
 ```
 
-The installation differs by model: on the **60D** the image goes into the default firmware slot, which
-becomes the default boot, and the rest of the slot becomes persistent storage (overlay); on the **90D**
-and the **60E** it goes into the **non-default** slot only, and the stock firmware stays the default
-boot (**[B]** in the boot loader menu switches between slots).
+The installation differs by model: on the **60D** and the **90D** the image goes into the OpenWrt firmware
+slot, which becomes the default boot, and the rest of the slot becomes persistent storage (overlay); on the
+**60E** it goes into the **non-default** slot only, and the stock firmware stays the default boot
+(**[B]** in the boot loader menu switches between slots).
 
 **What the installer checks.** It refuses to write anything, with a message, unless:
 
@@ -263,22 +265,23 @@ boot (**[B]** in the boot loader menu switches between slots).
 - the boot sector carries the stock header, and the **target partition** matches its MBR entry and the
   expected start and size;
 - the write windows reported by the kernel match the expected ones;
-- on the 60D, the slot it would overwrite is not a stock firmware set as the default boot.
+- on the 60D and the 90D, the slot it would overwrite is not a stock firmware set as the default boot, and
+  the other slot still holds a firmware that **[B]** can bring back.
 
 <details>
 <summary><b>What it writes, in this order</b></summary>
 
 1. **The firmware container** into the target slot. Only the start of the slot is used.
-2. On the **60D** only, **the head of the persistent area**, the rest of the same slot: either your
+2. On the **60D** and the **90D**, **the head of the persistent area**, the rest of the same slot: either your
    configuration archive, or a marker that asks for a clean format.
 3. **A few bytes of the boot sector**: the image name and build number of that slot, and on the 60D the
-   boot flags that make it the default one. Every other byte is checked to be unchanged.
+   boot flags that make it the default one (60D, 90D). Every other byte is checked to be unchanged.
 
 </details>
 
 Each step is read back and verified. The write windows are then closed again, and the appliance reboots into
-OpenWrt. On the 60D, on the first boot the persistent area is formatted (ext4) and your configuration is
-restored.
+OpenWrt. On the 60D and the 90D, on the first boot the persistent area is formatted (ext4) and your
+configuration is restored.
 
 ### 4. Update
 
@@ -286,10 +289,10 @@ Run `sysupgrade` again from the installed OpenWrt, with a newer image built the 
 
 - `sysupgrade -n <image>` starts from a clean configuration — this is the path used for every reference
   image so far;
-- `sysupgrade <image>` (60D only) keeps the configuration: it is saved as an archive, the persistent area is
+- `sysupgrade <image>` (60D, 90D) keeps the configuration: it is saved as an archive, the persistent area is
   formatted again, and the archive is restored at the first boot. As usual with OpenWrt, packages installed
   after the build are not kept. It has been exercised from an image to itself only. On models without
-  persistent storage, the installer refuses `sysupgrade` without `-n`.
+  persistent storage (60E), the installer refuses `sysupgrade` without `-n`.
 
 ### 5. Go back to the stock firmware
 
@@ -582,23 +585,24 @@ _To be completed._
 </details>
 
 <details>
-<summary><b>FortiGate 90D</b> — SoC2 · NP4Lite · on-chip VPN engine — 🔜 Coming soon</summary>
+<summary><b>FortiGate 90D</b> — SoC2 · NP4Lite · on-chip VPN engine — ✅ Available</summary>
 
 ### Specifications
 
 | Item | Value |
 |---|---|
 | SoC | SoC2 |
-| CPU | Faraday FA726TE (ARMv5TE) @ 900 MHz |
-| RAM | 2 GiB |
+| CPU | Faraday FA726TE (ARMv5TE) @ 900 MHz, L2 cache enabled |
+| RAM | 2 GiB (1813.7 MiB seen by the kernel) |
 | Network processor | NP4Lite, 4 RGMII ports |
 | Crypto | on-chip VPN engine |
-| Switches | 2 × Broadcom BCM53128, cascaded |
+| Switches | 2 × Broadcom BCM53128, cascaded, one DSA tree |
 | WAN PHYs | 2 × Broadcom BCM54616S |
 | Ethernet ports | 16 × 1 GbE: `wan1`, `wan2`, `internal1`…`internal14` |
 | Boot disk | internal USB flash disk, 8 GB |
 | Other storage | 32 GB disk-on-module in a mini-PCIe slot (PCIe-to-SATA bridge on the module); not usable yet: no driver for the SoC2 PCIe host |
 | Boot flash | SPI NOR, 512 KiB (read-only; holds the base MAC address) |
+| Console | RJ-45 serial, 9600 8N1 |
 | LEDs / buttons | none supported yet |
 | Power | 12 V DC input; to be measured |
 
@@ -617,8 +621,8 @@ flowchart TB
   CPU --- NP
   NP -- "port 0 · RGMII" --- PA
   NP -- "port 1 · RGMII" --- PB
-  NP -- "port 2 · RGMII" --- SW0
-  NP -- "port 3 · RGMII" --- SW1
+  NP -- "port 2 · RGMII 1G" --- SW0
+  NP -- "port 3 · RGMII 1G" --- SW1
   PA --- WAN1(["wan1"])
   PB --- WAN2(["wan2"])
   SW0 -- "ports 7–1" --- I1(["internal1 … internal7"])
@@ -627,28 +631,79 @@ flowchart TB
   SW1 -- "ports 6–0" --- I2(["internal8 … internal14"])
 ```
 
-Each switch port has its own logical interface on the NP, so flows through the `internal*` ports can be
-offloaded, with the limitation of the 60D under saturation of the NP–switch links (expected, not yet measured
-on the 90D; see [Known limitations](#known-limitations)).
+**Hardware offload scope.** As on the 60D, each switch port has its own logical interface on the NP, so
+hardware flow offload covers flows between `wan1`, `wan2` and the `internal*` ports of both switch chips,
+bonds of switch ports included; each switch chip has its own link to the NP. The `switch_offload`
+parameter and the limitation under saturation are the same as on the 60D (see
+[Known limitations](#known-limitations)).
+
+**Link aggregation.** A bond of ports of **one** switch chip is aggregated by that chip and can be bridged;
+the two chips share two hardware aggregation groups. A bond spanning the two chips works as a routed
+interface only: it is refused as a bridge port.
+
+### Image layout
+
+Same boot loader family and same image layout as the 60D (kernel file with its device tree, separate
+`rootfs.gz` ramdisk loaded at 16 MiB, 7 MiB limit on the kernel file kept by the build): see the 60D section.
 
 ### Benchmarks
 
-_To be measured._
+Measured on our test setup in October 2026, with the same protocol as the 60D, on lab images equivalent to
+the published profile (see [Benchmark methodology](#benchmark-methodology)). Throughputs are TCP goodput in
+Mbit/s, one stream, median of 3 runs; *fwd* / *rev* and *in* / *out* as for the 60D.
+
+| Test | Result | CPU |
+|---|---|---|
+| Routing `wan1` ↔ `wan2`, hw (fwd / rev) | **941 / 941** | about 99 % idle |
+| Bridged bond of switch ports (3 ports of one chip + 1 port of the other chip), switched by the chips | **941 / 941** | about 99 % idle |
+| Routing through a two-port LACP bond of switch ports, hw | 937–940 | |
+| IPsec, AES-128-CBC + HMAC-SHA1, NP offload (in / out) | 445.5 / **891.4** | in 100 %, out about 83 % |
+| WireGuard (in / out) | 76.6 / 59.2 | 100 % |
+| OpenVPN, ChaCha20-Poly1305, kernel data channel (DCO) (in / out) | 86.3 / 61.4 | 100 % |
+| OpenVPN, ChaCha20-Poly1305, user space (in / out) | 27.8 / 27.8 | 100 % |
+| OpenVPN, AES-256-CBC + HMAC-SHA256, user space (in / out) | 19.9 / 17.8 | 100 % |
+| Power-on to first LuCI response | about 70 s (70 and 71 s, two cold boots) | |
+
+The software paths scale with the CPU clock (900 / 800 MHz) against the 60D. Enabling the L2 cache of the
+90D brought the IPsec offload from 278 / 664 to 423 / 894 Mbit/s (in / out, same test kernel, three
+streams) and cut the fork/exec time by about a third.
 
 ### OpenWrt features
 
-OpenWrt runs in our lab, but this model is not published as supported yet. The image is installed with
-`sysupgrade -n` into the **non-default** slot of the internal disk, without persistent storage; the stock
-firmware stays the default boot, and **[B]** in the boot loader menu switches between slots. Hardware flow
-offload (including through the switch ports), LACP and the bridge over the two switch chips have been
-exercised; the IPsec offload package is in the image but has not been tested on this model (same SoC and NP as
-the 60D). The build uses the image layout of the 60D (separate ramdisk) for this model too; it has not been
-booted on the 90D yet. LEDs, buttons, RTC, the PCIe
-disk-on-module and the remaining items still have to be done.
+| Feature | Status |
+|---|---|
+| Ethernet ports (link, traffic) | ✅ Validated on the ports wired in our setup (`wan1`, `wan2`, 10 of the 14 `internal*` ports, on both chips) |
+| Switch bridging (`br-lan`) over the two chips | 🧪 Partial: bridge on `internal1`–`internal14` by default; measured with earlier images only |
+| VLANs | ✅ Validated: on `wan2` (offloaded) and on a bond of switch ports (802.1Q) |
+| Link aggregation (LACP), ports of one switch chip | ✅ Validated, routed and bridged |
+| Link aggregation spanning the two switch chips | 🧪 Routed only, in software; never bridged |
+| Hardware flow offload (`wan1` ↔ `wan2`), IPv4 routing, SNAT, DNAT | ✅ Validated |
+| Hardware flow offload through the switch ports | ✅ Validated, with the limitation under saturation listed in [Known limitations](#known-limitations) |
+| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated |
+| WireGuard, OpenVPN (with DCO) | ✅ Validated (packages included in the 90D profile) |
+| Persistent storage (overlay) | ✅ Validated: survives reboots and power cuts |
+| `sysupgrade` (keep / `-n`), `sysupgrade -b`, `firstboot` | ✅ Validated (keep exercised from an image to itself only) |
+| Back to stock with [B] | ✅ Validated: the overlay is left intact |
+| LEDs, buttons | ❌ none described yet |
+| RTC, rear USB-A port | ❓ Not tested on this model |
+| PCIe disk-on-module | ❌ no PCIe host driver yet |
 
 ### Installation notes
 
-_To be completed._
+> [!WARNING]
+> On the 90D, OpenWrt is always installed into **partition 2** (firmware image 1) of the internal boot disk,
+> which then becomes the default boot partition. **Before installing, make sure the stock firmware runs from
+> partition 1**: if needed, use **[B]** in the boot loader menu to switch to it, and check that it boots.
+> Anything in partition 2 is overwritten.
+
+- In the boot loader menu, **[R]** boots the image from RAM over TFTP (through `wan1`) and **[B]** switches
+  the default boot partition; the other entries are left alone.
+- Install from OpenWrt booted from RAM with `sysupgrade -n` (see [Getting started](#getting-started)). The
+  installer refuses to write if partition 2 is the default boot and does not hold OpenWrt, or if
+  partition 1 holds no firmware.
+- Persistent storage is the rest of the 256 MiB firmware slot (240 MiB, ext4).
+- To go back to the stock firmware, choose **[B]** in the boot loader menu: OpenWrt and its overlay stay in
+  partition 2, and **[B]** again brings them back.
 
 </details>
 
@@ -753,7 +808,7 @@ Benchmarks and installation notes: _to be completed_.
 
 ## Known limitations
 
-**60D, network processor.**
+**60D and 90D, network processor.**
 
 - **At most 4096 connections are offloaded to the NP at a time** (8192 flow entries, one per direction).
   This is a limit of the driver, not of the hardware; further connections are forwarded by the CPU
@@ -769,39 +824,43 @@ Benchmarks and installation notes: _to be completed_.
   offloaded bond. The NP rate limiter has no effect on this path, so this is a hardware architecture limit.
   Workaround: `echo oneway > /sys/module/fortinet_np4lite/parameters/switch_offload` keeps the switch → WAN
   direction offloaded and routes WAN → switch through the CPU (no CPU-frame loss, about 340 Mbit/s
-  WAN → switch); it can be changed at run time. The 90D has the same NP and switches (one link per switch):
-  the same behaviour is expected there, not yet measured.
+  WAN → switch); it can be changed at run time.
+  **On the 90D**, each switch chip has its own link to the NP, and the same behaviour was measured on the
+  link of the second chip (`internal8`…`internal14`), with the L2 cache disabled: 30–54 % of the frames sent
+  by the CPU lost, 23–49 % of the LACPDUs, up to 4 member losses per 120 s at 960 Mbit/s UDP, no loss in the
+  switch → WAN direction; with `oneway`, about 280–300 Mbit/s WAN → switch and no CPU-frame loss.
 - With hardware offload, fewer new connections per second are accepted than with software offload
   (about 2100–2300/s instead of 3300–3600/s), and the lossless IMIX rate (133 kpps) is below what the
   single-size results suggest. Both are being investigated.
 
-**60D, IPsec offload.**
+**60D and 90D, IPsec offload.**
 
 - IPv4 **tunnel mode only**, with the AES-CBC / 3DES-CBC and HMAC ciphers listed above. Transport mode,
   ESN, NAT-T, AES-GCM, ChaCha20-Poly1305 and all IPv6 IPsec run in software.
-- **Inbound** traffic is decrypted by the NP but forwarded by the CPU: about 396 Mbit/s, against
-  about 883 Mbit/s outbound.
+- **Inbound** traffic is decrypted by the NP but forwarded by the CPU: about 396 Mbit/s (60D) and
+  445 Mbit/s (90D), against about 883 / 891 Mbit/s outbound.
 - An ESP packet **fragmented on the outside** (an inner packet larger than the path MTU, encrypted by the
   peer and then fragmented) is dropped by the NP. The image clamps the TCP MSS of IPsec flows (1398 bytes) in
   the firewall, so TCP is not affected; large non-TCP packets can be lost.
 - **Inbound anti-replay is disabled** on offloaded SAs.
 - The NP checks that decrypted packets match the selector of their SA; an SA installed with an
   any-to-any (`0.0.0.0/0`) selector, as some IKE daemons do, is not restricted by this check.
-- The offload has been tested on the 60D only; on the 90D it is untested.
 
-**60D, other.**
+**60D and 90D, other.**
 
-- **WireGuard and OpenVPN run on the CPU** (about 50–80 Mbit/s). OpenVPN uses its kernel data channel for
-  ChaCha20-Poly1305 only; AES-256-CBC stays in user space (about 17 Mbit/s).
-- LuCI, WireGuard and OpenVPN are **in the default device profile of the 60D**. The 90D and 60E profiles do
-  not include them yet: select them at build time on those models.
+- **WireGuard and OpenVPN run on the CPU** (about 50–90 Mbit/s). OpenVPN uses its kernel data channel for
+  ChaCha20-Poly1305 only; AES-256-CBC stays in user space (about 17–20 Mbit/s).
+- LuCI, WireGuard and OpenVPN are **in the default device profiles of the 60D and the 90D**. The 60E
+  profile does not include them yet: select them at build time on that model.
+- **90D**: a bond spanning the two switch chips cannot be bridged (routed only), and the two chips share two
+  hardware aggregation groups. LEDs, buttons and the PCIe disk-on-module are not supported yet.
 - **Clock**: without a reachable NTP server, the clock was found days behind after reboots; the RTC driver
   has not been re-tested under OpenWrt. Keep NTP (the OpenWrt default) enabled, and check the time before
   relying on certificates.
-- **Boot time**: about 70 s from power-on to the web interface, most of it in the boot loader.
+- **Boot time**: about 70 s from power-on to the web interface, most of it in the boot loader (60D and 90D).
 
-**Other models.** The 90D and the 60E run OpenWrt in our lab without persistent storage, and are not published
-as supported yet (see [Devices](#devices)). The 60C and the 100D have no OpenWrt image.
+**Other models.** The 60E runs OpenWrt in our lab without persistent storage, and is not published as
+supported yet (see [Devices](#devices)). The 60C and the 100D have no OpenWrt image.
 
 ## Benchmark methodology
 
@@ -824,7 +883,8 @@ harness: the numbers in [Devices](#devices) come from it.
   image is built from the device profile alone: it has neither that console nor these tools (the generic
   `earlycon` of the kernel command line is the same in both).
 - Model caveat: on the 60D, the benchmark tables are measured between `wan1` and `wan2`; flows through the
-  switch ports are offloaded too (one bond measurement is given); on the 60E, the switch side is a bond of
+  switch ports are offloaded too (one bond measurement is given); on the 90D, the same tests were run on a
+  subset (routing, bonds of switch ports, IPsec offload, VPN); on the 60E, the switch side is a bond of
   switch ports.
 
 | Test | Tool / method | Variants |
