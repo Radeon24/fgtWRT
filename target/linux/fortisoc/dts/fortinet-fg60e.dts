@@ -133,7 +133,10 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		/* Present at 0x51, no driver: i2cget only. */
+		/*
+		 * Described for reference only: no device acknowledges at
+		 * 0x51 on this board; the clock is the SoC internal RTC.
+		 */
 		rtc@51 {
 			compatible = "nxp,pcf8563";
 			reg = <0x51>;
