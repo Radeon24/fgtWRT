@@ -48,9 +48,11 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/hash.h>
 #include <linux/hex.h>
 #include <linux/iopoll.h>
 #include <linux/jhash.h>
+#include <linux/log2.h>
 #include <linux/ioport.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
@@ -318,9 +320,23 @@ struct fnp6l_mdio {
 	int mdc_pin;		/* pin mux bit and NP GPIO of its MDC, -1 = none */
 };
 
-#define NP6L_FT_MSGQ			64	/* query replies waiting for the work */
-#define NP6L_FT_MSGLEN			192
-#define NP6L_FT_HASH			256
+#define NP6L_FT_MSGTYPES		16	/* NP messages counted by header byte 0, 3:0 */
+#define NP6L_FT_MSGHDR			24	/* header + key of the last unmatched message */
+#define NP6L_FT_DELKEYS			256	/* keys of the last sessions deleted */
+#define NP6L_FT_DELKEY_LEN		16	/* = NP6L_SSE_KEY4_LEN */
+#define NP6L_FT_DEAD_RETRY_MS		20	/* undeleted flows: next try */
+/*
+ * Indexes of the flows by cookie and of their sessions by key: 1 << bits
+ * buckets each, sized at probe (ft_hash_bits). A lookup walks one bucket:
+ * with a fixed 2048 buckets each, at 196608 flows, every STATS and every
+ * query reply walked about a hundred entries.
+ */
+#define NP6L_FT_HBITS_DEF		16	/* 65536 buckets: 256 KiB each (32-bit) */
+#define NP6L_FT_HBITS_MIN		11
+#define NP6L_FT_HBITS_MAX		20
+#define NP6L_FT_BHASH_BITS		10	/* flows given back, by cookie */
+#define NP6L_FT_BACK_MS			1000	/* given back: first offer again after */
+#define NP6L_FT_BACK_SHIFT_MAX		6	/* then doubled up to 64 s */
 
 struct fnp6l {
 	struct device *dev;
@@ -353,20 +369,88 @@ struct fnp6l {
 	struct fnp6l_ring cmdq;	/* session commands */
 	u8 *cmd_buf;
 	dma_addr_t cmd_dma;
-	unsigned int cmd_slot;
+	/* done index last seen, since when (ns), and whether it is stuck */
+	unsigned int cmd_seen;
+	u64 cmd_seen_ns;
+	bool cmd_stalled;
+	/*
+	 * session commands (fnp6l_sse_lock): posted; posts that found the
+	 * queue full (waits, time spun, longest spin); sleeps (none since
+	 * commands are never waited for); posts refused on a full queue;
+	 * stalls of the done index and the longest one seen (upper bound);
+	 * queries skipped on a nearly full queue
+	 */
+	unsigned long sse_cmds, sse_waits, sse_sleeps, sse_full, sse_tmo;
+	u64 sse_wait_us;
+	u32 sse_wait_max_us, sse_stall_max_ms;
+	unsigned long sse_qskip;
+	unsigned long sse_iskip;	/* inserts refused: room kept for deletes */
+	/* session table: buckets of the PHT and the OFT (read at probe) */
+	u32 sse_pht_n, sse_oft_n;
+	/*
+	 * Admission of new flows (see fnp6l_ft_admit): the OFT free count
+	 * read at oft_j and the sessions posted since (fnp6l_sse_lock, read
+	 * without it for the early refusal), refusals by cause.
+	 */
+	u32 oft_free;
+	unsigned int oft_posted;
+	unsigned long oft_j, oft_reads;
+	bool oft_valid;
+	atomic_long_t ft_ref_oft, ft_ref_guard, ft_ref_max;
+	/*
+	 * Inserts the engine refused (fnp6l_sse_lock): the gap INSERTS -
+	 * INSERTS_OK at engine init; at the last sample (command queue
+	 * drained) INSERTS and the gap; the refusals counted (np_refused,
+	 * see fnp6l_ft_cap_read), those not yet matched to a flow
+	 * (np_credit); flows given back to the software flow table.
+	 */
+	u32 ins_gap0, ins_last, ins_gap_last, np_refused, np_credit;
+	unsigned long ins_gap_j;
+	bool ins_gap_have;
+	unsigned long ft_back, ft_back_sess;
+	/*
+	 * Flows given back, by cookie, until their DESTROY (ft_sess_lock;
+	 * fnp6l_ft_back_*): how many, offers refused while the engine has no
+	 * room, given-back flows admitted again; deletes not posted for
+	 * sessions the engine refused; offers refused while a live flow held
+	 * one of their keys (fnp6l_sse_lock).
+	 */
+	struct hlist_head ft_bhash[1 << NP6L_FT_BHASH_BITS];
+	struct list_head ft_backl;
+	unsigned int ft_nback;
+	atomic_long_t ft_ref_back;
+	unsigned long ft_back_again, ft_del_skip, ft_keybusy;
+	/* query replies that found no session (ft_sess_lock) */
+	unsigned long ft_qmiss;
 	/* flow table offload: see its section */
 	bool ft_on;			/* the offload state is applied */
-	struct list_head ft_flows;	/* offloaded flows, by cookie */
+	struct list_head ft_flows;	/* offloaded flows */
+	struct hlist_head *ft_chash;	/* the same, by cookie (1 << ft_hbits) */
+	unsigned int ft_hbits;		/* both indexes, fixed at probe */
 	unsigned int ft_nflows;
+	/* flows whose delete failed: still in the engine, deleted again later */
+	struct list_head ft_dead;
+	unsigned int ft_ndead;
+	unsigned long ft_delfail, ft_dfree, ft_lagfail;
+	struct delayed_work ft_dead_work;
+	/* DESTROY and STATS of a cookie we do not track (ft_sess_lock) */
+	unsigned long ft_unk_destroy, ft_unk_stats;
 	/* per-flow activity by session query replies */
-	struct hlist_head ft_hash[NP6L_FT_HASH];	/* sessions by key */
-	struct work_struct ft_msg_work;
-	spinlock_t ft_msg_lock;
-	unsigned int ft_msg_n;
-	u16 ft_msg_len[NP6L_FT_MSGQ];
-	u8 ft_msg[NP6L_FT_MSGQ][NP6L_FT_MSGLEN];
+	spinlock_t ft_sess_lock;	/* ft_hash, session snapshots, lastused, q* */
+	struct hlist_head *ft_hash;	/* sessions by key (1 << ft_hbits) */
+	/* STATS answered under ft_sess_lock alone, or with the command lock */
+	unsigned long ft_sfast, ft_sslow;
 	unsigned long ft_qsent, ft_qreply, ft_qmatch, ft_qchange, ft_qdrop;
 	int ft_qoff;			/* key offset in the replies, -1: unseen */
+	/* NP messages that are no reply to a query of ours (ft_sess_lock) */
+	unsigned long ft_qnomatch, ft_msgtype[NP6L_FT_MSGTYPES];
+	u8 ft_msghdr[NP6L_FT_MSGHDR];
+	unsigned int ft_msghdr_len;
+	/* messages by header byte 1 (3:0); unmatched ones whose key is one of
+	 * the last NP6L_FT_DELKEYS session keys deleted (ft_sess_lock) */
+	unsigned long ft_msgop[NP6L_FT_MSGTYPES], ft_qnomatch_del;
+	u8 ft_delkey[NP6L_FT_DELKEYS][NP6L_FT_DELKEY_LEN];
+	unsigned int ft_ndelkey;
 	struct notifier_block ft_nb;	/* bond member changes (switch ports) */
 	struct delayed_work ft_lag_work;
 	unsigned int ft_lag_again;
@@ -1964,6 +2048,36 @@ static void fnp6l_pdq_init(struct fnp6l *np)
 
 static DEFINE_MUTEX(fnp6l_sse_lock);
 
+/*
+ * Table sizes in 128-byte buckets, read once at probe: 0 = the whole region
+ * (PHT 512 Ki buckets, OFT 640 Ki). A smaller power of two (at least
+ * NP6L_SSE_MIN_BUCKETS) keeps the same bases and the same hash formula; it
+ * only serves to fill the engine with few sessions. Built in, the driver
+ * takes them from the kernel command line
+ * (fortinet_np6lite.sse_pht_buckets=…).
+ */
+static unsigned int sse_pht_buckets;
+module_param(sse_pht_buckets, uint, 0444);
+MODULE_PARM_DESC(sse_pht_buckets, "PHT buckets (0: 524288; else a power of two from 1024), read at probe");
+static unsigned int sse_oft_buckets;
+module_param(sse_oft_buckets, uint, 0444);
+MODULE_PARM_DESC(sse_oft_buckets, "OFT buckets (0: 655360; else a power of two from 1024), read at probe");
+#define NP6L_SSE_MIN_BUCKETS		1024
+
+static u32 fnp6l_sse_buckets(struct fnp6l *np, const char *name,
+			     unsigned int want, u32 max)
+{
+	if (!want || want == max)
+		return max;
+	if (want < NP6L_SSE_MIN_BUCKETS || want > max || !is_power_of_2(want)) {
+		dev_warn(np->dev, "sse: %s %u buckets ignored (a power of two, %u to %u)\n",
+			 name, want, NP6L_SSE_MIN_BUCKETS, max);
+		return max;
+	}
+	dev_info(np->dev, "sse: %s reduced to %u buckets\n", name, want);
+	return want;
+}
+
 static void fnp6l_sse_log(struct fnp6l *np, const char *when)
 {
 	dev_info(np->dev,
@@ -2052,11 +2166,15 @@ static int fnp6l_sse_init(struct fnp6l *np)
 	dev_info(np->dev, "sse: OFT %#x (%u MiB) and PHT %#x (%u MiB) zeroed\n",
 		 NP6L_OFT_BASE, NP6L_OFT_SIZE >> 20, NP6L_PHT_BASE, NP6L_PHT_SIZE >> 20);
 
+	np->sse_pht_n = fnp6l_sse_buckets(np, "PHT", READ_ONCE(sse_pht_buckets),
+					  NP6L_PHT_SIZE >> 7);
+	np->sse_oft_n = fnp6l_sse_buckets(np, "OFT", READ_ONCE(sse_oft_buckets),
+					  NP6L_OFT_SIZE >> 7);
 	/* tables first, search last */
-	fnp6l_wr(np, NP6L_SSE_PHT_CFG, NP6L_PHT_BASE | NP6L_PHT_SIZE >> 7);
-	fnp6l_wr(np, NP6L_SSE_OFT_CFG, NP6L_OFT_BASE | NP6L_OFT_SIZE >> 7);
+	fnp6l_wr(np, NP6L_SSE_PHT_CFG, NP6L_PHT_BASE | np->sse_pht_n);
+	fnp6l_wr(np, NP6L_SSE_OFT_CFG, NP6L_OFT_BASE | np->sse_oft_n);
 	/* hash prime and seed from the PHT size */
-	n = ((NP6L_PHT_SIZE >> 7) - 1) & GENMASK(23, 0);
+	n = (np->sse_pht_n - 1) & GENMASK(23, 0);
 	h = fls(n) - 1;
 	prctl = (h + 1) << 27 | n << (23 - h);
 	mask = (27 - h) | 0x1e0;
@@ -2078,11 +2196,15 @@ static int fnp6l_sse_init(struct fnp6l *np)
 	if ((irq_ctrl & NP6L_SSE_IRQ_STATUS) & ~BIT(9))
 		dev_warn(np->dev, "sse: interrupt status %#lx\n",
 			 irq_ctrl & NP6L_SSE_IRQ_STATUS);
-	if (fnp6l_rd(np, NP6L_SSE_OFT_FREE) != (NP6L_OFT_SIZE >> 7) - 1)
+	if (fnp6l_rd(np, NP6L_SSE_OFT_FREE) != np->sse_oft_n - 1)
 		dev_warn(np->dev, "sse: OFT free count %#x, expected %#x\n",
-			 fnp6l_rd(np, NP6L_SSE_OFT_FREE), (NP6L_OFT_SIZE >> 7) - 1);
-	dev_info(np->dev, "sse: engine on (hash_ctrl %#x hash_mask %#x)%s\n",
-		 prctl, mask, ret ? ", flush timed out" : "");
+			 fnp6l_rd(np, NP6L_SSE_OFT_FREE), np->sse_oft_n - 1);
+	/* refusals are counted from here (INSERTS_OK read first) */
+	np->ins_gap0 = fnp6l_rd(np, NP6L_SSE_INSERTS_OK);
+	np->ins_gap0 = fnp6l_rd(np, NP6L_SSE_INSERTS) - np->ins_gap0;
+	dev_info(np->dev, "sse: engine on (PHT %u OFT %u buckets, hash_ctrl %#x hash_mask %#x)%s\n",
+		 np->sse_pht_n, np->sse_oft_n, prctl, mask,
+		 ret ? ", flush timed out" : "");
 	return ret;
 }
 
@@ -2120,8 +2242,16 @@ static int fnp6l_sse_init(struct fnp6l *np)
 #define NP6L_SSE_CMD_DELETE		2
 #define NP6L_SSE_ENTRY_LEN		128
 #define NP6L_SSE_KEY4_LEN		16
-#define NP6L_SSE_CMD_SLOTS		16
+/*
+ * Up to 64 descriptors (sse_slots): the ring size register takes the size
+ * as a count, as for the host frame queue (1024); 16 left no room for a
+ * burst of queries ahead of the deletes of short connections.
+ */
+#define NP6L_SSE_CMD_SLOTS		64
+#define NP6L_SSE_CMD_MIN_SLOTS		8
 #define NP6L_SSE_CMD_BUF		1024
+#define NP6L_SSE_QUERY_ROOM(n)		((n) / 4)	/* kept for inserts and deletes */
+#define NP6L_SSE_DEL_ROOM(n)		((n) / 8)	/* kept for deletes */
 #define NP6L_SSE_TXQ			1	/* host transmit queue of the commands */
 
 struct fnp6l_sse_opt {
@@ -2211,9 +2341,15 @@ static void fnp6l_sse_entry4(u8 *e, u8 proto, __be32 sip, __be16 sport,
 	}
 }
 
+static unsigned int sse_slots = NP6L_SSE_CMD_SLOTS;
+module_param(sse_slots, uint, 0644);
+MODULE_PARM_DESC(sse_slots, "session command descriptors (8 to 64, default 64), read once, at the first command");
+
 static int fnp6l_cmdq_up(struct fnp6l *np)
 {
 	struct fnp6l_ring *r = &np->cmdq;
+	unsigned int n = clamp_t(unsigned int, READ_ONCE(sse_slots),
+				 NP6L_SSE_CMD_MIN_SLOTS, NP6L_SSE_CMD_SLOTS);
 	u32 d[4] = { };
 	int ret;
 
@@ -2223,7 +2359,7 @@ static int fnp6l_cmdq_up(struct fnp6l *np)
 					  &np->cmd_dma, GFP_KERNEL);
 	if (!np->cmd_buf)
 		return -ENOMEM;
-	ret = fnp6l_ring_alloc(np, r, true, NP6L_SSE_TXQ, NP6L_SSE_CMD_SLOTS);
+	ret = fnp6l_ring_alloc(np, r, true, NP6L_SSE_TXQ, n);
 	if (!ret)
 		ret = fnp6l_ring_start(np, r);
 	if (ret) {
@@ -2237,29 +2373,175 @@ static int fnp6l_cmdq_up(struct fnp6l *np)
 	fnp6l_tbl_op(np, NP6L_TBL_IRQ_VEC, 0x40 + 4 * NP6L_SSE_TXQ, d, true);
 	d[0] = 4;
 	fnp6l_tbl_op(np, NP6L_TBL_IRQ_VEC, 0x41 + 4 * NP6L_SSE_TXQ, d, true);
-	dev_info(np->dev, "sse: command queue htxq%u started\n", NP6L_SSE_TXQ);
+	dev_info(np->dev, "sse: command queue htxq%u started, %u descriptors\n",
+		 NP6L_SSE_TXQ, n);
 	return 0;
 }
 
-static int fnp6l_sse_cmd_send(struct fnp6l *np, const u8 *msg, unsigned int len)
+/*
+ * Session commands, under fnp6l_sse_lock. The NP writes back the done index
+ * of the command queue (wb[0]) once it has read a descriptor and its buffer;
+ * descriptor i always carries buffer i, so a buffer is only written again
+ * when the ring wraps onto it, which needs the done index past it, as for a
+ * frame. The queue is read in order and the done index only says that a
+ * command was read, not what the engine made of it: a command is posted and
+ * never waited for (a delete posted before an insert of the same key is read
+ * first). Only a full queue is waited for, by a short busy poll
+ * (sse_spin_us), the engine reading a command in a few microseconds; still
+ * full, the command is refused (-EBUSY) and its caller keeps its state (a
+ * flow left to the software flow table, an undeleted flow tried again
+ * later): nothing sleeps under the command lock, which every flow table
+ * work takes. A done index that does not move for NP6L_SSE_TIMEOUT_US while
+ * commands wait is reported once ("not taken"), then again when it moves. A
+ * done index outside the ring (nothing written back yet) is ignored.
+ */
+static unsigned int sse_spin_us = 100;
+module_param(sse_spin_us, uint, 0644);
+MODULE_PARM_DESC(sse_spin_us, "busy wait (us, at most 1000) on a full session command queue before refusing a command");
+#define NP6L_SSE_SPIN_MAX_US		1000
+#define NP6L_SSE_TIMEOUT_US		200000
+
+/* catch up with the done index (tx_lock) */
+static void fnp6l_cmdq_reap(struct fnp6l_ring *r)
+{
+	unsigned int hw = le32_to_cpu(READ_ONCE(r->wb[0])) & 0xffff;
+
+	if (hw < r->size)
+		r->head = hw;
+}
+
+enum { FNP6L_CMDQ_OK, FNP6L_CMDQ_STALLED, FNP6L_CMDQ_RESUMED };
+static DEFINE_RATELIMIT_STATE(fnp6l_cmdq_rs, 5 * HZ, 10);
+
+/* follow the done index (tx_lock, after fnp6l_cmdq_reap) */
+static int fnp6l_cmdq_watch(struct fnp6l *np, u64 now)
 {
 	struct fnp6l_ring *r = &np->cmdq;
-	unsigned int slot = np->cmd_slot++ % NP6L_SSE_CMD_SLOTS, i, hw = 0;
-	dma_addr_t dma = np->cmd_dma + slot * NP6L_SSE_CMD_BUF;
-	__le32 *d;
-	int ret;
+	int ev = FNP6L_CMDQ_OK;
+	u32 ms;
 
-	memcpy(np->cmd_buf + slot * NP6L_SSE_CMD_BUF, msg, len);
+	if (r->head != np->cmd_seen || r->head == r->tail) {
+		if (np->cmd_stalled) {
+			ms = div_u64(now - np->cmd_seen_ns, NSEC_PER_MSEC);
+			if (ms > np->sse_stall_max_ms)
+				np->sse_stall_max_ms = ms;
+			np->cmd_stalled = false;
+			ev = FNP6L_CMDQ_RESUMED;
+		}
+		np->cmd_seen = r->head;
+		np->cmd_seen_ns = now;
+	} else if (!np->cmd_stalled &&
+		   now - np->cmd_seen_ns > (u64)NP6L_SSE_TIMEOUT_US * NSEC_PER_USEC) {
+		np->cmd_stalled = true;
+		np->sse_tmo++;
+		ev = FNP6L_CMDQ_STALLED;
+	}
+	return ev;
+}
+
+/* a stall of the done index, with the queues the NP writes to the host */
+static void fnp6l_cmdq_report(struct fnp6l *np, int ev)
+{
+	struct fnp6l_ring *r = &np->cmdq;
+	unsigned int q;
+
+	if (ev == FNP6L_CMDQ_RESUMED) {
+		dev_info_ratelimited(np->dev, "sse: htxq%u commands taken again (stall up to %u ms)\n",
+				     NP6L_SSE_TXQ, np->sse_stall_max_ms);
+		return;
+	}
+	if (ev != FNP6L_CMDQ_STALLED || !__ratelimit(&fnp6l_cmdq_rs))
+		return;
+	dev_warn(np->dev, "sse: htxq%u command %u not taken (head %u tail %u) for %u ms: fetch %u done %u cmd_status %#x cmd_drops %#x\n",
+		 NP6L_SSE_TXQ, r->head, r->head, r->tail, NP6L_SSE_TIMEOUT_US / 1000,
+		 readl(r->regs + NP6L_Q_RING_FETCH), readl(r->regs + NP6L_Q_RING_DONE),
+		 fnp6l_rd(np, NP6L_SSE_CMD_STATUS), fnp6l_rd(np, NP6L_SSE_CMD_DROPS));
+	for_each_set_bit(q, &np->rx_mask, NP6L_NR_QUEUES)
+		dev_warn(np->dev, "sse: hrxq%u head %u fetch %u done %u, host at %u\n", q,
+			 readl(np->rx[q].regs + NP6L_Q_RING_HEAD),
+			 readl(np->rx[q].regs + NP6L_Q_RING_FETCH),
+			 readl(np->rx[q].regs + NP6L_Q_RING_DONE), np->rx[q].head);
+}
+
+/* whether the NP has yet to read command descriptor @idx, posted by us */
+static bool fnp6l_cmdq_pending(struct fnp6l *np, unsigned int idx)
+{
+	struct fnp6l_ring *r = &np->cmdq;
+	unsigned int used, pos;
+
 	spin_lock_bh(&np->tx_lock);
-	/* the command queue completes nothing else: catch up first */
-	r->head = le32_to_cpu(READ_ONCE(r->wb[0])) & 0xffff;
-	if (r->head >= r->size)
-		r->head = r->tail;
-	if (fnp6l_tx_free(r) < 1) {
+	fnp6l_cmdq_reap(r);
+	used = (r->tail + r->size - r->head) % r->size;
+	pos = (idx + r->size - r->head) % r->size;
+	spin_unlock_bh(&np->tx_lock);
+	return pos < used;
+}
+
+/* free command descriptors */
+static unsigned int fnp6l_cmdq_room(struct fnp6l *np)
+{
+	unsigned int n;
+
+	spin_lock_bh(&np->tx_lock);
+	fnp6l_cmdq_reap(&np->cmdq);
+	n = fnp6l_tx_free(&np->cmdq);
+	spin_unlock_bh(&np->tx_lock);
+	return n;
+}
+
+/* busy poll until the NP has read descriptor @idx: 0, or -EBUSY */
+static int fnp6l_sse_spin(struct fnp6l *np, unsigned int idx)
+{
+	unsigned int spin = min_t(unsigned int, READ_ONCE(sse_spin_us),
+				  NP6L_SSE_SPIN_MAX_US);
+	u64 t0 = ktime_get_ns();
+	bool pending;
+	int ret = -EBUSY;
+	u32 dt;
+
+	/* a zero timeout would never end the busy poll */
+	if (spin &&
+	    !read_poll_timeout_atomic(fnp6l_cmdq_pending, pending, !pending,
+				      1, spin, false, np, idx))
+		ret = 0;
+	dt = div_u64(ktime_get_ns() - t0, NSEC_PER_USEC);
+	np->sse_waits++;
+	np->sse_wait_us += dt;
+	if (dt > np->sse_wait_max_us)
+		np->sse_wait_max_us = dt;
+	return ret;
+}
+
+/* post one command; a full queue is polled once for its oldest command */
+static int fnp6l_sse_post(struct fnp6l *np, const u8 *msg, unsigned int len)
+{
+	struct fnp6l_ring *r = &np->cmdq;
+	unsigned int i, oldest;
+	bool spun = false;
+	dma_addr_t dma;
+	__le32 *d;
+	int ev;
+
+	if (WARN_ON_ONCE(r->size > NP6L_SSE_CMD_SLOTS || len > NP6L_SSE_CMD_BUF))
+		return -EINVAL;
+	for (;;) {
+		spin_lock_bh(&np->tx_lock);
+		fnp6l_cmdq_reap(r);
+		ev = fnp6l_cmdq_watch(np, ktime_get_ns());
+		if (fnp6l_tx_free(r) >= 1)
+			break;
+		oldest = r->head;
 		spin_unlock_bh(&np->tx_lock);
-		return -EBUSY;
+		fnp6l_cmdq_report(np, ev);
+		if (spun || fnp6l_sse_spin(np, oldest)) {
+			np->sse_full++;
+			return -EBUSY;
+		}
+		spun = true;
 	}
 	i = r->tail;
+	dma = np->cmd_dma + i * NP6L_SSE_CMD_BUF;
+	memcpy(np->cmd_buf + i * NP6L_SSE_CMD_BUF, msg, len);
 	d = &r->desc[4 * i];
 	r->skb[i] = NULL;
 	r->blen[i] = 0;		/* coherent buffer: nothing to unmap */
@@ -2271,18 +2553,17 @@ static int fnp6l_sse_cmd_send(struct fnp6l *np, const u8 *msg, unsigned int len)
 	wmb();
 	writel(r->tail, r->regs + NP6L_Q_RING_HEAD);
 	spin_unlock_bh(&np->tx_lock);
-
-	ret = read_poll_timeout(le32_to_cpu, hw, (hw & 0xffff) == r->tail,
-				1000, 200000, false, READ_ONCE(r->wb[0]));
-	if (ret)
-		dev_warn(np->dev, "sse: htxq%u done index %u, tail %u: command not taken\n",
-			 NP6L_SSE_TXQ, hw & 0xffff, r->tail);
-	return ret;
+	fnp6l_cmdq_report(np, ev);
+	np->sse_cmds++;
+	return 0;
 }
+
+static void fnp6l_dbg_cap_show(struct seq_file *m, struct fnp6l *np);
 
 static int fnp6l_dbg_sse_show(struct seq_file *m, void *unused)
 {
 	struct fnp6l *np = m->private;
+	unsigned int t;
 	u32 off;
 
 	seq_printf(m, "initialised %d\n", np->sse_done);
@@ -2295,6 +2576,30 @@ static int fnp6l_dbg_sse_show(struct seq_file *m, void *unused)
 	seq_printf(m, "ft flows %u qsent %lu qreply %lu qmatch %lu qchange %lu qdrop %lu qoff %d\n",
 		   np->ft_nflows, np->ft_qsent, np->ft_qreply, np->ft_qmatch,
 		   np->ft_qchange, np->ft_qdrop, np->ft_qoff);
+	seq_printf(m, "sse cmds %lu waits %lu wait_us %llu max_us %u sleeps %lu full %lu tmo %lu spin_us %u stall_ms %u qskip %lu slots %u\n",
+		   np->sse_cmds, np->sse_waits, np->sse_wait_us,
+		   np->sse_wait_max_us, np->sse_sleeps, np->sse_full,
+		   np->sse_tmo, READ_ONCE(sse_spin_us), np->sse_stall_max_ms,
+		   np->sse_qskip, np->cmdq.size);
+	seq_printf(m, "ft dead %u delfail %lu dfree %lu lagfail %lu\n",
+		   np->ft_ndead, np->ft_delfail, np->ft_dfree, np->ft_lagfail);
+	/* messages by header byte 0 (3:0); the last one no query matched */
+	seq_printf(m, "ft msg nomatch %lu", np->ft_qnomatch);
+	for (t = 0; t < NP6L_FT_MSGTYPES; t++)
+		if (np->ft_msgtype[t])
+			seq_printf(m, " t%x %lu", t, np->ft_msgtype[t]);
+	seq_printf(m, " last %*phN\n", np->ft_msghdr_len, np->ft_msghdr);
+	/* cookies answered without the command lock, inserts refused to keep
+	 * room for deletes, unmatched messages carrying a deleted key, messages
+	 * by header byte 1 */
+	seq_printf(m, "ft gate unk_destroy %lu unk_stats %lu iskip %lu nomatch_del %lu",
+		   np->ft_unk_destroy, np->ft_unk_stats, np->sse_iskip,
+		   np->ft_qnomatch_del);
+	for (t = 0; t < NP6L_FT_MSGTYPES; t++)
+		if (np->ft_msgop[t])
+			seq_printf(m, " op%x %lu", t, np->ft_msgop[t]);
+	seq_putc(m, '\n');
+	fnp6l_dbg_cap_show(m, np);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(fnp6l_dbg_sse);
@@ -2456,10 +2761,89 @@ DEFINE_SHOW_ATTRIBUTE(fnp6l_dbg_class);
  */
 #define NP6L_FT_HOSTQ			3		/* ignored with a port output */
 #define NP6L_FT_ENTRY_TIMEOUT		2000		/* entry_timeout; the driver deletes entries itself */
-/* 8192 by default; the PHT has 512 Ki buckets and the OFT 640 Ki more */
-static unsigned int max_flows = 8192;
+/*
+ * Limits of the offload; a flow refused stays in the software flow table,
+ * which offers it again at its next refresh.
+ *
+ * The engine: it refuses an insert once its OFT has no free bucket left (a
+ * session goes to the OFT when its PHT bucket is taken; measured: about
+ * 1.13 million sessions with the full tables, IPv4 and IPv6 alike). A new
+ * flow is admitted while the OFT free count, less the sessions posted since
+ * it was read, stays at or above oft_min_free: 512 = the command queue (64)
+ * times the sessions of a flow (up to 8), what may still be on its way when
+ * the count is read. The count is read at most every oft_poll_ms, and again
+ * at once (at most once a tick) when the estimate comes near the threshold.
+ *
+ * The host: every offloaded flow costs activity queries and their replies
+ * (STATS); with the indexes sized at probe (ft_hash_bits), that cost grows
+ * linearly with the number of flows (measured on the 60E: about a fifth of
+ * the four cores at 131072 flows, where the software flow table spent a few
+ * percent). host_guard_flows bounds the flows offloaded at once (one flow =
+ * one direction of a connection, 131072 = 65536 connections); beyond it, new
+ * flows stay in the software flow table; 0 removes the bound.
+ *
+ * max_flows: a fixed bound as well, offloaded plus undeleted flows; 0 (the
+ * default) = none.
+ */
+static unsigned int max_flows;
 module_param(max_flows, uint, 0644);
-MODULE_PARM_DESC(max_flows, "most flows offloaded at once (then left to the software flow table)");
+MODULE_PARM_DESC(max_flows, "most flows offloaded at once, undeleted ones included (0: no fixed bound, the default)");
+static unsigned int oft_min_free = 512;
+module_param(oft_min_free, uint, 0644);
+MODULE_PARM_DESC(oft_min_free, "new flows admitted while this many OFT buckets stay free (default 512; 0: no check, refusals of the engine handled after the fact)");
+static unsigned int oft_poll_ms = 100;
+module_param(oft_poll_ms, uint, 0644);
+MODULE_PARM_DESC(oft_poll_ms, "interval (ms) between two reads of the OFT free count and of the insert counters (default 100)");
+static unsigned int host_guard_flows = 131072;
+module_param(host_guard_flows, uint, 0644);
+MODULE_PARM_DESC(host_guard_flows, "most flows (directions) offloaded at once, for the host cost of their activity queries (default 131072 = 65536 connections; 0: no bound)");
+
+/*
+ * debugfs sse, lines "cap". Admission: OFT free count last read, sessions
+ * posted since, its age, the bounds, offers refused by cause (OFT, host
+ * guard, max_flows). Engine: table sizes, insert gap at the last drained
+ * sample, refusals counted (two samples), not yet matched to a flow, query
+ * replies that found no session, flows (and their sessions) given back to
+ * the software flow table; then the flows given back still remembered,
+ * offers of them refused, admitted again, deletes not posted for refused
+ * sessions, offers refused on a key still held by a live flow.
+ */
+static void fnp6l_dbg_cap_show(struct seq_file *m, struct fnp6l *np)
+{
+	seq_printf(m, "cap admit flows %u oft_free %u posted %u age_ms %u reads %lu min_free %u guard %u max %u ref_oft %ld ref_guard %ld ref_max %ld\n",
+		   np->ft_nflows, READ_ONCE(np->oft_free), READ_ONCE(np->oft_posted),
+		   np->oft_valid ? jiffies_to_msecs(jiffies - READ_ONCE(np->oft_j)) : 0,
+		   np->oft_reads, READ_ONCE(oft_min_free), READ_ONCE(host_guard_flows),
+		   READ_ONCE(max_flows), atomic_long_read(&np->ft_ref_oft),
+		   atomic_long_read(&np->ft_ref_guard), atomic_long_read(&np->ft_ref_max));
+	seq_printf(m, "cap np tables %u/%u gap %u refused %u credit %u qmiss %lu back %lu back_sess %lu back_live %u ref_back %ld back_again %lu del_skip %lu keybusy %lu\n",
+		   np->sse_pht_n, np->sse_oft_n, np->ins_gap_last, np->np_refused,
+		   np->np_credit, np->ft_qmiss, np->ft_back, np->ft_back_sess,
+		   READ_ONCE(np->ft_nback), atomic_long_read(&np->ft_ref_back),
+		   np->ft_back_again, np->ft_del_skip, np->ft_keybusy);
+	seq_printf(m, "cap stats fast %lu slow %lu index %u\n",
+		   READ_ONCE(np->ft_sfast), READ_ONCE(np->ft_sslow),
+		   1U << np->ft_hbits);
+}
+
+/*
+ * Activity queries: the sessions of a flow at most every ft_stats_ms. The
+ * flow table asks for the stats of a flow at each pass (once a second) once
+ * its timeout has run below nine tenths: a busy flow is seen at most
+ * ft_stats_ms late, well within its timeout (30 s), an idle one expires at
+ * most that much later.
+ */
+static unsigned int ft_stats_ms = 2000;
+module_param(ft_stats_ms, uint, 0644);
+MODULE_PARM_DESC(ft_stats_ms, "least interval (ms) between two activity queries of a flow (default 2000)");
+/*
+ * UDP flows: left to the software flow table by default (a stall of the
+ * host delivery was seen under offloaded UDP); 1 offloads new UDP flows.
+ */
+static bool ft_udp;
+module_param(ft_udp, bool, 0644);
+MODULE_PARM_DESC(ft_udp, "offload UDP flows (default 0: new UDP flows stay in the software flow table; 1: offloaded; flows already offloaded stay)");
+#define NP6L_FT_MSG_QUERY		1	/* header byte 1 of a query reply */
 #define NP6L_FT_STATS_OFF		24	/* activity counters: what a hit moves */
 #define NP6L_FT_STATS_LEN		32
 #define NP6L_FT_KEYS			(BIT_ULL(FLOW_DISSECTOR_KEY_META) |		\
@@ -2472,8 +2856,12 @@ MODULE_PARM_DESC(max_flows, "most flows offloaded at once (then left to the soft
 			 BIT_ULL(FLOW_DISSECTOR_KEY_VLAN))
 
 struct fnp6l_ft_flow {
-	struct list_head node;
+	struct list_head node;		/* np->ft_flows, or np->ft_dead */
+	struct hlist_node cnode;	/* np->ft_chash, by cookie (live flows) */
 	unsigned long cookie;
+	bool hw_bad;		/* sessions not all in the engine: insert again */
+	/* block of the flow table that offered it: compared, never followed */
+	const struct flow_block *table;
 	__be32 sip, dip;
 	__be16 sport, dport;
 	u8 proto;
@@ -2494,7 +2882,29 @@ struct fnp6l_ft_flow {
 		u8 key[NP6L_SSE_KEY4_LEN];
 		u8 snap[NP6L_FT_STATS_LEN];
 		bool snap_ok;
+		bool missing;		/* a query found no such session */
+		bool refused;		/* missing, matched to a refusal: never deleted */
 	} s[NP6L_SW_PORTS];
+	unsigned int nback;	/* times given back before (fnp6l_ft_back_take) */
+};
+
+/*
+ * A flow given back to the software flow table (fnp6l_ft_stats): the flow
+ * table goes on offering it (a REPLACE at each refresh, once a second while
+ * it runs in software) until its DESTROY. Remembered by cookie until then,
+ * so that it is offered to the engine again only once the engine has room
+ * for it and not before @until: without that, with oft_min_free 0, every
+ * flow given back was inserted again at once, refused, given back, in a
+ * loop (about 1 000 refusals a second at 8 192 connections, as measured).
+ */
+struct fnp6l_ft_back {
+	struct hlist_node cnode;	/* np->ft_bhash (ft_sess_lock) */
+	struct list_head node;		/* np->ft_backl (ft_sess_lock) */
+	unsigned long cookie;
+	const struct flow_block *table;	/* compared, never followed */
+	unsigned long until;		/* jiffies: no offer before */
+	unsigned int n;			/* sessions of the flow */
+	unsigned int nback;		/* times given back */
 };
 
 /*
@@ -2746,7 +3156,7 @@ static int fnp6l_ft_cmd6(struct fnp6l *np, bool insert, u8 proto, __be32 sip,
 	msg[0] = 0x80 | (insert ? NP6L_SSE_CMD_INSERT : NP6L_SSE_CMD_DELETE);
 	msg[1] = (8 + len) / 8;
 	msg[3] = NP6L_SSE_TXQ;
-	return fnp6l_sse_cmd_send(np, msg, 8 + len);
+	return fnp6l_sse_post(np, msg, 8 + len);
 }
 
 static int fnp6l_ft_fcmd(struct fnp6l *np, bool insert, struct fnp6l_ft_flow *f,
@@ -2757,17 +3167,23 @@ static int fnp6l_ft_fcmd(struct fnp6l *np, bool insert, struct fnp6l_ft_flow *f,
 			     f->v6 ? f->a6 : NULL);
 }
 
-/* delete every session of a tracked flow (one per ingress LIF) */
+/*
+ * Delete every session of a tracked flow (one per ingress LIF): post the
+ * deletes (fnp6l_sse_post: the queue is read in order and no buffer is
+ * reused before it is read; a later insert of the same key is read after
+ * them). A post refused means a full queue: the next ones are not tried.
+ * A session the engine refused (refused, see fnp6l_ft_mark_refused) is
+ * not in the engine: no delete, it would only fail. Non-zero: the
+ * sessions may still be in the engine.
+ */
 static int fnp6l_ft_del(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 {
 	unsigned int i;
-	int ret = 0, r;
+	int ret = 0;
 
-	for (i = 0; i < flow->n_in_lif; i++) {
-		r = fnp6l_ft_fcmd(np, false, flow, i, NULL);
-		if (r && !ret)
-			ret = r;
-	}
+	for (i = 0; i < flow->n_in_lif && !ret; i++)
+		if (!flow->s[i].refused)
+			ret = fnp6l_ft_fcmd(np, false, flow, i, NULL);
 	return ret;
 }
 
@@ -2775,19 +3191,74 @@ static struct fnp6l_ft_flow *fnp6l_ft_find(struct fnp6l *np, unsigned long cooki
 {
 	struct fnp6l_ft_flow *flow;
 
-	list_for_each_entry(flow, &np->ft_flows, node)
+	hlist_for_each_entry(flow, &np->ft_chash[hash_long(cookie, np->ft_hbits)],
+			     cnode)
 		if (flow->cookie == cookie)
 			return flow;
 	return NULL;
 }
 
-static unsigned int fnp6l_ft_khash(const u8 *key)
+/*
+ * A live flow: on the list and indexed by cookie (fnp6l_sse_lock). The
+ * cookie index is changed under ft_sess_lock too: fnp6l_ft_known reads it
+ * under that lock alone.
+ */
+static void fnp6l_ft_link(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 {
-	return jhash(key, NP6L_SSE_KEY4_LEN, 0) % NP6L_FT_HASH;
+	spin_lock_bh(&np->ft_sess_lock);
+	hlist_add_head(&flow->cnode,
+		       &np->ft_chash[hash_long(flow->cookie, np->ft_hbits)]);
+	spin_unlock_bh(&np->ft_sess_lock);
+	list_add(&flow->node, &np->ft_flows);
+	np->ft_nflows++;
 }
 
-/* index the session keys of a flow for the query replies (fnp6l_sse_lock) */
-static void fnp6l_ft_hash_add(struct fnp6l *np, struct fnp6l_ft_flow *flow)
+static unsigned int fnp6l_ft_khash(const struct fnp6l *np, const u8 *key)
+{
+	return jhash(key, NP6L_SSE_KEY4_LEN, 0) & ((1U << np->ft_hbits) - 1);
+}
+
+static unsigned int ft_hash_bits = NP6L_FT_HBITS_DEF;
+module_param(ft_hash_bits, uint, 0444);
+MODULE_PARM_DESC(ft_hash_bits, "log2 of the buckets of the flow and session indexes, read at probe (11 to 20, default 16)");
+
+static void fnp6l_ft_index_free(void *data)
+{
+	struct fnp6l *np = data;
+
+	kvfree(np->ft_hash);
+	kvfree(np->ft_chash);
+	np->ft_hash = NULL;
+	np->ft_chash = NULL;
+}
+
+/*
+ * Both indexes, empty (a zeroed hlist_head is an empty bucket); a smaller
+ * size is tried should memory be short. 0, or -ENOMEM.
+ */
+static int fnp6l_ft_index_alloc(struct fnp6l *np)
+{
+	unsigned int want = clamp_t(unsigned int, READ_ONCE(ft_hash_bits),
+				    NP6L_FT_HBITS_MIN, NP6L_FT_HBITS_MAX);
+	unsigned int bits;
+
+	for (bits = want; bits >= NP6L_FT_HBITS_MIN; bits--) {
+		np->ft_hash = kvcalloc(1U << bits, sizeof(*np->ft_hash), GFP_KERNEL);
+		np->ft_chash = kvcalloc(1U << bits, sizeof(*np->ft_chash), GFP_KERNEL);
+		if (np->ft_hash && np->ft_chash)
+			break;
+		fnp6l_ft_index_free(np);
+	}
+	if (!np->ft_hash)
+		return -ENOMEM;
+	np->ft_hbits = bits;
+	if (bits != want)
+		dev_warn(np->dev, "ft: indexes reduced to %u buckets\n", 1U << bits);
+	return devm_add_action_or_reset(np->dev, fnp6l_ft_index_free, np);
+}
+
+/* the session keys of a flow, as a query reply carries them */
+static void fnp6l_ft_keys(struct fnp6l_ft_flow *flow)
 {
 	unsigned int i;
 
@@ -2800,26 +3271,494 @@ static void fnp6l_ft_hash_add(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 				 0, 0, NULL);
 		if (flow->v6)
 			s->key[15] |= 0x40;	/* KEY_TAGGED: IPv6 session */
-		s->flow = flow;
-		s->snap_ok = false;
-		hlist_add_head(&s->hn, &np->ft_hash[fnp6l_ft_khash(s->key)]);
 	}
 }
 
-static void fnp6l_ft_unhash(struct fnp6l_ft_flow *flow)
+/*
+ * Index the session keys of a flow (fnp6l_ft_keys) for the query replies.
+ * ft_sess_lock, not fnp6l_sse_lock, guards the index: fnp6l_rx_msg reads
+ * it in NAPI context, and a flow is freed only once out of it.
+ */
+static void fnp6l_ft_hash_add(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 {
 	unsigned int i;
 
-	for (i = 0; i < NP6L_SW_PORTS; i++)
-		if (!hlist_unhashed(&flow->s[i].hn))
-			hlist_del_init(&flow->s[i].hn);
+	spin_lock_bh(&np->ft_sess_lock);
+	for (i = 0; i < flow->n_in_lif; i++) {
+		struct fnp6l_ft_sess *s = &flow->s[i];
+
+		s->flow = flow;
+		s->snap_ok = false;
+		hlist_add_head(&s->hn, &np->ft_hash[fnp6l_ft_khash(np, s->key)]);
+	}
+	spin_unlock_bh(&np->ft_sess_lock);
+}
+
+/* off the key and cookie indexes; its session keys kept as deleted */
+static void fnp6l_ft_unhash(struct fnp6l *np, struct fnp6l_ft_flow *flow)
+{
+	unsigned int i;
+
+	spin_lock_bh(&np->ft_sess_lock);
+	hlist_del_init(&flow->cnode);
+	for (i = 0; i < NP6L_SW_PORTS; i++) {
+		if (hlist_unhashed(&flow->s[i].hn))
+			continue;
+		hlist_del_init(&flow->s[i].hn);
+		memcpy(np->ft_delkey[np->ft_ndelkey++ % NP6L_FT_DELKEYS],
+		       flow->s[i].key, sizeof(np->ft_delkey[0]));
+	}
+	spin_unlock_bh(&np->ft_sess_lock);
+}
+
+/* a live flow leaves: off the list, the cookie index and the key index */
+static void fnp6l_ft_unlink(struct fnp6l *np, struct fnp6l_ft_flow *flow)
+{
+	list_del(&flow->node);
+	np->ft_nflows--;
+	fnp6l_ft_unhash(np, flow);
+}
+
+/*
+ * A flow whose sessions could not be deleted stays counted (it holds
+ * engine entries) on ft_dead, deleted again by fnp6l_ft_dead_work, and no
+ * new flow with one of its keys is inserted until then.
+ */
+static void fnp6l_ft_bury(struct fnp6l *np, struct fnp6l_ft_flow *flow)
+{
+	list_add_tail(&flow->node, &np->ft_dead);
+	np->ft_ndead++;
+	np->ft_delfail++;
+	dev_warn_ratelimited(np->dev, "ft: %u flow(s) not deleted, retried\n",
+			     np->ft_ndead);
+	schedule_delayed_work(&np->ft_dead_work,
+			      msecs_to_jiffies(NP6L_FT_DEAD_RETRY_MS));
+}
+
+/* delete then free a flow already unlinked, or bury it (fnp6l_sse_lock) */
+static void fnp6l_ft_drop(struct fnp6l *np, struct fnp6l_ft_flow *flow)
+{
+	if (np->ft_on && np->sse_done && fnp6l_ft_del(np, flow)) {
+		fnp6l_ft_bury(np, flow);
+		return;
+	}
+	kfree(flow);
+}
+
+/* try the dead flows again; how many remain (fnp6l_sse_lock) */
+static unsigned int fnp6l_ft_dead_retry(struct fnp6l *np)
+{
+	struct fnp6l_ft_flow *flow, *tmp;
+
+	list_for_each_entry_safe(flow, tmp, &np->ft_dead, node) {
+		if (np->ft_on && np->sse_done && fnp6l_ft_del(np, flow))
+			break;		/* queue still full: later */
+		list_del(&flow->node);
+		np->ft_ndead--;
+		np->ft_dfree++;
+		kfree(flow);
+	}
+	return np->ft_ndead;
+}
+
+/* whether a dead flow still holds one of the keys of @fl */
+static bool fnp6l_ft_dead_key(struct fnp6l *np, const struct fnp6l_ft_flow *fl)
+{
+	const struct fnp6l_ft_flow *d;
+	unsigned int i, j;
+
+	list_for_each_entry(d, &np->ft_dead, node)
+		for (i = 0; i < d->n_in_lif; i++)
+			for (j = 0; j < fl->n_in_lif && !d->s[i].refused; j++)
+				if (!memcmp(d->s[i].key, fl->s[j].key,
+					    NP6L_SSE_KEY4_LEN) &&
+				    (!fl->v6 || !memcmp(d->a6, fl->a6, sizeof(fl->a6))))
+					return true;
+	return false;
+}
+
+static void fnp6l_ft_dead_work(struct work_struct *work)
+{
+	struct fnp6l *np = container_of(to_delayed_work(work), struct fnp6l,
+					ft_dead_work);
+	unsigned int left;
+
+	mutex_lock(&fnp6l_sse_lock);
+	left = fnp6l_ft_dead_retry(np);
+	mutex_unlock(&fnp6l_sse_lock);
+	if (left)
+		schedule_delayed_work(&np->ft_dead_work,
+				      msecs_to_jiffies(NP6L_FT_DEAD_RETRY_MS));
+}
+
+/*
+ * Whether @cookie is one of our flows, under ft_sess_lock alone; counted in
+ * *unknown otherwise. Every flow of a flow table with the offload flag gets
+ * DESTROY (and STATS) work, also those we refused: answered here without
+ * taking fnp6l_sse_lock. A REPLACE and a DESTROY of one flow never run at
+ * the same time (the flow table's pending bit), so a cookie unknown here is
+ * not being inserted.
+ */
+static bool fnp6l_ft_known(struct fnp6l *np, unsigned long cookie,
+			   unsigned long *unknown)
+{
+	bool known;
+
+	spin_lock_bh(&np->ft_sess_lock);
+	known = fnp6l_ft_find(np, cookie);
+	if (!known)
+		(*unknown)++;
+	spin_unlock_bh(&np->ft_sess_lock);
+	return known;
+}
+
+/* whether the NP has read every command posted (or none was ever posted) */
+static bool fnp6l_cmdq_idle(struct fnp6l *np)
+{
+	struct fnp6l_ring *r = &np->cmdq;
+	bool idle;
+
+	if (!np->cmd_buf)
+		return true;
+	spin_lock_bh(&np->tx_lock);
+	fnp6l_cmdq_reap(r);
+	idle = r->head == r->tail;
+	spin_unlock_bh(&np->tx_lock);
+	return idle;
+}
+
+static unsigned long fnp6l_ft_poll_jiffies(void)
+{
+	return max_t(unsigned long, 1, msecs_to_jiffies(READ_ONCE(oft_poll_ms)));
+}
+
+/*
+ * Read the OFT free count (fnp6l_sse_lock): every oft_poll_ms, or at once
+ * when @force (at most once a tick). Then, every oft_poll_ms and only with
+ * the command queue drained, the insert counters. The gap INSERTS -
+ * INSERTS_OK at one instant also holds the inserts the engine has taken
+ * but not completed: never read as refusals. An insert counted in INSERTS
+ * at one sample is completed by the next, at least oft_poll_ms later (the
+ * engine takes microseconds): the inserts refused are at least INSERTS at
+ * the previous sample less INSERTS_OK now (less the gap at engine init),
+ * exactly that once no insert came in between; np_refused only grows to
+ * that bound. The interrupt status bits are not used.
+ */
+static void fnp6l_ft_cap_read(struct fnp6l *np, bool force)
+{
+	unsigned long now = jiffies, poll = fnp6l_ft_poll_jiffies();
+	u32 ok, ins, gap, sure;
+
+	if (!np->sse_done)
+		return;
+	if (!np->oft_valid || time_after_eq(now, np->oft_j + poll) ||
+	    (force && np->oft_j != now)) {
+		WRITE_ONCE(np->oft_free, fnp6l_rd(np, NP6L_SSE_OFT_FREE));
+		WRITE_ONCE(np->oft_posted, 0);
+		WRITE_ONCE(np->oft_j, now);
+		WRITE_ONCE(np->oft_valid, true);
+		np->oft_reads++;
+	}
+	if (np->ins_gap_have && time_before(now, np->ins_gap_j + poll))
+		return;
+	if (!fnp6l_cmdq_idle(np))
+		return;		/* commands on their way: at the next call */
+	ok = fnp6l_rd(np, NP6L_SSE_INSERTS_OK);	/* first: never ahead of INSERTS */
+	ins = fnp6l_rd(np, NP6L_SSE_INSERTS);
+	gap = ins - ok - np->ins_gap0;
+	if (np->ins_gap_have) {
+		sure = np->ins_last - ok - np->ins_gap0;
+		if ((s32)sure > (s32)np->np_refused) {
+			np->np_credit += sure - np->np_refused;
+			np->np_refused = sure;
+		}
+	}
+	np->ins_last = ins;
+	np->ins_gap_last = (s32)gap > 0 ? gap : 0;
+	np->ins_gap_j = now;
+	np->ins_gap_have = true;
+}
+
+/* whether @n more sessions would leave fewer than @min_free OFT buckets */
+static bool fnp6l_ft_oft_short(struct fnp6l *np, unsigned int n,
+			       unsigned int min_free)
+{
+	return READ_ONCE(np->oft_free) <
+	       (u64)READ_ONCE(np->oft_posted) + n + min_free;
+}
+
+/*
+ * Whether a new flow of @n sessions may be offloaded: 0, or -ENOSPC counted
+ * by cause (each offer refused counts: a flow is offered again at each
+ * refresh). Under fnp6l_sse_lock, or @early: without it, before the flow is
+ * parsed, on values read once; the OFT is then only judged on a count read
+ * less than oft_poll_ms ago (an older one is read again under the lock).
+ */
+static int fnp6l_ft_admit(struct fnp6l *np, unsigned int n, bool early)
+{
+	unsigned int flows = READ_ONCE(np->ft_nflows);
+	unsigned int max = READ_ONCE(max_flows);
+	unsigned int guard = READ_ONCE(host_guard_flows);
+	unsigned int min_free = READ_ONCE(oft_min_free);
+
+	if (max && flows + READ_ONCE(np->ft_ndead) >= max) {
+		atomic_long_inc(&np->ft_ref_max);
+		return -ENOSPC;
+	}
+	if (guard && flows >= guard) {
+		atomic_long_inc(&np->ft_ref_guard);
+		return -ENOSPC;
+	}
+	if (!min_free || !READ_ONCE(np->sse_done))
+		return 0;
+	if (early) {
+		if (!READ_ONCE(np->oft_valid) ||
+		    time_after_eq(jiffies, READ_ONCE(np->oft_j) + fnp6l_ft_poll_jiffies()))
+			return 0;
+	} else {
+		fnp6l_ft_cap_read(np, false);
+		if (fnp6l_ft_oft_short(np, n, min_free))
+			fnp6l_ft_cap_read(np, true);	/* the estimate only falls */
+	}
+	if (fnp6l_ft_oft_short(np, n, min_free)) {
+		atomic_long_inc(&np->ft_ref_oft);
+		return -ENOSPC;
+	}
+	return 0;
+}
+
+/* sessions of @flow a query found missing from the engine */
+static unsigned int fnp6l_ft_missing(const struct fnp6l_ft_flow *flow)
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; i < flow->n_in_lif; i++)
+		n += READ_ONCE(flow->s[i].missing);
+	return n;
+}
+
+/*
+ * Sessions of @flow a query found missing, matched to the refusals counted
+ * from the insert counters (np_credit), at most np_credit of them: marked
+ * refused, so that no delete is posted for them (fnp6l_ft_del): the engine
+ * never held them, a delete would only fail (DELETES - DELETES_OK). A
+ * session found missing with no refusal left to match is deleted as
+ * before. How many were marked (fnp6l_sse_lock).
+ */
+static unsigned int fnp6l_ft_mark_refused(struct fnp6l *np,
+					  struct fnp6l_ft_flow *flow)
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; i < flow->n_in_lif && n < np->np_credit; i++) {
+		if (!READ_ONCE(flow->s[i].missing) || flow->s[i].refused)
+			continue;
+		flow->s[i].refused = true;
+		n++;
+	}
+	np->np_credit -= n;
+	np->ft_del_skip += n;
+	return n;
+}
+
+/*
+ * Whether a live flow already holds one of the session keys of @fl (keys
+ * set by fnp6l_ft_keys), IPv6 address words 1-3 compared too: see
+ * fnp6l_ft_replace (fnp6l_sse_lock).
+ */
+static bool fnp6l_ft_key_busy(struct fnp6l *np, const struct fnp6l_ft_flow *fl)
+{
+	const struct fnp6l_ft_sess *s;
+	bool busy = false;
+	unsigned int i;
+
+	spin_lock_bh(&np->ft_sess_lock);
+	for (i = 0; i < fl->n_in_lif && !busy; i++)
+		hlist_for_each_entry(s, &np->ft_hash[fnp6l_ft_khash(np, fl->s[i].key)], hn)
+			if (!memcmp(s->key, fl->s[i].key, NP6L_SSE_KEY4_LEN) &&
+			    (!fl->v6 || !memcmp(s->flow->a6, fl->a6, sizeof(fl->a6)))) {
+				busy = true;
+				break;
+			}
+	spin_unlock_bh(&np->ft_sess_lock);
+	return busy;
+}
+
+static struct hlist_head *fnp6l_ft_bhead(struct fnp6l *np, unsigned long cookie)
+{
+	return &np->ft_bhash[hash_long(cookie, NP6L_FT_BHASH_BITS)];
+}
+
+/* the flow given back with @cookie, or NULL (ft_sess_lock) */
+static struct fnp6l_ft_back *fnp6l_ft_back_find(struct fnp6l *np,
+						unsigned long cookie)
+{
+	struct fnp6l_ft_back *b;
+
+	hlist_for_each_entry(b, fnp6l_ft_bhead(np, cookie), cnode)
+		if (b->cookie == cookie)
+			return b;
+	return NULL;
+}
+
+/* delay before the next offer of a flow given back @nback times */
+static unsigned long fnp6l_ft_back_delay(unsigned int nback)
+{
+	return msecs_to_jiffies(NP6L_FT_BACK_MS <<
+				min_t(unsigned int, nback ? nback - 1 : 0,
+				      NP6L_FT_BACK_SHIFT_MAX));
+}
+
+/* off the index (ft_sess_lock); the caller frees it */
+static void fnp6l_ft_back_unlink(struct fnp6l *np, struct fnp6l_ft_back *b)
+{
+	hlist_del_init(&b->cnode);
+	list_del(&b->node);
+	WRITE_ONCE(np->ft_nback, np->ft_nback - 1);
+}
+
+/*
+ * @flow (unlinked, cookie set) given back to the software flow table:
+ * remembered until its DESTROY, its next offer not before NP6L_FT_BACK_MS,
+ * doubled at each give-back of the same flow up to 64 s (the flow table
+ * offers it once a second: a refusal there costs one look-up). Without
+ * memory for it, it is offered again as any new flow (fnp6l_sse_lock).
+ */
+static void fnp6l_ft_back_add(struct fnp6l *np, const struct fnp6l_ft_flow *flow)
+{
+	struct fnp6l_ft_back *b = kzalloc(sizeof(*b), GFP_KERNEL);
+
+	if (!b)
+		return;
+	b->cookie = flow->cookie;
+	b->table = flow->table;
+	b->n = flow->n_in_lif;
+	b->nback = flow->nback + 1;
+	b->until = jiffies + fnp6l_ft_back_delay(b->nback);
+	spin_lock_bh(&np->ft_sess_lock);
+	hlist_add_head(&b->cnode, fnp6l_ft_bhead(np, b->cookie));
+	list_add(&b->node, &np->ft_backl);
+	WRITE_ONCE(np->ft_nback, np->ft_nback + 1);
+	spin_unlock_bh(&np->ft_sess_lock);
+}
+
+/*
+ * Whether the flow of @cookie, if given back, may be offered to the engine
+ * again now: 0, or -ENOSPC (counted) before its delay, or while the OFT
+ * free count, less the sessions posted since its read, leaves no room for
+ * its sessions, whatever oft_min_free (0 included: what stops the loop of
+ * a flow inserted, refused and given back). @early: without
+ * fnp6l_sse_lock, before the parse, the OFT judged on a count read less
+ * than oft_poll_ms ago only; under the lock the count is read again when
+ * short, and a refusal on it puts the next offer one delay later.
+ */
+static int fnp6l_ft_back_check(struct fnp6l *np, unsigned long cookie,
+			       bool early)
+{
+	struct fnp6l_ft_back *b;
+	unsigned int n = 0;
+	int ret = 0;
+
+	if (!READ_ONCE(np->ft_nback))
+		return 0;
+	spin_lock_bh(&np->ft_sess_lock);
+	b = fnp6l_ft_back_find(np, cookie);
+	if (b) {
+		n = b->n;
+		if (time_before(jiffies, b->until))
+			ret = -ENOSPC;
+	}
+	spin_unlock_bh(&np->ft_sess_lock);
+	if (!b)
+		return 0;
+	if (!ret && READ_ONCE(np->sse_done)) {
+		if (early) {
+			if (READ_ONCE(np->oft_valid) &&
+			    time_before(jiffies, READ_ONCE(np->oft_j) +
+					fnp6l_ft_poll_jiffies()) &&
+			    fnp6l_ft_oft_short(np, n, 0))
+				ret = -ENOSPC;
+		} else {
+			fnp6l_ft_cap_read(np, false);
+			if (fnp6l_ft_oft_short(np, n, 0))
+				fnp6l_ft_cap_read(np, true);
+			if (fnp6l_ft_oft_short(np, n, 0)) {
+				ret = -ENOSPC;
+				spin_lock_bh(&np->ft_sess_lock);
+				b = fnp6l_ft_back_find(np, cookie);
+				if (b)
+					b->until = jiffies + fnp6l_ft_back_delay(b->nback);
+				spin_unlock_bh(&np->ft_sess_lock);
+			}
+		}
+	}
+	if (ret)
+		atomic_long_inc(&np->ft_ref_back);
+	return ret;
+}
+
+/* @flow (cookie set) inserted: no longer a flow given back (fnp6l_sse_lock) */
+static void fnp6l_ft_back_take(struct fnp6l *np, struct fnp6l_ft_flow *flow)
+{
+	struct fnp6l_ft_back *b;
+
+	if (!READ_ONCE(np->ft_nback))
+		return;
+	spin_lock_bh(&np->ft_sess_lock);
+	b = fnp6l_ft_back_find(np, flow->cookie);
+	if (b) {
+		flow->nback = b->nback;
+		fnp6l_ft_back_unlink(np, b);
+	}
+	spin_unlock_bh(&np->ft_sess_lock);
+	if (b) {
+		np->ft_back_again++;
+		kfree(b);
+	}
+}
+
+/* DESTROY of a flow given back: forgotten; whether it was one */
+static bool fnp6l_ft_back_forget(struct fnp6l *np, unsigned long cookie)
+{
+	struct fnp6l_ft_back *b;
+
+	if (!READ_ONCE(np->ft_nback))
+		return false;
+	spin_lock_bh(&np->ft_sess_lock);
+	b = fnp6l_ft_back_find(np, cookie);
+	if (b)
+		fnp6l_ft_back_unlink(np, b);
+	spin_unlock_bh(&np->ft_sess_lock);
+	if (!b)
+		return false;
+	kfree(b);
+	return true;
+}
+
+/* the flows given back by flow table @table: forgotten (it leaves the port) */
+static void fnp6l_ft_back_forget_table(struct fnp6l *np,
+				       const struct flow_block *table)
+{
+	struct fnp6l_ft_back *b, *tmp;
+	LIST_HEAD(gone);
+
+	spin_lock_bh(&np->ft_sess_lock);
+	list_for_each_entry_safe(b, tmp, &np->ft_backl, node) {
+		if (b->table != table)
+			continue;
+		fnp6l_ft_back_unlink(np, b);
+		list_add(&b->node, &gone);
+	}
+	spin_unlock_bh(&np->ft_sess_lock);
+	list_for_each_entry_safe(b, tmp, &gone, node)
+		kfree(b);
 }
 
 static struct fnp6l_ft_sess *fnp6l_ft_sess_find(struct fnp6l *np, const u8 *key)
 {
 	struct fnp6l_ft_sess *s;
 
-	hlist_for_each_entry(s, &np->ft_hash[fnp6l_ft_khash(key)], hn)
+	hlist_for_each_entry(s, &np->ft_hash[fnp6l_ft_khash(np, key)], hn)
 		if (!memcmp(s->key, key, NP6L_SSE_KEY4_LEN))
 			return s;
 	return NULL;
@@ -2850,85 +3789,135 @@ static int fnp6l_ft_query(struct fnp6l *np, const struct fnp6l_ft_sess *s)
 	msg[1] = (8 + len) / 8;
 	msg[3] = NP6L_SSE_TXQ;
 	np->ft_qsent++;
-	return fnp6l_sse_cmd_send(np, msg, 8 + len);
-}
-
-/* an NP message (NP6L_WB_MSG) in NAPI context: keep it for the work */
-static void fnp6l_rx_msg(struct fnp6l *np, const u8 *data, unsigned int len)
-{
-	unsigned int n = min_t(unsigned int, len, NP6L_FT_MSGLEN);
-
-	if (!READ_ONCE(np->ft_on))
-		return;
-	spin_lock_bh(&np->ft_msg_lock);
-	if (np->ft_msg_n < NP6L_FT_MSGQ) {
-		memcpy(np->ft_msg[np->ft_msg_n], data, n);
-		np->ft_msg_len[np->ft_msg_n++] = n;
-	} else {
-		np->ft_qdrop++;
-	}
-	spin_unlock_bh(&np->ft_msg_lock);
-	schedule_work(&np->ft_msg_work);
+	return fnp6l_sse_post(np, msg, 8 + len);
 }
 
 /*
- * A query reply carries the stored entry; where it starts in the message is
- * found by its key (first match remembered in ft_qoff). A session whose
- * service bytes 24-55 (timestamp, counters) moved since its last reply was
- * hit in between: its flow is used now.
+ * Session of a query reply whose entry starts at @off, or NULL (ft_sess_lock).
  */
-static void fnp6l_ft_msg_work(struct work_struct *work)
+static struct fnp6l_ft_sess *fnp6l_ft_reply_sess(struct fnp6l *np, const u8 *buf,
+						 unsigned int len, unsigned int off)
 {
-	struct fnp6l *np = container_of(work, struct fnp6l, ft_msg_work);
-	u8 buf[NP6L_FT_MSGLEN];
-	unsigned int len, off;
 	struct fnp6l_ft_sess *s;
 	u8 key[NP6L_SSE_KEY4_LEN];
 
-	for (;;) {
-		spin_lock_bh(&np->ft_msg_lock);
-		if (!np->ft_msg_n) {
-			spin_unlock_bh(&np->ft_msg_lock);
-			return;
-		}
-		np->ft_msg_n--;
-		len = np->ft_msg_len[np->ft_msg_n];
-		memcpy(buf, np->ft_msg[np->ft_msg_n], len);
-		spin_unlock_bh(&np->ft_msg_lock);
+	if (off + NP6L_FT_STATS_OFF + NP6L_FT_STATS_LEN > len)
+		return NULL;
+	memcpy(key, buf + off, NP6L_SSE_KEY4_LEN);
+	key[15] |= 0x80;
+	s = fnp6l_ft_sess_find(np, key);
+	/* IPv6: words 1-3 of the addresses at +84 too */
+	if (s && s->flow->v6 && off + 108 <= len &&
+	    memcmp(buf + off + 84, s->flow->a6, 24))
+		return NULL;
+	return s;
+}
 
-		/* reply: 8-byte header (byte 2 = length / 8), then the entry
-		 * with its KEY_VALID bit cleared; a miss returns the key alone */
-		mutex_lock(&fnp6l_sse_lock);
-		np->ft_qreply++;
-		for (off = 0; off <= 64 &&
-		     off + NP6L_FT_STATS_OFF + NP6L_FT_STATS_LEN <= len; off += 4) {
-			memcpy(key, buf + off, NP6L_SSE_KEY4_LEN);
-			key[15] |= 0x80;
-			s = fnp6l_ft_sess_find(np, key);
-			if (!s)
-				continue;
-			/* IPv6: words 1-3 of the addresses at +84 too */
-			if (s->flow->v6 && off + 108 <= len &&
-			    memcmp(buf + off + 84, s->flow->a6, 24))
-				continue;
-			if (np->ft_qoff != off) {
-				dev_info(np->dev, "ft: query reply: entry at +%u\n",
-					 off);
-				np->ft_qoff = off;
-			}
-			np->ft_qmatch++;
-			if (s->snap_ok &&
-			    memcmp(s->snap, buf + off + NP6L_FT_STATS_OFF,
-				   NP6L_FT_STATS_LEN)) {
-				s->flow->lastused = jiffies;
-				np->ft_qchange++;
-			}
-			memcpy(s->snap, buf + off + NP6L_FT_STATS_OFF, NP6L_FT_STATS_LEN);
-			s->snap_ok = true;
-			break;
+/*
+ * Session of a query reply that found nothing, or NULL (ft_sess_lock): the
+ * header (byte 1 = NP6L_FT_MSG_QUERY, byte 2 = length / 8) then the key
+ * alone, without the entry (24 bytes for an IPv4 key).
+ */
+static struct fnp6l_ft_sess *fnp6l_ft_miss_sess(struct fnp6l *np, const u8 *buf,
+						unsigned int len)
+{
+	unsigned int off = np->ft_qoff >= 0 ? np->ft_qoff : 8;
+	u8 key[NP6L_SSE_KEY4_LEN];
+
+	if (len < 2 || buf[1] != NP6L_FT_MSG_QUERY ||
+	    off + NP6L_SSE_KEY4_LEN > len ||
+	    off + NP6L_FT_STATS_OFF + NP6L_FT_STATS_LEN <= len)
+		return NULL;
+	memcpy(key, buf + off, NP6L_SSE_KEY4_LEN);
+	key[15] |= 0x80;
+	return fnp6l_ft_sess_find(np, key);
+}
+
+/*
+ * Whether @k (KEY_VALID as sent) is one of the last session keys deleted
+ * (ft_sess_lock): tells the reports of our deletes among the messages no
+ * query matched.
+ */
+static bool fnp6l_ft_deleted_key(struct fnp6l *np, const u8 *k)
+{
+	unsigned int i, n = min_t(unsigned int, np->ft_ndelkey, NP6L_FT_DELKEYS);
+	u8 key[NP6L_FT_DELKEY_LEN];
+
+	memcpy(key, k, sizeof(key));
+	key[NP6L_FT_DELKEY_LEN - 1] |= 0x80;
+	for (i = 0; i < n; i++)
+		if (!memcmp(np->ft_delkey[i], key, sizeof(key)))
+			return true;
+	return false;
+}
+
+/*
+ * An NP message (NP6L_WB_MSG), in NAPI context. A query reply carries the
+ * stored entry; where it starts in the message is found by its key, searched
+ * until a first match (ft_qoff), then only there. A session whose service
+ * bytes 24-55 (timestamp, counters) moved since its last reply was hit in
+ * between: its flow is used now.
+ *
+ * Handled here rather than queued for a work: the NP also sends messages
+ * that answer no query, in proportion to the sessions it holds, faster than
+ * a work drained a queue of 64 (qdrop). Only ft_sess_lock is taken (_bh
+ * elsewhere): what is read and written here (the key index, the session
+ * snapshots, lastused, the q* counters) is under it, a flow being unhashed
+ * under it before it is freed. Messages no query matched are counted by
+ * header byte 0, the last one kept (header and key only).
+ */
+static void fnp6l_rx_msg(struct fnp6l *np, const u8 *buf, unsigned int len)
+{
+	struct fnp6l_ft_sess *s = NULL;
+	unsigned int off;
+
+	if (!READ_ONCE(np->ft_on) || !len)
+		return;
+	/* reply: 8-byte header (byte 2 = length / 8), then the entry with
+	 * its KEY_VALID bit cleared; a miss returns the key alone */
+	spin_lock(&np->ft_sess_lock);
+	np->ft_qreply++;
+	np->ft_msgtype[buf[0] % NP6L_FT_MSGTYPES]++;
+	if (len > 1)
+		np->ft_msgop[buf[1] % NP6L_FT_MSGTYPES]++;
+	off = np->ft_qoff;
+	if (np->ft_qoff >= 0) {
+		s = fnp6l_ft_reply_sess(np, buf, len, off);
+	} else {
+		for (off = 0; off <= 64; off += 4) {
+			s = fnp6l_ft_reply_sess(np, buf, len, off);
+			if (s)
+				break;
 		}
-		mutex_unlock(&fnp6l_sse_lock);
 	}
+	if (s) {
+		if (np->ft_qoff != off) {
+			dev_info(np->dev, "ft: query reply: entry at +%u\n", off);
+			np->ft_qoff = off;
+		}
+		np->ft_qmatch++;
+		if (s->snap_ok &&
+		    memcmp(s->snap, buf + off + NP6L_FT_STATS_OFF, NP6L_FT_STATS_LEN)) {
+			WRITE_ONCE(s->flow->lastused, jiffies);
+			np->ft_qchange++;
+		}
+		memcpy(s->snap, buf + off + NP6L_FT_STATS_OFF, NP6L_FT_STATS_LEN);
+		s->snap_ok = true;
+		WRITE_ONCE(s->missing, false);
+	} else if ((s = fnp6l_ft_miss_sess(np, buf, len))) {
+		/* given back to the software flow table by fnp6l_ft_stats */
+		np->ft_qmiss++;
+		WRITE_ONCE(s->missing, true);
+	} else {
+		np->ft_qnomatch++;
+		np->ft_msghdr_len = min_t(unsigned int, len, NP6L_FT_MSGHDR);
+		memcpy(np->ft_msghdr, buf, np->ft_msghdr_len);
+		if (np->ft_qoff >= 0 &&
+		    np->ft_qoff + NP6L_FT_DELKEY_LEN <= len &&
+		    fnp6l_ft_deleted_key(np, buf + np->ft_qoff))
+			np->ft_qnomatch_del++;
+	}
+	spin_unlock(&np->ft_sess_lock);
 }
 
 /* ------------------------------------------- switch-port classification */
@@ -3423,6 +4412,8 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	if (basic.key->ip_proto != IPPROTO_TCP &&
 	    basic.key->ip_proto != IPPROTO_UDP)
 		return fnp6l_ft_refuse_dev(idev, extack, "not IPv4 TCP or UDP");
+	if (basic.key->ip_proto == IPPROTO_UDP && !READ_ONCE(ft_udp))
+		return fnp6l_ft_refuse_dev(idev, extack, "UDP not offloaded (ft_udp)");
 
 	if (fl->v6) {
 		struct flow_match_ipv6_addrs a6;
@@ -3578,6 +4569,7 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 }
 
 static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
+			    const struct flow_block *table,
 			    struct flow_cls_offload *cls)
 {
 	struct fnp6l_ft_flow fl = { }, *flow;
@@ -3586,6 +4578,16 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 	unsigned int i;
 	int ret;
 
+	/*
+	 * Full: refused before the parse and the lock. The flow table offers
+	 * a flow left in software again at each refresh (once a second per
+	 * flow): taking the command lock for each refusal queued the works.
+	 */
+	ret = fnp6l_ft_admit(np, 1, true);
+	if (!ret)
+		ret = fnp6l_ft_back_check(np, cls->cookie, true);
+	if (ret)
+		return ret;
 	ret = fnp6l_ft_parse(np, idev, cls, &fl, &opt, smac);
 	if (ret)
 		return ret;
@@ -3599,8 +4601,47 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 		ret = 0;
 		goto out;
 	}
-	if (np->ft_nflows >= max_flows) {
-		ret = -ENOSPC;
+	if (np->ft_ndead)
+		fnp6l_ft_dead_retry(np);
+	ret = fnp6l_ft_admit(np, fl.n_in_lif, false);
+	if (!ret)
+		ret = fnp6l_ft_back_check(np, cls->cookie, false);
+	if (ret)
+		goto out;
+	fnp6l_ft_keys(&fl);
+	/* a dead flow still holds this key: inserting it now, the retried
+	 * delete would remove the new session */
+	if (np->ft_ndead && fnp6l_ft_dead_key(np, &fl)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	/*
+	 * A live flow with another cookie still holds one of these keys: the
+	 * flow table has torn it down (its tuple used again, its conntrack
+	 * entry back from the flow table, flow_offload_teardown) and added a
+	 * new flow for the same tuple before the DESTROY of the old one
+	 * reached us. That DESTROY is queued at the next garbage collection
+	 * pass only, on another work queue than this REPLACE. Inserted now,
+	 * the new sessions would take the place of the old ones in the
+	 * engine (counted as inserted) and the delete of the old flow would
+	 * remove them: a flow tracked without a session, its own delete
+	 * refused later (as measured). Refused until the old flow is
+	 * gone; the flow table offers it again at its next refresh.
+	 */
+	if (fnp6l_ft_key_busy(np, &fl)) {
+		np->ft_keybusy++;
+		ret = -EBUSY;
+		goto out;
+	}
+	/*
+	 * The inserts never take the last eighth of the queue: a burst of
+	 * them refused the deletes of short connections (full, then a flow
+	 * kept on ft_dead). Offered again at the next refresh.
+	 */
+	if (np->cmd_buf &&
+	    fnp6l_cmdq_room(np) < fl.n_in_lif + NP6L_SSE_DEL_ROOM(np->cmdq.size)) {
+		np->sse_iskip++;
+		ret = -EBUSY;
 		goto out;
 	}
 	fl.opt = opt;
@@ -3612,23 +4653,27 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 	/* switch LIFs: source MAC of the rule (lif_cfg saved by fnp6l_sw_apply) */
 	if (fnp6l_lif_is_sw(np, opt.out) && is_valid_ether_addr(smac))
 		fnp6l_ft_set_smac(np, opt.out, smac);
+	/* post the inserts, never waited for (see fnp6l_ft_del) */
 	for (i = 0; i < fl.n_in_lif; i++) {
 		ret = fnp6l_ft_fcmd(np, true, &fl, i, &opt);
 		if (ret)
 			break;
 	}
 	if (ret) {
-		flow->n_in_lif = i;
-		fnp6l_ft_del(np, flow);
-		kfree(flow);
+		/* posted sessions may be in the engine: delete them, or keep
+		 * the flow until they are */
+		flow->n_in_lif = i < fl.n_in_lif ? i : fl.n_in_lif;
+		fnp6l_ft_drop(np, flow);
 		goto out;
 	}
+	WRITE_ONCE(np->oft_posted, np->oft_posted + fl.n_in_lif);
 	flow->cookie = cls->cookie;
+	flow->table = table;
 	flow->lastused = jiffies;
 	flow->qtime = jiffies;
 	fnp6l_ft_hash_add(np, flow);
-	list_add(&flow->node, &np->ft_flows);
-	np->ft_nflows++;
+	fnp6l_ft_link(np, flow);
+	fnp6l_ft_back_take(np, flow);
 	dev_dbg(np->dev,
 		"offloaded %u %pI4:%u > %pI4:%u (%u session(s), in_lif %u vid %u -> %u vid %u, nat %d)\n",
 		fl.proto, &fl.sip, ntohs(fl.sport), &fl.dip, ntohs(fl.dport),
@@ -3638,36 +4683,72 @@ out:
 	return ret;
 }
 
+/*
+ * The flow table has let the flow go (its cookie may come back for another
+ * flow): out of the indexes now; freed once its sessions are deleted, kept
+ * on ft_dead (still counted against max_flows) otherwise. Its sessions the
+ * engine refused get no delete (fnp6l_ft_mark_refused). A flow given back
+ * is only forgotten.
+ */
 static int fnp6l_ft_destroy(struct fnp6l *np, unsigned long cookie)
 {
 	struct fnp6l_ft_flow *flow;
-	int ret = 0;
 
+	if (fnp6l_ft_back_forget(np, cookie))
+		return 0;
+	if (!fnp6l_ft_known(np, cookie, &np->ft_unk_destroy))
+		return -ENOENT;
 	mutex_lock(&fnp6l_sse_lock);
 	flow = fnp6l_ft_find(np, cookie);
 	if (!flow) {
 		mutex_unlock(&fnp6l_sse_lock);
 		return -ENOENT;
 	}
-	list_del(&flow->node);
-	np->ft_nflows--;
-	if (np->ft_on && np->sse_done)
-		ret = fnp6l_ft_del(np, flow);
-	fnp6l_ft_unhash(flow);
+	fnp6l_ft_unlink(np, flow);
+	if (np->np_credit && fnp6l_ft_missing(flow))
+		fnp6l_ft_mark_refused(np, flow);
+	fnp6l_ft_drop(np, flow);
 	mutex_unlock(&fnp6l_sse_lock);
-	kfree(flow);
-	return ret;
+	return 0;
 }
 
 /*
- * Activity of a flow: query each session of the flow (at most twice a
- * second) and report the time its entry last moved (fnp6l_ft_msg_work).
+ * Activity of a flow: query each session of the flow (at most every
+ * ft_stats_ms) and report the time its entry last moved (fnp6l_rx_msg).
+ * The queries are posted, never waited for: the reply comes as a message.
+ * They never take the last quarter of the descriptors, left to the
+ * inserts and deletes; a query skipped is asked again at the next pass.
+ *
+ * The flow table asks once a second per flow, a query is due every
+ * ft_stats_ms: most calls only read the activity, under ft_sess_lock
+ * alone (the lock the replies write it under, a flow being unhashed under
+ * it before it is freed). The command lock only when a query is due or a
+ * session was found missing.
  */
 static int fnp6l_ft_stats(struct fnp6l *np, struct flow_cls_offload *cls)
 {
 	struct fnp6l_ft_flow *flow;
 	unsigned long lastused;
 	unsigned int i;
+	bool due;
+
+	spin_lock_bh(&np->ft_sess_lock);
+	flow = fnp6l_ft_find(np, cls->cookie);
+	if (!flow) {
+		np->ft_unk_stats++;
+		spin_unlock_bh(&np->ft_sess_lock);
+		return -ENOENT;
+	}
+	due = fnp6l_ft_missing(flow) ||
+	      (READ_ONCE(np->sse_done) &&
+	       time_after_eq(jiffies, READ_ONCE(flow->qtime) +
+			     msecs_to_jiffies(READ_ONCE(ft_stats_ms))));
+	lastused = READ_ONCE(flow->lastused);
+	if (!due)
+		np->ft_sfast++;
+	spin_unlock_bh(&np->ft_sess_lock);
+	if (!due)
+		goto report;
 
 	mutex_lock(&fnp6l_sse_lock);
 	flow = fnp6l_ft_find(np, cls->cookie);
@@ -3675,14 +4756,42 @@ static int fnp6l_ft_stats(struct fnp6l *np, struct flow_cls_offload *cls)
 		mutex_unlock(&fnp6l_sse_lock);
 		return -ENOENT;
 	}
-	if (np->sse_done &&
-	    time_after_eq(jiffies, flow->qtime + HZ / 2)) {
-		flow->qtime = jiffies;
-		for (i = 0; i < flow->n_in_lif; i++)
-			fnp6l_ft_query(np, &flow->s[i]);
+	np->ft_sslow++;
+	fnp6l_ft_cap_read(np, false);
+	/*
+	 * A session the engine refused (a query found it missing, and the
+	 * insert counters showed refusals not yet matched to a flow): the
+	 * flow is no longer counted nor queried, its other sessions are
+	 * deleted (never the refused ones), and it goes on in the software
+	 * flow table, which offers it again at each refresh: remembered as
+	 * given back, it is offered to the engine again only once the engine
+	 * has room for it (fnp6l_ft_back_check).
+	 */
+	if (fnp6l_ft_missing(flow) && np->np_credit) {
+		i = fnp6l_ft_mark_refused(np, flow);
+		np->ft_back++;
+		np->ft_back_sess += i;
+		fnp6l_ft_unlink(np, flow);
+		fnp6l_ft_back_add(np, flow);
+		fnp6l_ft_drop(np, flow);
+		mutex_unlock(&fnp6l_sse_lock);
+		return -ENOENT;
 	}
-	lastused = flow->lastused;
+	if (np->sse_done &&
+	    time_after_eq(jiffies, flow->qtime +
+			  msecs_to_jiffies(READ_ONCE(ft_stats_ms)))) {
+		if (fnp6l_cmdq_room(np) <
+		    NP6L_SSE_QUERY_ROOM(np->cmdq.size) + flow->n_in_lif) {
+			np->sse_qskip++;
+		} else {
+			WRITE_ONCE(flow->qtime, jiffies);
+			for (i = 0; i < flow->n_in_lif; i++)
+				fnp6l_ft_query(np, &flow->s[i]);
+		}
+	}
+	lastused = READ_ONCE(flow->lastused);
 	mutex_unlock(&fnp6l_sse_lock);
+report:
 	if (time_after(lastused, jiffies))
 		lastused = jiffies;
 	flow_stats_update(&cls->stats, 0, 0, 0, lastused,
@@ -3694,12 +4803,16 @@ static int fnp6l_ft_stats(struct fnp6l *np, struct flow_cls_offload *cls)
  * LAG (switch ports): re-pick the output member of every flow sent to a
  * bond of switch ports, as the bond would now (member lost, back, or slave
  * array updated); a flow whose member changed gets its sessions deleted and
- * inserted again with the new out_lif. Under fnp6l_sse_lock.
+ * inserted again with the new out_lif (posted in that order, read in that
+ * order). A flow whose delete was refused keeps its member; one whose insert
+ * was refused is marked hw_bad and done again on the next pass; *failed
+ * counts both. Under fnp6l_sse_lock.
  */
-static unsigned int fnp6l_ft_lag_rebalance(struct fnp6l *np)
+static unsigned int fnp6l_ft_lag_rebalance(struct fnp6l *np, unsigned int *failed)
 {
 	struct fnp6l_ft_flow *flow;
 	unsigned int lif, i, moved = 0;
+	int ret;
 
 	list_for_each_entry(flow, &np->ft_flows, node) {
 		if (!flow->obond)
@@ -3707,14 +4820,26 @@ static unsigned int fnp6l_ft_lag_rebalance(struct fnp6l *np)
 		lif = fnp6l_ft_bond_out(np, flow->obond, flow->eth, flow->l3,
 					flow->l4, flow->proto,
 					flow->v6 ? flow->a6 : NULL);
-		if (!lif || lif == flow->opt.out)
+		if (!lif || (lif == flow->opt.out && !flow->hw_bad))
 			continue;
-		fnp6l_ft_del(np, flow);
+		if (fnp6l_ft_del(np, flow)) {
+			flow->hw_bad = true;
+			(*failed)++;
+			continue;
+		}
 		flow->opt.out = lif;
 		fnp6l_ft_set_smac(np, lif, flow->eth + ETH_ALEN);
-		for (i = 0; i < flow->n_in_lif; i++)
-			fnp6l_ft_fcmd(np, true, flow, i, &flow->opt);
-		moved++;
+		for (ret = 0, i = 0; i < flow->n_in_lif && !ret; i++) {
+			ret = fnp6l_ft_fcmd(np, true, flow, i, &flow->opt);
+			/* inserted again: an earlier miss no longer holds */
+			if (!ret)
+				WRITE_ONCE(flow->s[i].missing, false);
+		}
+		flow->hw_bad = ret;
+		if (flow->hw_bad)
+			(*failed)++;
+		else
+			moved++;
 	}
 	return moved;
 }
@@ -3727,20 +4852,26 @@ static void fnp6l_ft_lag_work(struct work_struct *work)
 {
 	struct fnp6l *np = container_of(to_delayed_work(work), struct fnp6l,
 					ft_lag_work);
-	unsigned int moved = 0;
+	unsigned int moved = 0, failed = 0;
 
 	rtnl_lock();		/* bond lowers and slave state stable */
 	mutex_lock(&fnp6l_sse_lock);
 	if (np->ft_on && np->sse_done)
-		moved = fnp6l_ft_lag_rebalance(np);
+		moved = fnp6l_ft_lag_rebalance(np, &failed);
+	np->ft_lagfail += failed;
 	mutex_unlock(&fnp6l_sse_lock);
 	rtnl_unlock();
 	if (moved)
 		dev_info(np->dev, "ft: lag: %u flow(s) moved to another member\n",
 			 moved);
+	if (failed)
+		dev_warn_ratelimited(np->dev, "ft: lag: %u flow(s) not moved, retried\n",
+				     failed);
 	if (np->ft_lag_again) {
 		np->ft_lag_again = 0;
 		schedule_delayed_work(&np->ft_lag_work, msecs_to_jiffies(300));
+	} else if (failed) {
+		schedule_delayed_work(&np->ft_lag_work, HZ);
 	}
 }
 
@@ -3769,26 +4900,47 @@ static int fnp6l_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 	return NOTIFY_DONE;
 }
 
-/* a port leaves the flow table: delete every flow */
-static void fnp6l_ft_forget_all(struct fnp6l *np)
+/*
+ * A port or a bond leaves flow table @table: delete every flow that table
+ * offered, through any port. The flows of the other tables bound at the
+ * same time (a reload binds the new table before it unbinds the old one,
+ * a check-only transaction binds and unbinds a table of its own) stay.
+ */
+static void fnp6l_ft_forget_table(struct fnp6l *np,
+				  const struct flow_block *table)
 {
 	struct fnp6l_ft_flow *flow, *tmp;
 
 	mutex_lock(&fnp6l_sse_lock);
 	list_for_each_entry_safe(flow, tmp, &np->ft_flows, node) {
-		if (np->ft_on && np->sse_done)
-			fnp6l_ft_del(np, flow);
-		list_del(&flow->node);
-		fnp6l_ft_unhash(flow);
-		kfree(flow);
+		if (flow->table != table)
+			continue;
+		fnp6l_ft_unlink(np, flow);
+		fnp6l_ft_drop(np, flow);
 	}
-	np->ft_nflows = 0;
+	fnp6l_ft_back_forget_table(np, table);
 	mutex_unlock(&fnp6l_sse_lock);
+}
+
+/*
+ * Several flow tables may be bound to a port at a time: each binding of a
+ * table to a port has its callback, whose data says which table its flows
+ * come from.
+ */
+struct fnp6l_ft_block {
+	struct fnp6l_port *port;
+	const struct flow_block *table;
+};
+
+static void fnp6l_ft_block_free(void *cb_priv)
+{
+	kfree(cb_priv);
 }
 
 static int fnp6l_ft_cb(enum tc_setup_type type, void *type_data, void *cb_priv)
 {
-	struct fnp6l_port *port = cb_priv;
+	const struct fnp6l_ft_block *blk = cb_priv;
+	struct fnp6l_port *port = blk->port;
 	struct flow_cls_offload *cls = type_data;
 
 	if (type != TC_SETUP_CLSFLOWER)
@@ -3797,7 +4949,7 @@ static int fnp6l_ft_cb(enum tc_setup_type type, void *type_data, void *cb_priv)
 	case FLOW_CLS_REPLACE:
 		if (!tc_can_offload(port->ndev))
 			return -EOPNOTSUPP;
-		return fnp6l_ft_replace(port->np, port->ndev, cls);
+		return fnp6l_ft_replace(port->np, port->ndev, blk->table, cls);
 	case FLOW_CLS_DESTROY:
 		return fnp6l_ft_destroy(port->np, cls->cookie);
 	case FLOW_CLS_STATS:
@@ -3813,6 +4965,7 @@ static int fnp6l_setup_ft(struct fnp6l_port *port, struct flow_block_offload *f)
 {
 	flow_setup_cb_t *cb = fnp6l_ft_cb;
 	struct flow_block_cb *block_cb;
+	struct fnp6l_ft_block *blk;
 
 	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
 		return -EOPNOTSUPP;
@@ -3825,11 +4978,24 @@ static int fnp6l_setup_ft(struct fnp6l_port *port, struct flow_block_offload *f)
 					   "flow offload not enabled");
 			return -EOPNOTSUPP;
 		}
-		if (flow_block_cb_is_busy(cb, port, &fnp6l_block_cb_list))
-			return -EBUSY;
-		block_cb = flow_block_cb_alloc(cb, port, port, NULL);
-		if (IS_ERR(block_cb))
+		/* bound twice to this port by the same table */
+		block_cb = flow_block_cb_lookup(f->block, cb, port);
+		if (block_cb) {
+			flow_block_cb_incref(block_cb);
+			return 0;
+		}
+		/* one callback per table, others bound or not */
+		blk = kzalloc(sizeof(*blk), GFP_KERNEL);
+		if (!blk)
+			return -ENOMEM;
+		blk->port = port;
+		blk->table = f->block;
+		block_cb = flow_block_cb_alloc(cb, port, blk, fnp6l_ft_block_free);
+		if (IS_ERR(block_cb)) {
+			kfree(blk);
 			return PTR_ERR(block_cb);
+		}
+		flow_block_cb_incref(block_cb);
 		flow_block_cb_add(block_cb, f);
 		list_add_tail(&block_cb->driver_list, &fnp6l_block_cb_list);
 		return 0;
@@ -3837,9 +5003,11 @@ static int fnp6l_setup_ft(struct fnp6l_port *port, struct flow_block_offload *f)
 		block_cb = flow_block_cb_lookup(f->block, cb, port);
 		if (!block_cb)
 			return -ENOENT;
+		if (flow_block_cb_decref(block_cb))
+			return 0;
 		flow_block_cb_remove(block_cb, f);
 		list_del(&block_cb->driver_list);
-		fnp6l_ft_forget_all(port->np);
+		fnp6l_ft_forget_table(port->np, f->block);
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -3857,6 +5025,7 @@ static int fnp6l_setup_ft(struct fnp6l_port *port, struct flow_block_offload *f)
 struct fnp6l_ft_bond {
 	struct fnp6l *np;
 	struct net_device *dev;
+	const struct flow_block *table;	/* one callback per table */
 };
 
 static int fnp6l_ft_bond_cb(enum tc_setup_type type, void *type_data,
@@ -3869,7 +5038,7 @@ static int fnp6l_ft_bond_cb(enum tc_setup_type type, void *type_data,
 		return -EOPNOTSUPP;
 	switch (cls->command) {
 	case FLOW_CLS_REPLACE:
-		return fnp6l_ft_replace(b->np, b->dev, cls);
+		return fnp6l_ft_replace(b->np, b->dev, b->table, cls);
 	case FLOW_CLS_DESTROY:
 		return fnp6l_ft_destroy(b->np, cls->cookie);
 	case FLOW_CLS_STATS:
@@ -3911,13 +5080,18 @@ static int fnp6l_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 			return -EOPNOTSUPP;
 		}
 		mutex_unlock(&fnp6l_sse_lock);
-		if (flow_block_cb_is_busy(fnp6l_ft_bond_cb, dev, &fnp6l_block_cb_list))
-			return -EBUSY;
+		/* bound twice to this bond by the same table */
+		block_cb = flow_block_cb_lookup(f->block, fnp6l_ft_bond_cb, dev);
+		if (block_cb) {
+			flow_block_cb_incref(block_cb);
+			return 0;
+		}
 		b = kzalloc(sizeof(*b), GFP_KERNEL);
 		if (!b)
 			return -ENOMEM;
 		b->np = np;
 		b->dev = dev;
+		b->table = f->block;
 		block_cb = flow_indr_block_cb_alloc(fnp6l_ft_bond_cb, dev, b,
 						    fnp6l_ft_bond_release, f, dev,
 						    sch, data, np, cleanup);
@@ -3925,6 +5099,7 @@ static int fnp6l_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 			kfree(b);
 			return PTR_ERR(block_cb);
 		}
+		flow_block_cb_incref(block_cb);
 		flow_block_cb_add(block_cb, f);
 		list_add_tail(&block_cb->driver_list, &fnp6l_block_cb_list);
 		dev_info(np->dev, "ft: bond %s bound (switch ports)\n", dev->name);
@@ -3933,9 +5108,11 @@ static int fnp6l_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 		block_cb = flow_block_cb_lookup(f->block, fnp6l_ft_bond_cb, dev);
 		if (!block_cb)
 			return -ENOENT;
+		if (flow_block_cb_decref(block_cb))
+			return 0;
 		flow_indr_block_cb_remove(block_cb, f);
 		list_del(&block_cb->driver_list);
-		fnp6l_ft_forget_all(np);
+		fnp6l_ft_forget_table(np, f->block);
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -4343,10 +5520,12 @@ static int fnp6l_setup_net(struct platform_device *pdev, struct fnp6l *np)
 		 np->use_irq ? "interrupts" : "polled", np->nvec);
 	fnp6l_debugfs_init(np);
 	INIT_LIST_HEAD(&np->ft_flows);
-	for (q = 0; q < NP6L_FT_HASH; q++)
-		INIT_HLIST_HEAD(&np->ft_hash[q]);
-	spin_lock_init(&np->ft_msg_lock);
-	INIT_WORK(&np->ft_msg_work, fnp6l_ft_msg_work);
+	INIT_LIST_HEAD(&np->ft_dead);
+	INIT_LIST_HEAD(&np->ft_backl);
+	for (q = 0; q < ARRAY_SIZE(np->ft_bhash); q++)
+		INIT_HLIST_HEAD(&np->ft_bhash[q]);
+	spin_lock_init(&np->ft_sess_lock);
+	INIT_DELAYED_WORK(&np->ft_dead_work, fnp6l_ft_dead_work);
 	np->ft_qoff = -1;
 	INIT_DELAYED_WORK(&np->ft_lag_work, fnp6l_ft_lag_work);
 	np->ft_nb.notifier_call = fnp6l_ft_netdev_event;
@@ -4443,6 +5622,9 @@ static int fnp6l_probe(struct platform_device *pdev)
 	spin_lock_init(&np->mdio_lock);
 	spin_lock_init(&np->tx_lock);
 	platform_set_drvdata(pdev, np);
+	ret = fnp6l_ft_index_alloc(np);
+	if (ret)
+		return ret;
 
 	/* Before anything is written: it may defer the probe */
 	ret = fnp6l_wait_mac_cells(np);
