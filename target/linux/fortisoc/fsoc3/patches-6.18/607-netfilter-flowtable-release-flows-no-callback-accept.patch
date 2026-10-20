@@ -36,7 +36,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  enum flow_offload_type {
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -563,6 +563,29 @@ static void nf_flow_table_extend_ct_time
+@@ -563,6 +563,29 @@ static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct)
  	nf_ct_put(ct);
  }
  
@@ -66,7 +66,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
-@@ -583,7 +606,8 @@ static void nf_flow_offload_gc_step(stru
+@@ -583,7 +606,8 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  	}
  
  	if (teardown) {
@@ -76,7 +76,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  			if (!test_bit(NF_FLOW_HW_DYING, &flow->flags))
  				nf_flow_offload_del(flow_table, flow);
  			else if (test_bit(NF_FLOW_HW_DEAD, &flow->flags))
-@@ -591,11 +615,14 @@ static void nf_flow_offload_gc_step(stru
+@@ -591,11 +615,14 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  		} else {
  			flow_offload_del(flow_table, flow);
  		}
@@ -95,7 +95,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  }
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
-@@ -987,6 +987,8 @@ static void flow_offload_work_add(struct
+@@ -1094,6 +1094,8 @@ static void flow_offload_work_add(struct flow_offload_work *offload)
  	if (err < 0)
  		goto out;
  
