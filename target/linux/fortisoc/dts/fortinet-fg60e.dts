@@ -227,6 +227,13 @@
 			ethernet-switch@1e {
 				compatible = "brcm,bcm53128";
 				reg = <30>;
+				/*
+				 * Traffic class 7 on every user port (as the 60D
+				 * and 90D): the frames of port 0 (dmz) then key
+				 * the class table of the network processor with
+				 * VID 0xe0, never VID 0 (never matched, measured).
+				 */
+				brcm,port-traffic-class = <7>;
 
 				ethernet-ports {
 					#address-cells = <1>;
@@ -347,11 +354,12 @@
 				label = "sw0";
 				fortinet,np-link = <1>;
 				/*
-				 * LIF of switch port 0 to 7: dmz (port 0)
-				 * stays on the conduit LIF 3, internal7 to
-				 * internal1 (ports 1 to 7) on LIFs 9 to 15.
+				 * LIF of switch port 0 to 7: dmz (port 0) on
+				 * LIF 8, internal7 to internal1 (ports 1 to 7)
+				 * on LIFs 9 to 15; the class cell of the
+				 * conduit (VID 0, LIF 3) is left as it is.
 				 */
-				fortinet,switch-logical-interfaces = <0 9 10 11 12 13 14 15>;
+				fortinet,switch-logical-interfaces = <8 9 10 11 12 13 14 15>;
 				phy-mode = "rgmii";
 
 				fixed-link {
