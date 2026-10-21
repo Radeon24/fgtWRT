@@ -44,6 +44,7 @@
 #define RTL930X_MAC_LINK_STS			(0xCB10)
 
 #define RTL930X_EEE_CTRL(p)			(0x3274 + ((p) << 6))
+#define RTL930X_VLAN_PORT_AFT			(0x8260)
 
 #define RTL930X_TRK_HASH_CTRL			(0x9F80)
 #define RTL930X_TRK_CTRL			(0x9F88)
@@ -602,6 +603,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.stat_port_std_mib = RTL930X_STAT_PORT_MIB_CNTR,
 	.stat_port_prv_mib = RTL930X_STAT_PORT_PRVTE_CNTR,
 	.mib_desc = &otto_stats_930x_mib_desc,
+	.drop_desc = &otto_stats_930x_drop_desc,
 	.stat_counters_lock = otto_stats_counters_lock_register,
 	.stat_counters_unlock = otto_stats_counters_unlock_register,
 	.stat_update_counters_atomically = otto_stats_update_counters_atomically,
@@ -629,7 +631,10 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.vlan_profile_get = otto_vlan_930x_profile_get,
 	.vlan_profile_dump = otto_vlan_930x_profile_dump,
 	.vlan_profile_setup = otto_vlan_930x_profile_setup,
+	.vlan_port_aft = RTL930X_VLAN_PORT_AFT,
 	.vlan_fwd_on_inner = otto_vlan_930x_port_forward_on_inner,
+	.vlan_qinq_setup = otto_vlan_930x_qinq_setup,
+	.vlan_port_qinq_set = otto_vlan_930x_port_qinq_set,
 	.set_vlan_igr_filter = rtl930x_set_igr_filter,
 	.set_vlan_egr_filter = rtl930x_set_egr_filter,
 	.stp_get = rtldsa_930x_stp_get,
@@ -687,7 +692,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.enable_flood = otto_l2_930x_enable_flood,
 	.enable_bcast_flood = otto_l2_930x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_930x_set_receive_management_action,
-	.qos_init = rtldsa_930x_qos_init,
+	.qos_init = otto_qos_930x_init,
 	.trk_ctrl = RTL930X_TRK_CTRL,
 	.trk_hash_ctrl = RTL930X_TRK_HASH_CTRL,
 	.prepare_lag_fdb = otto_lag_93xx_prepare_fdb,

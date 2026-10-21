@@ -117,18 +117,18 @@ properties:
             minItems: 1
             maxItems: 8
             items:
-              - const: 0
-            additionalItems:
               enum: [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
             description:
               DSA conduit to a Broadcom switch (BCM53128, ports 0 to 7), with
               the Broadcom tag. The LIF of each switch port, by port number,
               0 for none, for the network processor to class the frames of
               the switch by source port; ports past the end of the list have
-              none. Switch port 0 is classed like the conduit itself, so the
-              first value is always 0. Each LIF used once, and none the LIF
-              of a port. Without it, the frames of every switch port stay on
-              the LIF of the conduit.
+              none. Switch port 0 is classed like the conduit itself: with 0
+              it stays on the LIF of the conduit, with a LIF of its own (never
+              the conduit's) the class entry of the conduit is given that
+              LIF, the conduit's LIF then carrying host transmission only.
+              Each LIF used once, and none the LIF of a port. Without it, the
+              frames of every switch port stay on the LIF of the conduit.
 
           post-init-providers: true
 

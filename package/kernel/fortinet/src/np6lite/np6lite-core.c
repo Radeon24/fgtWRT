@@ -50,6 +50,7 @@
 #include <linux/udp.h>
 #include <linux/hash.h>
 #include <linux/hex.h>
+#include <linux/if_bridge.h>
 #include <linux/iopoll.h>
 #include <linux/jhash.h>
 #include <linux/log2.h>
@@ -71,6 +72,8 @@
 #include <net/dsa.h>
 #include <net/flow_offload.h>
 #include <net/ip.h>
+#include <net/netfilter/nf_flow_table.h>
+#include <net/switchdev.h>
 #include <net/pkt_cls.h>
 
 #define DRV_NAME		"fortinet-np6lite"
@@ -241,11 +244,26 @@
 #define NP6L_LIF_HOST			1
 /* most switch ports behind one conduit (Broadcom tag: ports 0 to 7) */
 #define NP6L_SW_PORTS			8
+/* class table cells of the switch ports, all conduits (fnp6l_sw_apply_conduit) */
+#define NP6L_SW_CELLS			64
 #define NP6L_NR_VEC			4	/* HIF vectors 0..3; vector 4 = "err" */
 
 static unsigned int poll_ms = CONFIG_FORTINET_NP6LITE_POLL_MS;
 module_param(poll_ms, uint, 0444);
 MODULE_PARM_DESC(poll_ms, "poll period in ms (0 = interrupts, with a 100 ms safety poll)");
+
+/*
+ * Energy Efficient Ethernet on the PHY of a port. The MAC of the NP has no
+ * known Low Power Idle control: it never asks its PHY for LPI, and phylib
+ * then expects the MAC driver to keep EEE off (phy_disable_eee()).
+ * Advertised, it still lets the link partner put its own transmit side to
+ * sleep between bursts, adding its wake time to every burst a window
+ * bound TCP flow sends. Off by default, read at each open;
+ * "ethtool --set-eee <port> eee on" turns it back on until the next open.
+ */
+static bool phy_eee;
+module_param(phy_eee, bool, 0644);
+MODULE_PARM_DESC(phy_eee, "advertise EEE on the PHY of the ports (read at open, default N)");
 
 /*
  * Flow table offload (CONFIG_FORTINET_NP6LITE_FLOW_OFFLOAD). At probe, after
@@ -258,7 +276,8 @@ MODULE_PARM_DESC(poll_ms, "poll period in ms (0 = interrupts, with a 100 ms safe
  * straight from the host tag. Then the session engine is given its tables,
  * the offload state is applied and the switch ports are classified to their
  * own LIFs; nftables flow tables with "flags offload" over the ports (60E:
- * wan1, wan2) and a bond of switch ports are then forwarded by the NP.
+ * wan1, wan2), bonds of switch ports and bare switch ports are then
+ * forwarded by the NP.
  * Without the Kconfig option the driver keeps the port tag path and
  * offloads nothing.
  */
@@ -305,6 +324,7 @@ struct fnp6l_port {
 	u32 lif;
 	u32 link;		/* NP link, 1-based; MAC port = link - 1 */
 	int speed;
+	int duplex;		/* with speed: the MAC follows both */
 	bool conduit;		/* DSA conduit: a switch CPU port points at it */
 	/*
 	 * Conduit: LIF of each switch port, by port number, 0 = none
@@ -369,6 +389,14 @@ struct fnp6l {
 	struct fnp6l_ring cmdq;	/* session commands */
 	u8 *cmd_buf;
 	dma_addr_t cmd_dma;
+	bool cmdq_on;		/* command queue started (buffers kept on failure) */
+	/*
+	 * fatal error interrupts of the host queues: seen, acknowledged by
+	 * writing the status bits back, masked on a queue whose status stays
+	 * set after the acknowledgement (no interrupt storm)
+	 */
+	u64 err_fatal;
+	unsigned long fatal_masked;	/* bit q: HRX queue q; bit 16: HTX queue */
 	/* done index last seen, since when (ns), and whether it is stuck */
 	unsigned int cmd_seen;
 	u64 cmd_seen_ns;
@@ -454,16 +482,27 @@ struct fnp6l {
 	struct notifier_block ft_nb;	/* bond member changes (switch ports) */
 	struct delayed_work ft_lag_work;
 	unsigned int ft_lag_again;
+	/* bridge_offload: stations learnt or forgotten on a bridged port */
+	struct notifier_block ft_fdb_nb;
+	struct work_struct ft_fdb_work;
+	spinlock_t ft_fdb_lock;
+	struct net_device *ft_fdb_dev[8];	/* held, with their address */
+	u8 ft_fdb_addr[8][ETH_ALEN];
+	bool ft_fdb_del[8];			/* entry forgets the station */
+	unsigned int ft_fdb_n;
+	bool ft_fdb_lost;			/* ring full: every bridged LIF */
+	unsigned long ft_fdb_moves;		/* LIFs whose flows were torn down */
 	struct fnp6l_ft_save {
 		u32 tbl, idx, d[4];	/* a saved table entry */
 	} ft_save[32];
 	unsigned int ft_nsave;
 	/* switch-port classification: see its section */
 	bool sw_on;
-	u8 sw_idx[NP6L_MAX_LIF];	/* class table indices to clear on failure */
+	u8 sw_idx[NP6L_SW_CELLS];	/* class table indices to clear on failure */
 	unsigned int sw_nidx;
 	struct fnp6l_ft_save sw_save[6 * NP6L_MAX_LIF];	/* 6 tables per switch-port LIF */
 	unsigned int sw_nsave;
+	unsigned int sw_rb_bad;		/* switch-port LIF entries read back different */
 	u64 sw_rx_retag;		/* frames given back their Broadcom tag */
 	/* switch-port LIF -> its conduit and switch port (fnp6l_sw_map) */
 	struct fnp6l_port *sw_conduit[NP6L_MAX_LIF];
@@ -693,9 +732,10 @@ static void fnp6l_adjust_link(struct net_device *ndev)
 	unsigned int port = p->link - 1;
 	u32 rx, tx, spd;
 
-	if (!phy->link || phy->speed == p->speed)
+	if (!phy->link || (phy->speed == p->speed && phy->duplex == p->duplex))
 		goto out;
 	p->speed = phy->speed;
+	p->duplex = phy->duplex;
 	/* inferred: 0 = 10, 1 = 100, 2 = 1000 (2 at init) */
 	spd = phy->speed == SPEED_1000 ? 2 : phy->speed == SPEED_100 ? 1 : 0;
 	rx = fnp6l_rd(p->np, NP6L_MAC(port) + NP6L_MAC_RX_CTRL);
@@ -1185,7 +1225,10 @@ static void fnp6l_rx_deliver(struct fnp6l *np, struct fnp6l_vec *v,
 			 * Switch-port classification: the IGR consumed the
 			 * Broadcom tag as a second tag (second tag TPID 0x0000)
 			 * and classified the switch port to its own LIF (on the
-			 * conduit LIF: switch port 0). Give the frame back a
+			 * conduit LIF: its own cell, key VID 0, which no frame
+			 * with a second tag matches (measured), taken as port 0;
+			 * on its own LIF, p is NULL and sw_port[] gives the
+			 * port, 0 included). Give the frame back a
 			 * Broadcom egress tag (opcode 0, source port) so
 			 * tag_brcm demultiplexes it.
 			 */
@@ -1437,12 +1480,44 @@ static irqreturn_t fnp6l_vec_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-/* "err" (fatal errors of every queue): as before, every vector */
+static DEFINE_RATELIMIT_STATE(fnp6l_fatal_rs, 5 * HZ, 4);
+
+/*
+ * Fatal error status of one host queue: counted, acknowledged by writing
+ * the bits back (as the other status bits), and masked if they stay set:
+ * the "err" interrupt is enabled for them at setup and would otherwise
+ * fire again at once, for good. Returns whether the queue had one.
+ */
+static bool fnp6l_fatal_ack(struct fnp6l *np, void __iomem *regs,
+			    unsigned int bit, const char *name, unsigned int q)
+{
+	u32 st = readl(regs + NP6L_Q_INT_STATUS) & NP6L_Q_INT_FATAL;
+
+	if (!st)
+		return false;
+	np->err_fatal++;
+	writel(st, regs + NP6L_Q_INT_STATUS);
+	if (readl(regs + NP6L_Q_INT_STATUS) & NP6L_Q_INT_FATAL) {
+		writel(NP6L_Q_INT_FATAL, regs + NP6L_Q_INT_ENABLE_CLR);
+		if (!test_and_set_bit(bit, &np->fatal_masked))
+			dev_err(np->dev, "%s%u: fatal error status %#x stays set, masked\n",
+				name, q, st);
+	} else if (__ratelimit(&fnp6l_fatal_rs)) {
+		dev_warn(np->dev, "%s%u: fatal error status %#x (%llu)\n",
+			 name, q, st, np->err_fatal);
+	}
+	return true;
+}
+
+/* "err" (fatal errors of every queue): acknowledged, then every vector */
 static irqreturn_t fnp6l_err_irq(int irq, void *data)
 {
 	struct fnp6l *np = data;
-	unsigned int i;
+	unsigned int i, q;
 
+	for_each_set_bit(q, &np->rx_mask, NP6L_NR_QUEUES)
+		fnp6l_fatal_ack(np, np->rx[q].regs, q, "hrxq", q);
+	fnp6l_fatal_ack(np, np->tx.regs, NP6L_NR_QUEUES, "htxq", 0);
 	for (i = 0; i < np->nvec; i++) {
 		fnp6l_vec_mask_ack(&np->vec[i]);
 		napi_schedule(&np->vec[i].napi);
@@ -1573,6 +1648,7 @@ static const char fnp6l_gstrings[][ETH_GSTRING_LEN] = {
 	"rx_unknown_lif", "rx_flow_msgs", "rx_seg_drop", "rx_nomem",
 	"rx_vec0", "rx_vec1", "rx_vec2", "rx_vec3",
 	"tx_csum_hw6", "rx_csum_ok_v4", "rx_csum_ok_v6", "rx_csum_none",
+	"err_fatal",
 };
 
 static void fnp6l_get_strings(struct net_device *ndev, u32 sset, u8 *data)
@@ -1613,6 +1689,22 @@ static void fnp6l_get_ethtool_stats(struct net_device *ndev,
 		data[i + 1] += np->vec[k].rx_csum_ok6;
 		data[i + 2] += np->vec[k].rx_csum_none;
 	}
+	data[i + 3] = np->err_fatal;
+}
+
+/* EEE of the PHY of a port (see phy_eee): state and advertisement only */
+static int fnp6l_get_eee(struct net_device *ndev, struct ethtool_keee *e)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+	return phy_ethtool_get_eee(ndev->phydev, e);
+}
+
+static int fnp6l_set_eee(struct net_device *ndev, struct ethtool_keee *e)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+	return phy_ethtool_set_eee(ndev->phydev, e);
 }
 
 static const struct ethtool_ops fnp6l_ethtool_ops = {
@@ -1620,6 +1712,8 @@ static const struct ethtool_ops fnp6l_ethtool_ops = {
 	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
 	.set_link_ksettings	= phy_ethtool_set_link_ksettings,
 	.nway_reset		= phy_ethtool_nway_reset,
+	.get_eee		= fnp6l_get_eee,
+	.set_eee		= fnp6l_set_eee,
 	.get_strings		= fnp6l_get_strings,
 	.get_sset_count		= fnp6l_get_sset_count,
 	.get_ethtool_stats	= fnp6l_get_ethtool_stats,
@@ -1693,8 +1787,14 @@ static netdev_tx_t fnp6l_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	spin_lock_bh(&np->tx_lock);
 	if (fnp6l_tx_free(r) < n) {
-		spin_unlock_bh(&np->tx_lock);
+		/*
+		 * Stopped under tx_lock: fnp6l_tx_clean frees under it and
+		 * tests the stopped queues after, so it sees this stop and
+		 * wakes the queue once the ring has room (the ring is shared
+		 * by every port, without a transmit timeout).
+		 */
 		netif_stop_queue(ndev);
+		spin_unlock_bh(&np->tx_lock);
 		while (--k)
 			dma_unmap_page(np->dev, dma[k], dlen[k], DMA_TO_DEVICE);
 		dma_unmap_single(np->dev, dma[0], dlen[0], DMA_TO_DEVICE);
@@ -1755,10 +1855,19 @@ static int fnp6l_open(struct net_device *ndev)
 
 	phy = of_phy_get_and_connect(ndev, p->dn, fnp6l_adjust_link);
 	if (!phy) {
+		/* a fixed link it registered stays otherwise */
+		if (of_phy_is_fixed_link(p->dn))
+			of_phy_deregister_fixed_link(p->dn);
 		netdev_err(ndev, "no PHY\n");
 		return -ENODEV;
 	}
+	if (!of_phy_is_fixed_link(p->dn) && !READ_ONCE(phy_eee)) {
+		/* advertisement kept: ethtool --set-eee can turn it back on */
+		phy->eee_cfg.eee_enabled = false;
+		phy->eee_cfg.tx_lpi_enabled = false;
+	}
 	p->speed = 0;
+	p->duplex = DUPLEX_UNKNOWN;
 	fnp6l_pcs_init(p->np, p->link - 1);
 	fnp6l_mac_init(p->np, p->link - 1);
 	phy_start(phy);
@@ -1768,11 +1877,20 @@ static int fnp6l_open(struct net_device *ndev)
 
 static int fnp6l_stop(struct net_device *ndev)
 {
+	struct fnp6l_port *p = netdev_priv(ndev);
+
 	netif_stop_queue(ndev);
 	if (ndev->phydev) {
 		phy_stop(ndev->phydev);
 		phy_disconnect(ndev->phydev);
 	}
+	/*
+	 * of_phy_get_and_connect() registers a new fixed PHY at each open
+	 * (the conduit): without this, every down/up of the conduit leaves
+	 * one behind, until the fixed MDIO bus has no address left.
+	 */
+	if (of_phy_is_fixed_link(p->dn))
+		of_phy_deregister_fixed_link(p->dn);
 	return 0;
 }
 
@@ -1812,11 +1930,13 @@ static bool fnp6l_dt_is_conduit(struct device_node *dn)
 /*
  * "fortinet,switch-logical-interfaces" of a conduit: the LIF of each switch
  * port, by port number, 0 for none (the frames of that port stay on the
- * conduit LIF). Switch port 0 keys the class table like the conduit itself
- * (VID 0), so it always stays on the conduit LIF: its entry must be 0. The
- * LIFs are checked against each other and the port LIFs by fnp6l_sw_map,
- * once every port is known. A bad value leaves the switch ports of this
- * conduit unclassified (the conduit still works).
+ * conduit LIF). Switch port 0 in class 0 keys VID 0, never matched: with a
+ * LIF of its own (never the conduit's) it is classified in the other
+ * classes of switch_tc_mask only (class 7: brcm,port-traffic-class = <7>
+ * on the switch), see fnp6l_sw_apply_conduit. The LIFs are checked
+ * against each other and the port LIFs by fnp6l_sw_map, once every port is
+ * known. A bad value leaves the switch ports of this conduit unclassified
+ * (the conduit still works).
  */
 static void fnp6l_dt_switch_lifs(struct fnp6l *np, struct fnp6l_port *p)
 {
@@ -1828,7 +1948,7 @@ static void fnp6l_dt_switch_lifs(struct fnp6l *np, struct fnp6l_port *p)
 		return;		/* absent: switch ports not classified */
 	if (!p->conduit || n < 1 || n > NP6L_SW_PORTS ||
 	    of_property_read_u32_array(p->dn, "fortinet,switch-logical-interfaces", v, n) ||
-	    v[0])
+	    (v[0] && v[0] == p->lif))
 		goto bad;
 	for (i = 0; i < n; i++)
 		if (v[i] >= NP6L_MAX_LIF || v[i] == NP6L_LIF_HOST)
@@ -2353,19 +2473,27 @@ static int fnp6l_cmdq_up(struct fnp6l *np)
 	u32 d[4] = { };
 	int ret;
 
-	if (np->cmd_buf)
+	if (np->cmdq_on)
 		return 0;
-	np->cmd_buf = dmam_alloc_coherent(np->dev, NP6L_SSE_CMD_SLOTS * NP6L_SSE_CMD_BUF,
-					  &np->cmd_dma, GFP_KERNEL);
-	if (!np->cmd_buf)
-		return -ENOMEM;
-	ret = fnp6l_ring_alloc(np, r, true, NP6L_SSE_TXQ, n);
-	if (!ret)
-		ret = fnp6l_ring_start(np, r);
-	if (ret) {
-		np->cmd_buf = NULL;
-		return ret;
+	/* managed buffers, allocated once: a failed start is tried again on them */
+	if (!np->cmd_buf) {
+		np->cmd_buf = dmam_alloc_coherent(np->dev,
+						  NP6L_SSE_CMD_SLOTS * NP6L_SSE_CMD_BUF,
+						  &np->cmd_dma, GFP_KERNEL);
+		if (!np->cmd_buf)
+			return -ENOMEM;
 	}
+	if (!r->desc) {
+		ret = fnp6l_ring_alloc(np, r, true, NP6L_SSE_TXQ, n);
+		if (ret) {
+			r->desc = NULL;
+			return ret;
+		}
+	}
+	ret = fnp6l_ring_start(np, r);
+	if (ret)
+		return ret;
+	np->cmdq_on = true;
 	/* no interrupt from this queue; its sources to the vectors of queue 0 */
 	writel(NP6L_Q_INT_TIMER | NP6L_Q_INT_ABS_TIMER | NP6L_Q_INT_IDLE_TIMER |
 	       NP6L_Q_INT_FRAMES | NP6L_Q_INT_FATAL,
@@ -2701,6 +2829,29 @@ static int fnp6l_class_insert(struct fnp6l *np, unsigned int ptag,
 }
 
 /*
+ * Cell of key {port tag, VID} (w0[23:0], whatever its LIF): the table index
+ * and its entry in @cur, -ENOENT when no bank of the row holds the key.
+ */
+static int fnp6l_class_find(struct fnp6l *np, unsigned int ptag,
+			    unsigned int vid, u32 *cur)
+{
+	unsigned int row, bank, idx;
+	u32 w0, w1;
+
+	fnp6l_class_key(ptag, vid, 0, &w0, &w1);
+	row = fnp6l_class_bucket(w0);
+	for (bank = 0; bank < NP6L_CLASS_BANKS; bank++) {
+		idx = row * NP6L_CLASS_BANKS + bank;
+		if (fnp6l_tbl_op(np, NP6L_TBL_CLASS, idx, cur, false))
+			return -EIO;
+		if ((cur[1] & NP6L_CLASS_VALID) &&
+		    !((cur[0] ^ w0) & GENMASK(23, 0)))
+			return idx;
+	}
+	return -ENOENT;
+}
+
+/*
  * Receive port tag of a MAC port: rx_port_tag read back from its MAC at
  * bring-up (fnp6l_mac_init set it to (port+1)<<4 = link<<4); fall back to
  * the per-port value link<<4 if the field reads 0. MAC port 2 = 0x030.
@@ -2744,7 +2895,8 @@ DEFINE_SHOW_ATTRIBUTE(fnp6l_dbg_class);
 /*
  * Hardware offload of the Linux flow table to the session engine: IPv4 and
  * IPv6 TCP or UDP flows between the ports that are not DSA conduits (60E:
- * wan1, wan2) and a bond of switch ports, NAT and 802.1Q included,
+ * wan1, wan2), bonds of switch ports and bare switch ports (a user port
+ * outside a bond, its own LIF: bare_ports), NAT and 802.1Q included,
  * forwarded by the NP at line rate with no CPU (measured). Needs the
  * ingress classification: the NP classifies each port to its LIF (60E:
  * wan1 -> 0, wan2 -> 2) in hardware (and strips the port tag), so a
@@ -2837,12 +2989,13 @@ static unsigned int ft_stats_ms = 2000;
 module_param(ft_stats_ms, uint, 0644);
 MODULE_PARM_DESC(ft_stats_ms, "least interval (ms) between two activity queries of a flow (default 2000)");
 /*
- * UDP flows: left to the software flow table by default (a stall of the
- * host delivery was seen under offloaded UDP); 1 offloads new UDP flows.
+ * UDP flows: offloaded by default; 0 leaves new UDP flows to the software
+ * flow table (fallback kept for a stall of the host delivery once seen
+ * under offloaded UDP).
  */
-static bool ft_udp;
+static bool ft_udp = true;
 module_param(ft_udp, bool, 0644);
-MODULE_PARM_DESC(ft_udp, "offload UDP flows (default 0: new UDP flows stay in the software flow table; 1: offloaded; flows already offloaded stay)");
+MODULE_PARM_DESC(ft_udp, "offload UDP flows (default 1: offloaded; 0: new UDP flows stay in the software flow table; flows already offloaded stay)");
 #define NP6L_FT_MSG_QUERY		1	/* header byte 1 of a query reply */
 #define NP6L_FT_STATS_OFF		24	/* activity counters: what a hit moves */
 #define NP6L_FT_STATS_LEN		32
@@ -3418,7 +3571,7 @@ static bool fnp6l_cmdq_idle(struct fnp6l *np)
 	struct fnp6l_ring *r = &np->cmdq;
 	bool idle;
 
-	if (!np->cmd_buf)
+	if (!np->cmdq_on)
 		return true;
 	spin_lock_bh(&np->tx_lock);
 	fnp6l_cmdq_reap(r);
@@ -3930,25 +4083,74 @@ static void fnp6l_rx_msg(struct fnp6l *np, const u8 *buf, unsigned int len)
  * switch frames, +1 per frame on wan1). A TPID-0x0000 tag matches the
  * Broadcom tag; on the NP6Lite the port tag TPID holds the port tag
  * (0x8200), so the Broadcom tag is declared as the second tag (second tag
- * TPID 0x10000): its 12 low bits (the source port, the reason code byte
- * having only PCP bits set) then key the class table {port tag of the
- * conduit, VID = port} -> one LIF per switch port. Switch port p gets the
+ * TPID 0x10000): its 12 low bits (the low nibble of the reason code, the
+ * traffic class and the source port: 00 00 RC TC<<5|port) then key the
+ * class table {port tag of the conduit, VID = (RC & 0xf) << 8 | TC << 5 |
+ * port} -> one LIF per switch port. The BCM53128 gives the frames of a
+ * standalone port the reason 0x20 and those of a bridged port 0x04
+ * (measured on the 90D), class 0 under b53 as is and class 7 with
+ * brcm,port-traffic-class = <7>: each switch port gets one cell per reason
+ * nibble of switch_rc_mask and class of switch_tc_mask. Key VID 0 (port 0,
+ * reason nibble 0, class 0) is never matched (measured on the 60E: every
+ * frame of port 0 takes the default LIF with both tags; same as key 0 on
+ * the NP4Lite of the 60D): that key is never inserted, the conduit's own
+ * ingress classification cell (VID 0, LIF 3) is left as it is, and switch
+ * port 0 (dmz) is classified in class 7 only, which needs the switch
+ * property. Switch port p gets the
  * LIF "fortinet,switch-logical-interfaces" of its conduit gives it (60E:
- * 8 + p for p = 1..7) with copies of the conduit LIF tables (lif_cfg,
+ * 8 + p) with copies of the conduit LIF tables (lif_cfg,
  * trunk_cfg, port_action: applied after the offload state to copy its
- * raised source action); port 0 (key VID 0 = the ingress classification
- * entry) and a port without a LIF stay on the conduit LIF (60E: dmz on
- * LIF 3). The second tag TPID is global: every conduit of the NP needs the
- * property. A classified frame reaches the host without its Broadcom tag:
+ * raised source action); a port without a LIF stays on the conduit LIF.
+ * Every entry written is
+ * read back (LIFs >= 4 hold SRAM residue). The second tag TPID is global:
+ * every conduit of the NP needs the property. A classified frame reaches the
+ * host without its Broadcom tag:
  * fnp6l_rx_deliver puts back an egress tag (opcode 0, source port) for
- * tag_brcm. A miss (reason code outside the PCP bits) keeps both tags and
- * takes the port tag fallback.
+ * tag_brcm. A miss (a reason or a class without a cell, port 0 in class 0)
+ * keeps both tags, lands on the IGR default LIF and takes the port tag
+ * fallback.
  * Everything is saved and restored should a step fail; a reset undoes it.
  * Host transmission is unchanged (tag_brcm still tags it).
+ */
+/*
+ * Reason nibbles 0 (0x20, standalone port) and 4 (0x04, bridged port);
+ * classes 0 (b53 as is) and 7 (brcm,port-traffic-class = <7>): one image
+ * good with or without the switch property, standalone or bridged ports.
+ */
+static unsigned int switch_rc_mask = BIT(0) | BIT(4);
+module_param(switch_rc_mask, uint, 0444);
+MODULE_PARM_DESC(switch_rc_mask,
+		 "switch ports: low nibbles of the Broadcom reason code in the class table, one bit each (0x11: 0 and 4)");
+static unsigned int switch_tc_mask = BIT(0) | BIT(7);
+module_param(switch_tc_mask, uint, 0444);
+MODULE_PARM_DESC(switch_tc_mask,
+		 "switch ports: traffic classes in the class table, one bit each (0x81: classes 0 and 7)");
+
+/* words of a table entry read back different from @d, as a bit mask */
+static unsigned int fnp6l_sw_check(struct fnp6l *np, u32 tbl, u32 idx,
+				   const u32 *d)
+{
+	unsigned int i, bad = 0;
+	u32 rb[4];
+
+	if (fnp6l_tbl_op(np, tbl, idx, rb, false))
+		return 0xf;
+	for (i = 0; i < 4; i++)
+		if (rb[i] != d[i])
+			bad |= BIT(i);
+	return bad;
+}
+
+/*
+ * Save the entry, write @d and read it back; an entry read back different is
+ * written once more, then counted (sw_rb_bad) and logged by table, index and
+ * word, never by value (lif_cfg holds a MAC): the classification goes on.
  */
 static int fnp6l_sw_write(struct fnp6l *np, u32 tbl, u32 idx, u32 *d)
 {
 	struct fnp6l_ft_save *s = &np->sw_save[np->sw_nsave];
+	unsigned int bad;
+	int ret;
 
 	if (np->sw_nsave >= ARRAY_SIZE(np->sw_save))
 		return -ENOSPC;
@@ -3957,10 +4159,28 @@ static int fnp6l_sw_write(struct fnp6l *np, u32 tbl, u32 idx, u32 *d)
 	s->tbl = tbl;
 	s->idx = idx;
 	np->sw_nsave++;
-	return fnp6l_tbl_op(np, tbl, idx, d, true);
+	ret = fnp6l_tbl_op(np, tbl, idx, d, true);
+	if (ret)
+		return ret;
+	bad = fnp6l_sw_check(np, tbl, idx, d);
+	if (bad) {
+		ret = fnp6l_tbl_op(np, tbl, idx, d, true);
+		if (ret)
+			return ret;
+		bad = fnp6l_sw_check(np, tbl, idx, d);
+	}
+	if (bad) {
+		np->sw_rb_bad++;
+		dev_warn(np->dev, "sw_class: table %#x[%u] read back different (words %#x)\n",
+			 tbl, idx, bad);
+	}
+	return 0;
 }
 
-/* undo a failed fnp6l_sw_apply: class table cells and saved tables */
+/*
+ * Undo a failed fnp6l_sw_apply: class table cells inserted (the conduit's
+ * own cell is never written), saved tables.
+ */
 static void fnp6l_sw_restore(struct fnp6l *np)
 {
 	unsigned int i;
@@ -3998,7 +4218,7 @@ static int fnp6l_sw_map(struct fnp6l *np)
 			netdev_warn(c->ndev, "sw_class: conduit without switch-port LIFs\n");
 			goto bad;
 		}
-		for (sp = 1; sp < c->sw_nports; sp++) {
+		for (sp = 0; sp < c->sw_nports; sp++) {
 			lif = c->sw_lif[sp];
 			if (!lif)
 				continue;
@@ -4021,9 +4241,9 @@ bad:
 /* the switch ports of one conduit @sw to their own LIFs */
 static int fnp6l_sw_apply_conduit(struct fnp6l *np, struct fnp6l_port *sw)
 {
-	u32 pc[4], tc[4], sa[4], im[4], d[4];
-	unsigned int sp, lif, ptag;
-	int idx, ret;
+	u32 pc[4], tc[4], sa[4], im[4], d[4], cell[4];
+	unsigned int sp, lif, ptag, rc, cl, vid, n;
+	int idx, first, ret;
 
 	if (fnp6l_tbl_op(np, NP6L_TBL_LIF_CFG, sw->lif, pc, false) ||
 	    fnp6l_tbl_op(np, NP6L_TBL_TRUNK_CFG, sw->lif, tc, false) ||
@@ -4031,7 +4251,22 @@ static int fnp6l_sw_apply_conduit(struct fnp6l *np, struct fnp6l_port *sw)
 	    fnp6l_tbl_op(np, NP6L_TBL_LIF_MAC, sw->lif, im, false))
 		return -EIO;
 	ptag = fnp6l_port_tag(np, sw);
-	for (sp = 1; sp < sw->sw_nports; sp++) {
+	/*
+	 * Where a frame of switch port 0 goes today, read only: the
+	 * conduit's class cell (key VID 0) and the IGR default LIF, where a
+	 * frame missing the class table lands.
+	 */
+	idx = fnp6l_class_find(np, ptag, 0, cell);
+	if (idx >= 0)
+		dev_info(np->dev,
+			 "sw_class: conduit LIF %u cell idx %d ent %08x %08x %08x %08x, IGR default LIF %#x\n",
+			 sw->lif, idx, cell[0], cell[1], cell[2], cell[3],
+			 fnp6l_rd(np, NP6L_IGR_DEFAULT_LIF));
+	else
+		dev_info(np->dev,
+			 "sw_class: conduit LIF %u cell not found (%d), IGR default LIF %#x\n",
+			 sw->lif, idx, fnp6l_rd(np, NP6L_IGR_DEFAULT_LIF));
+	for (sp = 0; sp < sw->sw_nports; sp++) {
 		lif = sw->sw_lif[sp];
 		if (!lif)
 			continue;
@@ -4058,14 +4293,43 @@ static int fnp6l_sw_apply_conduit(struct fnp6l *np, struct fnp6l_port *sw)
 			ret = fnp6l_sw_write(np, NP6L_TBL_LIF_MAC, lif, im);
 		if (ret)
 			return ret;
-		if (np->sw_nidx >= ARRAY_SIZE(np->sw_idx))
-			return -ENOSPC;
-		idx = fnp6l_class_insert(np, ptag, sp, lif);	/* key port tag << 12 | port */
-		if (idx < 0)
-			return idx;
-		np->sw_idx[np->sw_nidx++] = idx;
-		dev_info(np->dev, "sw_class: switch port %u -> LIF %u, class table idx %d\n",
-			 sp, lif, idx);
+		/*
+		 * One cell per reason nibble and class: key port tag << 12 |
+		 * (RC & 0xf) << 8 | TC << 5 | port. VID 0 (port 0, nibble 0,
+		 * class 0) is never matched and is the conduit's own cell: never
+		 * inserted, the conduit's cell keeps its LIF.
+		 */
+		n = 0;
+		first = -1;
+		for (rc = 0; rc < 16; rc++) {
+			if (!(switch_rc_mask & BIT(rc)))
+				continue;
+			for (cl = 0; cl < 8; cl++) {
+				if (!(switch_tc_mask & BIT(cl)))
+					continue;
+				vid = rc << 8 | cl << 5 | sp;
+				if (!vid)
+					continue;
+				if (np->sw_nidx >= ARRAY_SIZE(np->sw_idx))
+					return -ENOSPC;
+				idx = fnp6l_class_insert(np, ptag, vid, lif);
+				if (idx < 0)
+					return idx;
+				np->sw_idx[np->sw_nidx++] = idx;
+				if (first < 0)
+					first = idx;
+				n++;
+			}
+		}
+		if (!n) {
+			netdev_warn(sw->ndev,
+				    "sw_class: switch port %u: no class table key (rc mask %#x, tc mask %#x)\n",
+				    sp, switch_rc_mask, switch_tc_mask);
+			return -EINVAL;
+		}
+		dev_info(np->dev,
+			 "sw_class: switch port %u -> LIF %u, %u class table cells (first idx %d)\n",
+			 sp, lif, n, first);
 	}
 	dev_info(np->dev, "sw_class: port_action %08x %08x copied from LIF %u\n",
 		 sa[0], sa[1], sw->lif);
@@ -4085,6 +4349,7 @@ static int fnp6l_sw_apply(struct fnp6l *np)
 		return ret;
 	np->sw_nsave = 0;
 	np->sw_nidx = 0;
+	np->sw_rb_bad = 0;
 	for (i = 0; i < NP6L_MAX_LIF; i++) {
 		if (!np->port[i] || !np->port[i]->conduit)
 			continue;
@@ -4098,9 +4363,10 @@ static int fnp6l_sw_apply(struct fnp6l *np)
 	fnp6l_wr(np, NP6L_IGR_TAG2_TPID, NP6L_IGR_TAG2_TPID_BRCM);
 	np->sw_on = true;
 	dev_info(np->dev,
-		 "sw_class: on, tag2 TPID %#x -> %#x, egress tag2 %#x -> %#x (%u entries saved)\n",
+		 "sw_class: on, tag2 TPID %#x -> %#x, egress tag2 %#x -> %#x (%u entries saved, %u read back different, %u class cells, rc mask %#x, tc mask %#x)\n",
 		 tag2_tpid, fnp6l_rd(np, NP6L_IGR_TAG2_TPID), egr_tag2,
-		 fnp6l_rd(np, NP6L_EGR_TAG2), np->sw_nsave);
+		 fnp6l_rd(np, NP6L_EGR_TAG2), np->sw_nsave, np->sw_rb_bad,
+		 np->sw_nidx, switch_rc_mask, switch_tc_mask);
 	return 0;
 fail:
 	fnp6l_sw_restore(np);
@@ -4108,6 +4374,64 @@ fail:
 	dev_warn(np->dev, "sw_class: apply failed (%d), restored\n", ret);
 	return ret;
 }
+
+/*
+ * debugfs "sw_class", read only: per switch-port LIF its tables as read now
+ * (lif_cfg: port field only, the rest is a MAC; lif_mac: compared with the
+ * conduit's), the conduits' class cells, the switch-port cells and the IGR
+ * default LIF.
+ */
+static int fnp6l_dbg_sw_show(struct seq_file *m, void *unused)
+{
+	struct fnp6l *np = m->private;
+	u32 eg[4], lc[4], pt[4], tc[4], pa[4], im[4], cim[4], cell[4];
+	struct fnp6l_port *c;
+	unsigned int lif, i;
+	int idx;
+
+	mutex_lock(&fnp6l_sse_lock);
+	seq_printf(m, "sw_on %u read_back_different %u default_lif %08x bridge_moves %lu rc_mask %#x tc_mask %#x cells %u\n",
+		   np->sw_on, np->sw_rb_bad, fnp6l_rd(np, NP6L_IGR_DEFAULT_LIF),
+		   np->ft_fdb_moves, switch_rc_mask, switch_tc_mask, np->sw_nidx);
+	/* the conduits' own cells (key VID 0), never written by sw_class */
+	for (lif = 0; lif < NP6L_MAX_LIF; lif++) {
+		c = np->port[lif];
+		if (!c || !c->conduit)
+			continue;
+		idx = fnp6l_class_find(np, fnp6l_port_tag(np, c), 0, cell);
+		if (idx >= 0)
+			seq_printf(m, "conduit LIF %u cell idx %d ent %08x %08x %08x %08x\n",
+				   lif, idx, cell[0], cell[1], cell[2], cell[3]);
+		else
+			seq_printf(m, "conduit LIF %u cell not found (%d)\n", lif, idx);
+	}
+	for (i = 0; i < np->sw_nidx; i++)
+		if (!fnp6l_tbl_op(np, NP6L_TBL_CLASS, np->sw_idx[i], cell, false))
+			seq_printf(m, "cell idx %3u ent %08x %08x (LIF %u, port tag %#x, VID %#05x)\n",
+				   np->sw_idx[i], cell[0], cell[1], cell[0] >> 24,
+				   (cell[0] >> 12) & 0xfff, cell[0] & 0xfff);
+	for (lif = 0; lif < NP6L_MAX_LIF; lif++) {
+		c = np->sw_conduit[lif];
+		if (!c)
+			continue;
+		if (fnp6l_tbl_op(np, NP6L_TBL_EGR_TAG, lif, eg, false) ||
+		    fnp6l_tbl_op(np, NP6L_TBL_LIF_CFG, lif, lc, false) ||
+		    fnp6l_tbl_op(np, NP6L_TBL_PORT_TRUNK, lif, pt, false) ||
+		    fnp6l_tbl_op(np, NP6L_TBL_TRUNK_CFG, lif, tc, false) ||
+		    fnp6l_tbl_op(np, NP6L_TBL_PORT_ACTION, lif, pa, false) ||
+		    fnp6l_tbl_op(np, NP6L_TBL_LIF_MAC, lif, im, false) ||
+		    fnp6l_tbl_op(np, NP6L_TBL_LIF_MAC, c->lif, cim, false))
+			break;
+		seq_printf(m, "LIF %2u port %u conduit LIF %u egr_tag %08x lif_cfg port %02lx port_trunk %08x trunk_cfg %08x %08x %08x %08x port_action %08x %08x lif_mac %s\n",
+			   lif, np->sw_port[lif], c->lif, eg[0],
+			   FIELD_GET(GENMASK(22, 16), lc[1]), pt[0],
+			   tc[0], tc[1], tc[2], tc[3], pa[0], pa[1],
+			   memcmp(im, cim, sizeof(im)) ? "differs" : "= conduit");
+	}
+	mutex_unlock(&fnp6l_sse_lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(fnp6l_dbg_sw);
 
 static int fnp6l_set_mac_address(struct net_device *ndev, void *addr)
 {
@@ -4238,11 +4562,109 @@ static int fnp6l_ft_lower(struct net_device *ldev,
 	return 0;
 }
 
+static bool bare_ports = true;
+module_param(bare_ports, bool, 0644);
+MODULE_PARM_DESC(bare_ports, "switch user ports outside a bond as flow ends (N: refused, as a conduit)");
+
+static bool sw_routed;
+module_param(sw_routed, bool, 0644);
+MODULE_PARM_DESC(sw_routed, "offload flows routed between two switch LIFs, through the conduit link both ways (read per flow)");
+
+static bool bridge_offload = true;
+module_param(bridge_offload, bool, 0644);
+MODULE_PARM_DESC(bridge_offload, "switch user ports of a bridge offloaded to the switch as flow ends (needs bare_ports for the conduit callback; read per flow)");
+
+struct fnp6l_ft_br {
+	struct fnp6l *np;
+	struct net_device *br;
+	struct dsa_switch_tree *dst;
+};
+
+/*
+ * A device below the bridge, at any depth: a conduit (DSA links each user
+ * port as an upper of its conduit), or a user port of the same DSA tree,
+ * the bridge offloaded to it, with a LIF behind one of our conduits; any
+ * other stops the walk (a bond, a port of the NP, a port of another tree:
+ * bridged by the host).
+ */
+static int fnp6l_ft_br_lower(struct net_device *lower,
+			     struct netdev_nested_priv *priv)
+{
+	const struct fnp6l_ft_br *b = priv->data;
+	struct dsa_port *dp;
+
+	if (netdev_uses_dsa(lower))
+		return 0;
+	dp = fnp6l_dsa_port(lower);
+	if (IS_ERR_OR_NULL(dp) || dp->ds->dst != b->dst ||
+	    !dsa_port_offloads_bridge_dev(dp, b->br) ||
+	    !fnp6l_ft_sw_lif(b->np, lower))
+		return 1;
+	return 0;
+}
+
+/*
+ * bridge_offload: whether the user port @dev, below the bridge @br, may be
+ * a flow end. The bridge offloaded to the switch (it forwards within the
+ * bridge), not VLAN filtering (the switch would tag the frames to the IMP
+ * with the VID), every port below it a port of the tree of @dev with a LIF
+ * (fnp6l_ft_br_lower). The NP routes to and from the bridge's address: the
+ * source MAC of the output LIF is taken from the rule (h_source, the
+ * bridge's address), the ingress classification keys on the source port
+ * only. Same rule as the 60D (fnp4l_dsa_bridged); FortiOS offloads a
+ * software switch only with an explicit intra-switch policy, never the
+ * bridging itself. Under RCU.
+ */
+static bool fnp6l_ft_bridged(struct fnp6l *np, struct net_device *dev,
+			     struct net_device *br)
+{
+	struct fnp6l_ft_br b = { .np = np, .br = br };
+	struct netdev_nested_priv priv = { .data = &b };
+	struct dsa_port *dp;
+
+	if (!IS_REACHABLE(CONFIG_BRIDGE) || !READ_ONCE(bridge_offload) ||
+	    br_vlan_enabled(br))
+		return false;
+	dp = fnp6l_dsa_port(dev);
+	if (IS_ERR_OR_NULL(dp) || !dsa_port_offloads_bridge_dev(dp, br))
+		return false;
+	b.dst = dp->ds->dst;
+	return !netdev_walk_all_lower_dev_rcu(br, fnp6l_ft_br_lower, &priv);
+}
+
+/*
+ * LIF of a switch user port as a flow end: a user port with a LIF of its
+ * own and either no master (bare_ports) or a bridge offloaded to the
+ * switch (bridge_offload, fnp6l_ft_bridged). A bond member's flows come
+ * through the bond. 0 for any other device. Any context (RCU for the
+ * master).
+ */
+static unsigned int fnp6l_ft_bare_lif(struct fnp6l *np, struct net_device *dev)
+{
+	struct net_device *master;
+	unsigned int lif;
+	bool ok;
+
+	lif = fnp6l_ft_sw_lif(np, dev);
+	if (!lif)
+		return 0;
+	rcu_read_lock();
+	master = netdev_master_upper_dev_get_rcu(dev);
+	if (!master)
+		ok = READ_ONCE(bare_ports);
+	else
+		ok = netif_is_bridge_master(master) &&
+		     fnp6l_ft_bridged(np, dev, master);
+	rcu_read_unlock();
+	return ok ? lif : 0;
+}
+
 /*
  * LIFs of one end of a flow: a port that is not a DSA conduit -> its port
- * LIF (60E: wan1 0, wan2 2); with the switch ports classified, a bond of
- * switch ports -> the LIF of every member (@all, the ingress: one session
- * per member) or of the first running one (output).
+ * LIF (60E: wan1 0, wan2 2); with the switch ports classified, a bare or
+ * bridged switch port -> its LIF (fnp6l_ft_bare_lif), a bond of switch ports -> the LIF of
+ * every member (@all, the ingress: one session per member) or of the first
+ * running one (output).
  * 0 when the end is not ours.
  */
 static unsigned int fnp6l_ft_end(struct fnp6l *np, struct net_device *dev,
@@ -4258,8 +4680,12 @@ static unsigned int fnp6l_ft_end(struct fnp6l *np, struct net_device *dev,
 		lifs[0] = p->lif;
 		return 1;
 	}
-	if (!np->sw_on || !netif_is_bond_master(dev))
+	if (!np->sw_on)
 		return 0;
+	if (!netif_is_bond_master(dev)) {
+		lifs[0] = fnp6l_ft_bare_lif(np, dev);
+		return lifs[0] ? 1 : 0;
+	}
 	rcu_read_lock();
 	netdev_walk_all_lower_dev_rcu(dev, fnp6l_ft_lower, &priv);
 	rcu_read_unlock();
@@ -4499,6 +4925,12 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	if (nout != 1)
 		return fnp6l_ft_refuse_dev(idev, extack, "output is not an NP end");
 	/*
+	 * The session MTU is 1500 (fnp6l_sse_entry4): the NP would send frames
+	 * of up to 1500 bytes out of a smaller MTU, without an ICMP error.
+	 */
+	if (odev && READ_ONCE(odev->mtu) < ETH_DATA_LEN)
+		return fnp6l_ft_refuse_dev(idev, extack, "output MTU under 1500");
+	/*
 	 * The VLAN match of nf_flow_table_offload: in used_keys with our
 	 * flowtable fix, left out of it by mainline (dissector offset set
 	 * only), so a VLAN_POP of the tuple tells it is there and it is read
@@ -4525,10 +4957,16 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	for (i = 0; i < fl->n_in_lif; i++)
 		if (fl->in_lif[i] == olif[0])
 			return fnp6l_ft_refuse_dev(idev, extack, "hairpin");
-	/* one port end at least: switch <-> switch is not tried */
+	/*
+	 * One port end at least, unless sw_routed: a flow routed between two
+	 * switch LIFs (dmz <-> internal3, a bond <-> a bare port) enters and
+	 * leaves through the conduit link, the NP turning it round between
+	 * two LIFs of the same MAC port (never measured: off by default).
+	 * The same LIF both ways stays refused above (hairpin).
+	 */
 	for (i = j = 0; i < fl->n_in_lif; i++)
 		j += fnp6l_lif_is_sw(np, fl->in_lif[i]);
-	if (j && fnp6l_lif_is_sw(np, olif[0]))
+	if (j && fnp6l_lif_is_sw(np, olif[0]) && !READ_ONCE(sw_routed))
 		return fnp6l_ft_refuse_dev(idev, extack, "switch to switch");
 	if (!is_valid_ether_addr(eth))
 		return fnp6l_ft_refuse_dev(idev, extack, "no destination MAC");
@@ -4638,7 +5076,7 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 	 * them refused the deletes of short connections (full, then a flow
 	 * kept on ft_dead). Offered again at the next refresh.
 	 */
-	if (np->cmd_buf &&
+	if (np->cmdq_on &&
 	    fnp6l_cmdq_room(np) < fl.n_in_lif + NP6L_SSE_DEL_ROOM(np->cmdq.size)) {
 		np->sse_iskip++;
 		ret = -EBUSY;
@@ -4887,6 +5325,18 @@ static int fnp6l_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 	case NETDEV_CHANGE:
 	case NETDEV_CHANGELOWERSTATE:
 		break;
+	case NETDEV_CHANGEUPPER:
+		/*
+		 * A switch port joins or leaves a bridge (or a bond): its
+		 * flows were offloaded with the source MAC and the end of
+		 * before; torn down, offered anew. Under RTNL, as the flow
+		 * table does itself on NETDEV_DOWN.
+		 */
+		if (IS_ENABLED(CONFIG_NF_FLOW_TABLE) &&
+		    READ_ONCE(np->ft_on) && READ_ONCE(np->sw_on) &&
+		    fnp6l_ft_sw_lif(np, dev))
+			nf_flow_table_cleanup(dev);
+		return NOTIFY_DONE;
 	default:
 		return NOTIFY_DONE;
 	}
@@ -4898,6 +5348,139 @@ static int fnp6l_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 	mod_delayed_work(system_wq, &np->ft_lag_work,
 			 msecs_to_jiffies(lag_repick_ms));
 	return NOTIFY_DONE;
+}
+
+/* The user port of the switch LIF @lif, or NULL. RTNL. */
+static struct net_device *fnp6l_sw_user(struct fnp6l *np, unsigned int lif)
+{
+#if IS_REACHABLE(CONFIG_NET_DSA)
+	struct fnp6l_port *c = lif < NP6L_MAX_LIF ? np->sw_conduit[lif] : NULL;
+	struct dsa_port *cpu, *dp;
+
+	if (!c)
+		return NULL;
+	cpu = c->ndev->dsa_ptr;
+	if (!cpu)
+		return NULL;
+	dp = dsa_to_port(cpu->ds, np->sw_port[lif]);
+	return dp ? dp->user : NULL;
+#else
+	return NULL;
+#endif
+}
+
+/*
+ * A station learnt by a bridge on one of our switch ports, or forgotten
+ * there (an entry put by the user only: offloaded stations are not seen
+ * ageing by the bridge): an offloaded flow towards it through another
+ * port of the bridge would keep sending there. Queued for
+ * fnp6l_ft_fdb_work (60D: fnp4l_dsa_fdb_event). Atomic.
+ */
+static int fnp6l_ft_fdb_event(struct notifier_block *nb, unsigned long event,
+			      void *ptr)
+{
+	struct fnp6l *np = container_of(nb, struct fnp6l, ft_fdb_nb);
+	struct switchdev_notifier_fdb_info *fdb = ptr;
+	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
+	struct net_device *master;
+	unsigned long flags;
+	bool ours;
+
+	if ((event != SWITCHDEV_FDB_ADD_TO_DEVICE &&
+	     (event != SWITCHDEV_FDB_DEL_TO_DEVICE || !fdb->added_by_user)) ||
+	    fdb->is_local || !READ_ONCE(bridge_offload) ||
+	    !READ_ONCE(np->ft_on) || !READ_ONCE(np->sw_on))
+		return NOTIFY_DONE;
+	rcu_read_lock();
+	master = netdev_master_upper_dev_get_rcu(dev);
+	ours = master && netif_is_bridge_master(master) &&
+	       fnp6l_ft_sw_lif(np, dev);
+	rcu_read_unlock();
+	if (!ours)
+		return NOTIFY_DONE;
+
+	spin_lock_irqsave(&np->ft_fdb_lock, flags);
+	if (np->ft_fdb_n < ARRAY_SIZE(np->ft_fdb_dev)) {
+		dev_hold(dev);
+		np->ft_fdb_dev[np->ft_fdb_n] = dev;
+		ether_addr_copy(np->ft_fdb_addr[np->ft_fdb_n], fdb->addr);
+		np->ft_fdb_del[np->ft_fdb_n] =
+			event == SWITCHDEV_FDB_DEL_TO_DEVICE;
+		np->ft_fdb_n++;
+	} else {
+		np->ft_fdb_lost = true;
+	}
+	spin_unlock_irqrestore(&np->ft_fdb_lock, flags);
+	queue_work(system_wq, &np->ft_fdb_work);
+	return NOTIFY_DONE;
+}
+
+/*
+ * Tear down the flows towards a station learnt on another port than the one
+ * of their output LIF, or forgotten (all the bridged LIFs past a full
+ * ring): the flow table tears down every flow through that port
+ * (nf_flow_table_cleanup), whose packets then go through the host, which
+ * offers them anew once the path resolves the new port. The flow list under
+ * fnp6l_sse_lock, the cleanup outside it (it flushes the offload work,
+ * whose callbacks take that lock).
+ */
+static void fnp6l_ft_fdb_work(struct work_struct *work)
+{
+	struct fnp6l *np = container_of(work, struct fnp6l, ft_fdb_work);
+	struct net_device *devs[ARRAY_SIZE(np->ft_fdb_dev)];
+	u8 addrs[ARRAY_SIZE(np->ft_fdb_dev)][ETH_ALEN];
+	bool dels[ARRAY_SIZE(np->ft_fdb_dev)];
+	struct fnp6l_ft_flow *flow;
+	unsigned long old = 0, flags;
+	struct net_device *udev;
+	unsigned int i, n, lif, out;
+	bool lost;
+
+	spin_lock_irqsave(&np->ft_fdb_lock, flags);
+	n = np->ft_fdb_n;
+	memcpy(devs, np->ft_fdb_dev, n * sizeof(devs[0]));
+	memcpy(addrs, np->ft_fdb_addr, n * ETH_ALEN);
+	memcpy(dels, np->ft_fdb_del, n * sizeof(dels[0]));
+	np->ft_fdb_n = 0;
+	lost = np->ft_fdb_lost;
+	np->ft_fdb_lost = false;
+	spin_unlock_irqrestore(&np->ft_fdb_lock, flags);
+
+	rtnl_lock();
+	mutex_lock(&fnp6l_sse_lock);
+	list_for_each_entry(flow, &np->ft_flows, node) {
+		out = flow->opt.out;
+		if (flow->obond || !fnp6l_lif_is_sw(np, out))
+			continue;
+		if (lost) {
+			__set_bit(out, &old);
+			continue;
+		}
+		for (i = 0; i < n; i++) {
+			if (!ether_addr_equal(flow->eth, addrs[i]))
+				continue;
+			lif = fnp6l_ft_sw_lif(np, devs[i]);
+			/* forgotten: whatever port; learnt: another port */
+			if (dels[i] || out != lif)
+				__set_bit(out, &old);
+		}
+	}
+	mutex_unlock(&fnp6l_sse_lock);
+	if (old && IS_ENABLED(CONFIG_NF_FLOW_TABLE)) {
+		for_each_set_bit(lif, &old, NP6L_MAX_LIF) {
+			udev = fnp6l_sw_user(np, lif);
+			if (!udev)
+				continue;
+			nf_flow_table_cleanup(udev);
+			np->ft_fdb_moves++;
+		}
+		dev_info(np->dev, "ft: bridge: station moved or forgotten, flows through LIFs %#lx torn down\n",
+			 old);
+	}
+	rtnl_unlock();
+
+	for (i = 0; i < n; i++)
+		dev_put(devs[i]);
 }
 
 /*
@@ -4961,6 +5544,124 @@ static int fnp6l_ft_cb(enum tc_setup_type type, void *type_data, void *cb_priv)
 
 static LIST_HEAD(fnp6l_block_cb_list);
 
+static void fnp6l_ft_priv_release(void *cb_priv)
+{
+	kfree(cb_priv);
+}
+
+/*
+ * Bare switch ports: a flow table listing a DSA user port reaches its
+ * conduit's ndo_setup_tc with the table's block, once per user port listed
+ * (dsa_user_setup_ft_block), the user port unnamed. One callback per table
+ * and conduit, counted (flow_block_cb_incref/decref), bound with the first
+ * user port and unbound with the last (several tables may be bound at a
+ * time, as for a port: a reload binds the new table before it unbinds the
+ * old one); the ingress device of each flow is
+ * found by meta.ingress_ifindex. Only a flow entering through a user port of
+ * this conduit is parsed (fnp6l_ft_end: a bare port with a LIF of its own),
+ * any other is left to the callback of its own device. STATS and DESTROY
+ * go by cookie, as for every callback of the table: the activity reported
+ * is a time, never packets or bytes, so a flow seen by several callbacks
+ * is not counted twice.
+ */
+struct fnp6l_ft_dsa {
+	struct fnp6l_port *port;	/* the conduit */
+	struct net *net;		/* of the flow table */
+	const struct flow_block *table;	/* one callback per table */
+};
+
+static int fnp6l_ft_dsa_cb(enum tc_setup_type type, void *type_data,
+			   void *cb_priv)
+{
+	struct fnp6l_ft_dsa *b = cb_priv;
+	struct fnp6l *np = b->port->np;
+	struct flow_cls_offload *cls = type_data;
+	struct flow_match_meta meta;
+	struct net_device *idev;
+	struct dsa_port *dp;
+	int ret;
+
+	if (type != TC_SETUP_CLSFLOWER)
+		return -EOPNOTSUPP;
+	switch (cls->command) {
+	case FLOW_CLS_REPLACE:
+		if (!flow_rule_match_key(flow_cls_offload_flow_rule(cls),
+					 FLOW_DISSECTOR_KEY_META))
+			return -EOPNOTSUPP;
+		flow_rule_match_meta(flow_cls_offload_flow_rule(cls), &meta);
+		idev = dev_get_by_index(b->net, meta.key->ingress_ifindex);
+		if (!idev)
+			return -ENOENT;
+		dp = fnp6l_dsa_port(idev);
+		if (IS_ERR_OR_NULL(dp) || !dp->cpu_dp ||
+		    dp->cpu_dp->conduit != b->port->ndev || !tc_can_offload(idev))
+			ret = -EOPNOTSUPP;	/* not entering through our user ports */
+		else
+			ret = fnp6l_ft_replace(np, idev, b->table, cls);
+		dev_put(idev);
+		return ret;
+	case FLOW_CLS_DESTROY:
+		return fnp6l_ft_destroy(np, cls->cookie);
+	case FLOW_CLS_STATS:
+		return fnp6l_ft_stats(np, cls);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int fnp6l_setup_ft_conduit(struct fnp6l_port *port,
+				  struct flow_block_offload *f)
+{
+	struct fnp6l *np = port->np;
+	struct flow_block_cb *block_cb;
+	struct fnp6l_ft_dsa *b;
+
+	switch (f->command) {
+	case FLOW_BLOCK_BIND:
+		block_cb = flow_block_cb_lookup(f->block, fnp6l_ft_dsa_cb, port);
+		if (block_cb) {		/* another user port of the same table */
+			flow_block_cb_incref(block_cb);
+			return 0;
+		}
+		if (!READ_ONCE(bare_ports) || !READ_ONCE(np->ft_on) ||
+		    !READ_ONCE(np->sw_on)) {
+			NL_SET_ERR_MSG_MOD(f->extack, "flow offload not enabled");
+			return -EOPNOTSUPP;
+		}
+		/* one callback per table, others bound or not */
+		b = kzalloc(sizeof(*b), GFP_KERNEL);
+		if (!b)
+			return -ENOMEM;
+		b->port = port;
+		b->net = f->net;
+		b->table = f->block;
+		block_cb = flow_block_cb_alloc(fnp6l_ft_dsa_cb, port, b,
+					       fnp6l_ft_priv_release);
+		if (IS_ERR(block_cb)) {
+			kfree(b);
+			return PTR_ERR(block_cb);
+		}
+		flow_block_cb_incref(block_cb);
+		flow_block_cb_add(block_cb, f);
+		list_add_tail(&block_cb->driver_list, &fnp6l_block_cb_list);
+		netdev_info(port->ndev, "ft: bound (bare switch ports)\n");
+		return 0;
+	case FLOW_BLOCK_UNBIND:
+		block_cb = flow_block_cb_lookup(f->block, fnp6l_ft_dsa_cb, port);
+		if (!block_cb)
+			return -ENOENT;
+		if (flow_block_cb_decref(block_cb))
+			return 0;	/* other user ports still listed */
+		flow_block_cb_remove(block_cb, f);
+		list_del(&block_cb->driver_list);
+		fnp6l_ft_forget_table(np, f->block);
+		netdev_info(port->ndev, "ft: unbound (bare switch ports)\n");
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static int fnp6l_setup_ft(struct fnp6l_port *port, struct flow_block_offload *f)
 {
 	flow_setup_cb_t *cb = fnp6l_ft_cb;
@@ -4970,10 +5671,13 @@ static int fnp6l_setup_ft(struct fnp6l_port *port, struct flow_block_offload *f)
 	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
 		return -EOPNOTSUPP;
 	f->driver_block_list = &fnp6l_block_cb_list;
+	/* a DSA conduit: reached through user ports of the switch only */
+	if (netdev_uses_dsa(port->ndev))
+		return fnp6l_setup_ft_conduit(port, f);
 
 	switch (f->command) {
 	case FLOW_BLOCK_BIND:
-		if (!READ_ONCE(port->np->ft_on) || netdev_uses_dsa(port->ndev)) {
+		if (!READ_ONCE(port->np->ft_on)) {
 			NL_SET_ERR_MSG_MOD(f->extack,
 					   "flow offload not enabled");
 			return -EOPNOTSUPP;
@@ -5048,11 +5752,6 @@ static int fnp6l_ft_bond_cb(enum tc_setup_type type, void *type_data,
 	}
 }
 
-static void fnp6l_ft_bond_release(void *cb_priv)
-{
-	kfree(cb_priv);
-}
-
 static int fnp6l_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 			       void *cb_priv, enum tc_setup_type type,
 			       void *type_data, void *data,
@@ -5093,7 +5792,7 @@ static int fnp6l_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 		b->dev = dev;
 		b->table = f->block;
 		block_cb = flow_indr_block_cb_alloc(fnp6l_ft_bond_cb, dev, b,
-						    fnp6l_ft_bond_release, f, dev,
+						    fnp6l_ft_priv_release, f, dev,
 						    sch, data, np, cleanup);
 		if (IS_ERR(block_cb)) {
 			kfree(b);
@@ -5280,6 +5979,7 @@ static void fnp6l_debugfs_init(struct fnp6l *np)
 
 	debugfs_create_file("sse", 0400, dir, np, &fnp6l_dbg_sse_fops);
 	debugfs_create_file("class_table", 0400, dir, np, &fnp6l_dbg_class_fops);
+	debugfs_create_file("sw_class", 0400, dir, np, &fnp6l_dbg_sw_fops);
 }
 
 /*
@@ -5529,11 +6229,16 @@ static int fnp6l_setup_net(struct platform_device *pdev, struct fnp6l *np)
 	np->ft_qoff = -1;
 	INIT_DELAYED_WORK(&np->ft_lag_work, fnp6l_ft_lag_work);
 	np->ft_nb.notifier_call = fnp6l_ft_netdev_event;
+	spin_lock_init(&np->ft_fdb_lock);
+	INIT_WORK(&np->ft_fdb_work, fnp6l_ft_fdb_work);
+	np->ft_fdb_nb.notifier_call = fnp6l_ft_fdb_event;
 	if (IS_ENABLED(CONFIG_FORTINET_NP6LITE_FLOW_OFFLOAD)) {
 		if (flow_indr_dev_register(fnp6l_ft_indr_setup, np))
 			dev_warn(np->dev, "ft: indirect block (bond) not registered\n");
 		if (register_netdevice_notifier(&np->ft_nb))
 			dev_warn(np->dev, "ft: netdevice notifier not registered\n");
+		if (register_switchdev_notifier(&np->ft_fdb_nb))
+			dev_warn(np->dev, "ft: switchdev notifier (bridge stations) not registered\n");
 	}
 	mutex_lock(&fnp6l_sse_lock);
 	fnp6l_v6_mtu_init(np);

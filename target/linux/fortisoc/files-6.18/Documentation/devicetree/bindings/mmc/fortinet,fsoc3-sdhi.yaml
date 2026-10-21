@@ -56,12 +56,45 @@ properties:
       Write windows of the read-only guard, for an installer writing one
       firmware slot. Once armed from user space, plain writes of 512-byte
       blocks to the user area lying entirely inside one window are let
-      through; everything else stays refused. A window holding sector 0
-      lets the whole sector be written. Without it, the guard refuses
-      every write.
+      through; everything else stays refused. In a write of sector 0,
+      only the bytes listed by fortinet,sector0-bytes may change. Without
+      windows, the guard refuses every write.
+
+  fortinet,sector0-bytes:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    maxItems: 8
+    items:
+      items:
+        - description: Offset of the first byte, in sector 0
+          maximum: 511
+        - description: Number of bytes
+          minimum: 1
+          maximum: 512
+    description:
+      Bytes of sector 0 that a write through a window may change, compared
+      with sector 0 as it was when the windows were armed. Without it, the
+      content of sector 0 may not change at all.
+
+  fortinet,persistent-windows:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    maxItems: 4
+    items:
+      items:
+        - description: First 512-byte sector of the window, in the user
+            area, never sector 0
+          minimum: 1
+        - description: Number of sectors of the window
+          minimum: 1
+    description:
+      Areas of the user area holding a writable file system, open to plain
+      writes of 512-byte blocks from boot, without arming, until the
+      windows are turned off. An area reached through a loop device backed
+      by the whole disk is aligned on 4 KiB pages (multiples of 8 sectors).
 
 dependencies:
   fortinet,write-windows: [ "fortinet,force-ro" ]
+  fortinet,sector0-bytes: [ "fortinet,write-windows" ]
+  fortinet,persistent-windows: [ "fortinet,force-ro" ]
 
 required:
   - compatible
@@ -88,4 +121,6 @@ examples:
         no-sd;
         fortinet,force-ro;
         fortinet,write-windows = <0 1>, <786440 524288>;
+        fortinet,sector0-bytes = <0x30 32>, <0x12c 4>, <0x1be 1>, <0x1ce 1>;
+        fortinet,persistent-windows = <819208 491520>;
     };

@@ -22,7 +22,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	NUM_FLOW_ACTIONS,
  };
  
-@@ -327,6 +328,7 @@ struct flow_action_entry {
+@@ -329,6 +330,7 @@ struct flow_action_entry {
  		struct {				/* FLOW_ACTION_PPPOE_PUSH */
  			u16		sid;
  		} pppoe;

@@ -99,7 +99,7 @@ endef
 define KernelPackage/fortinet-np6lite
   SUBMENU:=Network Devices
   TITLE:=Fortinet NP6Lite network processor
-  DEPENDS:=@TARGET_fortisoc_fsoc3
+  DEPENDS:=@TARGET_fortisoc_fsoc3 +kmod-nf-flow
   FILES:=$(PKG_BUILD_DIR)/fortinet-np6lite.ko
   AUTOLOAD:=$(call AutoLoad,20,fortinet-np6lite,1)
   KCONFIG:=

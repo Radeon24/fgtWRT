@@ -27,6 +27,19 @@ DEVICE_TYPE:=router
 
 include $(INCLUDE_DIR)/target.mk
 
+# Patches of one subtarget only (<subtarget>/patches-<version>), applied after
+# those of the target: changes kept out of the kernels of the other subtargets.
+SUBTARGET_PATCH_DIR:=$(CURDIR)/$(SUBTARGET)/patches-$(KERNEL_PATCHVER)
+ifneq ($(SUBTARGET),)
+ifneq ($(wildcard $(SUBTARGET_PATCH_DIR)),)
+  KERNEL_FILE_DEPENDS += $(SUBTARGET_PATCH_DIR)
+  define Kernel/Patch
+	$(Kernel/Patch/Default)
+	$(call PatchDir,$(LINUX_DIR),$(SUBTARGET_PATCH_DIR),platform-$(SUBTARGET)/)
+  endef
+endif
+endif
+
 # No flash to manage at build time: the internal storage holds firmware
 # slots behind write guards, not an OpenWrt flash layout.
 DEFAULT_PACKAGES := $(filter-out mtd,$(DEFAULT_PACKAGES))

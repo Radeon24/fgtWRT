@@ -1,0 +1,106 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] netfilter: flowtable: release flows no callback accepted without a destroy
+
+Every flow of a flow table with the offload flag gets NF_FLOW_HW when it
+is added, before any callback has seen it. A flow every callback refused
+(driver table full, unsupported path) holds no hardware state, yet its
+teardown still queues a DESTROY and waits for HW_DEAD plus one more
+garbage collection pass before the flow, and the reference it holds on
+its conntrack entry, are released; meanwhile it gets STATS work too.
+Under a high rate of short connections whose tuples are reused, the
+conntrack entries killed by the reopen stay counted against
+nf_conntrack_max for that extra time, out of reach of early drop.
+
+Record that a callback accepted the flow (NF_FLOW_HW_ACCEPTED, set by the
+REPLACE work before it clears the pending bit). A flow never accepted is
+released at teardown like a software flow, after claiming the pending bit
+for good so that no offload work can start for it any more; it gets
+neither DESTROY nor STATS.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ include/net/netfilter/nf_flow_table.h |  1 +
+ net/netfilter/nf_flow_table_core.c    | 33 +++++++++++++++++++++++++---
+ net/netfilter/nf_flow_table_offload.c |  2 ++
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -172,6 +172,7 @@ enum nf_flow_flags {
+ 	NF_FLOW_HW_DEAD,
+ 	NF_FLOW_HW_BIDIRECTIONAL,
+ 	NF_FLOW_HW_ESTABLISHED,
++	NF_FLOW_HW_ACCEPTED,
+ };
+ 
+ enum flow_offload_type {
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -563,6 +563,29 @@ static void nf_flow_table_extend_ct_time
+ 	nf_ct_put(ct);
+ }
+ 
++/*
++ * No callback accepted the flow (every REPLACE refused, or none run yet): no
++ * driver holds state for it, a DESTROY would find nothing, and waiting for
++ * one keeps the flow, and the conntrack entry it holds a reference on, one
++ * more garbage collection pass. Claim the pending bit for good, so that no
++ * offload work starts for this flow any more, then look again: a REPLACE
++ * that completed meanwhile may have been accepted (it sets
++ * NF_FLOW_HW_ACCEPTED before it releases the pending bit).
++ */
++static bool nf_flow_hw_release_unaccepted(struct flow_offload *flow)
++{
++	if (test_bit(NF_FLOW_HW_ACCEPTED, &flow->flags) ||
++	    test_and_set_bit(NF_FLOW_PENDING, &flow->flags))
++		return false;
++
++	if (test_bit(NF_FLOW_HW_ACCEPTED, &flow->flags)) {
++		clear_bit(NF_FLOW_PENDING, &flow->flags);
++		return false;
++	}
++
++	return true;
++}
++
+ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 				    struct flow_offload *flow, void *data)
+ {
+@@ -583,7 +606,8 @@ static void nf_flow_offload_gc_step(stru
+ 	}
+ 
+ 	if (teardown) {
+-		if (test_bit(NF_FLOW_HW, &flow->flags)) {
++		if (test_bit(NF_FLOW_HW, &flow->flags) &&
++		    !nf_flow_hw_release_unaccepted(flow)) {
+ 			if (!test_bit(NF_FLOW_HW_DYING, &flow->flags))
+ 				nf_flow_offload_del(flow_table, flow);
+ 			else if (test_bit(NF_FLOW_HW_DEAD, &flow->flags))
+@@ -591,11 +615,14 @@ static void nf_flow_offload_gc_step(stru
+ 		} else {
+ 			flow_offload_del(flow_table, flow);
+ 		}
++	} else if (!test_bit(NF_FLOW_HW, &flow->flags) ||
++		   !test_bit(NF_FLOW_HW_ACCEPTED, &flow->flags)) {
++		/* nothing held in hardware: neither destroy nor stats */
++		return;
+ 	} else if (test_bit(NF_FLOW_CLOSING, &flow->flags) &&
+-		   test_bit(NF_FLOW_HW, &flow->flags) &&
+ 		   !test_bit(NF_FLOW_HW_DYING, &flow->flags)) {
+ 		nf_flow_offload_del(flow_table, flow);
+-	} else if (test_bit(NF_FLOW_HW, &flow->flags)) {
++	} else {
+ 		nf_flow_offload_stats(flow_table, flow);
+ 	}
+ }
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1094,6 +1094,8 @@ static void flow_offload_work_add(struct
+ 	if (err < 0)
+ 		goto out;
+ 
++	/* a callback holds state for the flow: destroy it at teardown */
++	set_bit(NF_FLOW_HW_ACCEPTED, &offload->flow->flags);
+ 	set_bit(IPS_HW_OFFLOAD_BIT, &offload->flow->ct->status);
+ 
+ out:

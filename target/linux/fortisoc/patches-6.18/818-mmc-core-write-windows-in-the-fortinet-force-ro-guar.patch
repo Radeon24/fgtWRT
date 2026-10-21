@@ -4,28 +4,38 @@ Subject: [PATCH] mmc: core: write windows in the fortinet,force-ro guard, armed 
 Optional (MMC_WRITE_WINDOWS, default n): sector windows of the
 force-ro guard, read from the fortinet,write-windows property of the
 guarded host, disarmed at boot and armed once per boot through the
-write_windows parameter, for the installer of a second firmware slot. Also refuse data writes through the block ioctl under the guard,
-window or not.
+write_windows parameter, for the installer of a second firmware slot.
+A write of sector 0 may only change the bytes listed by
+fortinet,sector0-bytes, compared with a copy read at arming time.
+Optional persistent windows (fortinet,persistent-windows) are open from
+boot without arming, for a file system kept in that slot, until "off";
+a refused PARTITION_CONFIG switch closes every window. Also refuse data
+writes through the block ioctl under the guard, window or not.
+
+The code lives in drivers/mmc/core/write-windows.c (our files); this
+patch hooks it up (core, host, block driver for the disk of the user
+area).
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/mmc/core/Kconfig |  25 +++
- drivers/mmc/core/block.c |   7 +-
- drivers/mmc/core/core.c  | 298 ++++++++++++++++++++++++++++++++++++++++-
- drivers/mmc/core/core.h  |  10 +
- drivers/mmc/core/host.c  |   9 +
- drivers/mmc/core/queue.c |   4 +
- 6 files changed, 349 insertions(+), 4 deletions(-)
+ drivers/mmc/core/Kconfig  | 32 ++++++++++++++++++++++++++++++++
+ drivers/mmc/core/Makefile |  1 +
+ drivers/mmc/core/block.c  | 10 +++++++++-
+ drivers/mmc/core/core.c   | 19 ++++++++++++++++---
+ drivers/mmc/core/core.h   |  2 ++
+ drivers/mmc/core/host.c   |  9 +++++++++
+ drivers/mmc/core/queue.c  |  4 ++++
+ 7 files changed, 73 insertions(+), 4 deletions(-)
 
 --- a/drivers/mmc/core/Kconfig
 +++ b/drivers/mmc/core/Kconfig
-@@ -34,6 +34,31 @@ config PWRSEQ_SIMPLE
+@@ -34,6 +34,38 @@ config PWRSEQ_SIMPLE
  	  This driver can also be built as a module. If so, the module
  	  will be called pwrseq_simple.
  
 +config MMC_WRITE_WINDOWS
 +	bool "Write windows in the fortinet,force-ro guard, armed at run time"
-+	depends on MMC
++	depends on MMC && BLOCK
 +	default n
 +	help
 +	  The read-only guard of hosts marked "fortinet,force-ro" refuses
@@ -34,23 +44,40 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 +	  through when the whole request lies inside one of the windows
 +	  given by the "fortinet,write-windows" property of the host
 +	  (<start count> pairs of 512-byte sectors). A guarded host without
-+	  that property stays strictly read-only.
++	  windows stays strictly read-only.
 +
 +	  The windows are disarmed at boot: every write stays refused until
 +	  user space (the installer) writes "arm" to
 +	  /sys/module/mmc_core/parameters/write_windows. They can be armed
-+	  once per boot, for 10 minutes at most, and are then off until the
-+	  next boot; writing "off" (end of the installation) or a refused
-+	  PARTITION_CONFIG switch turns them off as well.
-+	  The parameter reads "inactive", "disarmed ...", "armed ..." or
-+	  "off". Erase, discard, EXT_CSD writes, boot/RPMB partitions, the
-+	  command queue engine and ioctl writes stay refused.
++	  once per boot, for 10 minutes at most; writing "off" (end of the
++	  installation) or a refused PARTITION_CONFIG switch turns them off
++	  until the next boot. A write of sector 0 may only change the bytes
++	  listed by "fortinet,sector0-bytes", compared with a copy of
++	  sector 0 read at arming time.
++
++	  Optional persistent windows ("fortinet,persistent-windows") are
++	  open from boot without arming, for a file system kept in a
++	  firmware slot, until "off"; the end of the armed time leaves them
++	  open ("expired").
++	  The parameter reads "inactive", "disarmed ...", "armed ...",
++	  "expired ..." or "off". Erase, discard, EXT_CSD writes, boot/RPMB
++	  partitions, the command queue engine and ioctl writes stay refused.
 +
 +	  For an installer writing one firmware slot of an eMMC. Say N.
 +
  config MMC_BLOCK
  	tristate "MMC block device driver"
  	depends on BLOCK
+--- a/drivers/mmc/core/Makefile
++++ b/drivers/mmc/core/Makefile
+@@ -10,6 +10,7 @@ mmc_core-y			:= core.o bus.o host.o \
+ 				   sdio_cis.o sdio_io.o sdio_irq.o sd_uhs2.o\
+ 				   slot-gpio.o regulator.o
+ mmc_core-$(CONFIG_OF)		+= pwrseq.o
++mmc_core-$(CONFIG_MMC_WRITE_WINDOWS)	+= write-windows.o
+ obj-$(CONFIG_PWRSEQ_SIMPLE)	+= pwrseq_simple.o
+ obj-$(CONFIG_PWRSEQ_SD8787)	+= pwrseq_sd8787.o
+ obj-$(CONFIG_PWRSEQ_EMMC)	+= pwrseq_emmc.o
 --- a/drivers/mmc/core/block.c
 +++ b/drivers/mmc/core/block.c
 @@ -497,6 +497,10 @@ static int __mmc_blk_ioctl_cmd(struct mm
@@ -74,292 +101,26 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	       !(card->csd.cmdclass & CCC_BLOCK_WRITE);
  }
  
+@@ -3058,6 +3063,7 @@ static void mmc_blk_remove_req(struct mm
+ 	 * Flush remaining requests and free queues. It is freeing the queue
+ 	 * that stops new requests from being accepted.
+ 	 */
++	mmc_write_windows_remove_disk(md->disk);
+ 	del_gendisk(md->disk);
+ 	mmc_cleanup_queue(&md->queue);
+ 	mmc_blk_put(md);
+@@ -3299,6 +3305,8 @@ static int mmc_blk_probe(struct mmc_card
+ 		ret = PTR_ERR(md);
+ 		goto out_free;
+ 	}
++	/* Read-only guard: the disk of the user area of its windows */
++	mmc_write_windows_add_disk(card->host, md->disk);
+ 
+ 	ret = mmc_blk_alloc_parts(card, md);
+ 	if (ret)
 --- a/drivers/mmc/core/core.c
 +++ b/drivers/mmc/core/core.c
-@@ -263,13 +263,299 @@ static bool mmc_force_ro_cmd_ok(const st
- 	}
- }
- 
-+#ifdef CONFIG_MMC_WRITE_WINDOWS
-+/*
-+ * Write windows of the read-only guard, for an installer writing one
-+ * firmware slot: absolute 512-byte sectors of the user area, given by the
-+ * "fortinet,write-windows" property of the guarded host (<start count>
-+ * pairs), read once when the host is added (nothing can change them at
-+ * run time). Only one guarded host may have windows; a guarded host
-+ * without the property stays strictly read-only. A window holding sector 0
-+ * lets the whole sector be written: which bytes of it may change is
-+ * decided by the installer in user space.
-+ * Everything else stays refused: a write request must lie entirely inside
-+ * one window, or it is refused as a whole.
-+ */
-+#define MMC_WRITE_WINDOWS_MAX	4
-+
-+static struct {
-+	u32 start;
-+	u32 count;
-+} mmc_write_windows[MMC_WRITE_WINDOWS_MAX];
-+static unsigned int mmc_write_windows_nr;
-+/* The guarded host the windows belong to, set once */
-+static struct mmc_host *mmc_write_windows_host;
-+
-+/* Lifetime of an armed window, from the arming (one installation) */
-+#define MMC_WRITE_WINDOWS_ARM_SECS	600
-+
-+/*
-+ * State of the windows, one way only (a state never goes back to an
-+ * earlier, more permissive one within a boot):
-+ *  INACTIVE  no guarded host registered yet;
-+ *  DISARMED  guarded host registered, every write refused (boot default);
-+ *  ARMED     armed by user space ("arm" written to the parameter), once per
-+ *            boot, for MMC_WRITE_WINDOWS_ARM_SECS at most;
-+ *  OFF       disarmed for good until the next boot: armed time over, "off"
-+ *            written by user space (end of the installation), or the guard
-+ *            refused a PARTITION_CONFIG switch (the cached part_config could
-+ *            then say "user area" while another partition is selected).
-+ */
-+enum {
-+	MMC_WRWIN_INACTIVE,
-+	MMC_WRWIN_DISARMED,
-+	MMC_WRWIN_ARMED,
-+	MMC_WRWIN_OFF,
-+};
-+
-+static atomic_t mmc_write_windows_state = ATOMIC_INIT(MMC_WRWIN_INACTIVE);
-+static unsigned long mmc_write_windows_until;	/* jiffies, valid when ARMED */
-+static DEFINE_MUTEX(mmc_write_windows_lock);	/* host setup and arming */
-+
-+static void mmc_write_windows_disable(const char *why)
-+{
-+	int old = atomic_xchg(&mmc_write_windows_state, MMC_WRWIN_OFF);
-+
-+	if (old != MMC_WRWIN_OFF)
-+		pr_warn("force-ro: write windows off (%s)\n", why);
-+}
-+
-+/* True while armed; turns the windows off once the armed time is over */
-+static bool mmc_write_windows_armed(void)
-+{
-+	if (atomic_read(&mmc_write_windows_state) != MMC_WRWIN_ARMED)
-+		return false;
-+	/* pairs with the full barrier of the arming cmpxchg */
-+	smp_rmb();
-+	if (time_before(jiffies, READ_ONCE(mmc_write_windows_until)))
-+		return true;
-+	mmc_write_windows_disable("armed time over");
-+	return false;
-+}
-+
-+static bool mmc_write_window_ok(struct mmc_host *host,
-+				const struct mmc_request *mrq)
-+{
-+	const struct mmc_card *card = host->card;
-+	const struct mmc_command *cmd = mrq->cmd;
-+	const struct mmc_data *data = mrq->data;
-+	u64 start, end;
-+	int i;
-+
-+	if (host != READ_ONCE(mmc_write_windows_host) ||
-+	    !mmc_write_windows_armed())
-+		return false;
-+	/* Sector-addressed eMMC, user area selected (no boot, GP, RPMB) */
-+	if (!card || !mmc_card_mmc(card) || !mmc_card_blockaddr(card))
-+		return false;
-+	if (card->ext_csd.part_config & EXT_CSD_PART_CONFIG_ACC_MASK)
-+		return false;
-+	if (!cmd || !data || mrq->cap_cmd_during_tfr)
-+		return false;
-+	/* Plain write: no reliable write, tag, forced programming, CQE flags */
-+	if (data->flags != MMC_DATA_WRITE)
-+		return false;
-+	if (data->blksz != 512 || !data->blocks)
-+		return false;
-+	/* CMD12 is the only stop command */
-+	if (mrq->stop && (mrq->stop->opcode != MMC_STOP_TRANSMISSION ||
-+			  mrq->stop->arg != 0))
-+		return false;
-+
-+	switch (cmd->opcode) {
-+	case MMC_WRITE_BLOCK:
-+		if (data->blocks != 1 || mrq->sbc)
-+			return false;
-+		break;
-+	case MMC_WRITE_MULTIPLE_BLOCK:
-+		/*
-+		 * At least 2 blocks: tmio sends its automatic CMD12 only for
-+		 * more than one block, a 1-block CMD25 would stay open-ended.
-+		 */
-+		if (data->blocks < 2)
-+			return false;
-+		if (mrq->sbc) {
-+			/* block count only, exactly the data length */
-+			if (mrq->sbc->opcode != MMC_SET_BLOCK_COUNT ||
-+			    mrq->sbc->arg != data->blocks)
-+				return false;
-+		} else if (!mrq->stop) {
-+			return false;	/* open-ended write */
-+		}
-+		break;
-+	default:
-+		return false;
-+	}
-+
-+	start = cmd->arg;
-+	end = start + data->blocks;
-+	for (i = 0; i < mmc_write_windows_nr; i++) {
-+		u64 ws = mmc_write_windows[i].start;
-+		u64 we = ws + mmc_write_windows[i].count;
-+
-+		if (start >= ws && end <= we)
-+			return true;
-+	}
-+	return false;
-+}
-+
-+/*
-+ * Witness and arming switch for the installer:
-+ * /sys/module/mmc_core/parameters/write_windows reads "inactive", "off",
-+ * or "disarmed"/"armed" followed by the windows ("LBA+sectors"); writing
-+ * "arm" arms disarmed windows, once per boot, and "off" turns them off
-+ * until the next boot. Anything else is refused.
-+ */
-+static int mmc_write_windows_get(char *buf, const struct kernel_param *kp)
-+{
-+	int i, n, state;
-+
-+	mmc_write_windows_armed();	/* turns an expired arming off */
-+	state = atomic_read(&mmc_write_windows_state);
-+	if (state == MMC_WRWIN_OFF)
-+		return scnprintf(buf, PAGE_SIZE, "off\n");
-+	if (state == MMC_WRWIN_INACTIVE)
-+		return scnprintf(buf, PAGE_SIZE, "inactive\n");
-+	n = scnprintf(buf, PAGE_SIZE, "%s",
-+		      state == MMC_WRWIN_ARMED ? "armed" : "disarmed");
-+	for (i = 0; i < mmc_write_windows_nr; i++)
-+		n += scnprintf(buf + n, PAGE_SIZE - n, " %u+%u",
-+			       mmc_write_windows[i].start,
-+			       mmc_write_windows[i].count);
-+	return n + scnprintf(buf + n, PAGE_SIZE - n, "\n");
-+}
-+
-+static int mmc_write_windows_set(const char *val, const struct kernel_param *kp)
-+{
-+	/* Never from the kernel command line: at run time only */
-+	if (system_state != SYSTEM_RUNNING)
-+		return -EPERM;
-+	/* "off": less permissive than any state, always accepted */
-+	if (sysfs_streq(val, "off")) {
-+		mmc_write_windows_disable("turned off by user space");
-+		return 0;
-+	}
-+	if (!sysfs_streq(val, "arm"))
-+		return -EINVAL;
-+
-+	/*
-+	 * Only DISARMED can be armed, and the state never comes back to it:
-+	 * the deadline is written once per boot, never pushed back.
-+	 */
-+	guard(mutex)(&mmc_write_windows_lock);
-+	if (atomic_read(&mmc_write_windows_state) != MMC_WRWIN_DISARMED)
-+		return -EPERM;
-+	WRITE_ONCE(mmc_write_windows_until,
-+		   jiffies + MMC_WRITE_WINDOWS_ARM_SECS * HZ);
-+	/* full barrier on success: the deadline is seen before the state */
-+	if (atomic_cmpxchg(&mmc_write_windows_state, MMC_WRWIN_DISARMED,
-+			   MMC_WRWIN_ARMED) != MMC_WRWIN_DISARMED)
-+		return -EPERM;	/* turned off meanwhile */
-+
-+	pr_warn("force-ro: write windows armed for %u s by %s[%d]\n",
-+		MMC_WRITE_WINDOWS_ARM_SECS, current->comm,
-+		task_pid_nr(current));
-+	return 0;
-+}
-+
-+static const struct kernel_param_ops mmc_write_windows_ops = {
-+	.set = mmc_write_windows_set,
-+	.get = mmc_write_windows_get,
-+};
-+module_param_cb(write_windows, &mmc_write_windows_ops, NULL, 0644);
-+MODULE_PARM_DESC(write_windows,
-+		 "Write windows of the fortinet,force-ro guard (\"arm\" once per boot, \"off\")");
-+
-+/*
-+ * Called for a guarded host when it is added: read its windows, if any.
-+ * A second host with windows, or a bad property, turns them off for good.
-+ */
-+void mmc_write_windows_setup(struct mmc_host *host)
-+{
-+	struct device *dev = mmc_dev(host);
-+	u32 cells[2 * MMC_WRITE_WINDOWS_MAX];
-+	int n, i;
-+
-+	n = device_property_count_u32(dev, "fortinet,write-windows");
-+	if (n == -EINVAL)
-+		return;		/* no window: strictly read-only */
-+
-+	guard(mutex)(&mmc_write_windows_lock);
-+	if (mmc_write_windows_host) {
-+		pr_err("%s: force-ro: write windows of another host already\n",
-+		       mmc_hostname(host));
-+		mmc_write_windows_disable("more than one host with windows");
-+		return;
-+	}
-+	if (n <= 0 || n % 2 || n > ARRAY_SIZE(cells) ||
-+	    device_property_read_u32_array(dev, "fortinet,write-windows",
-+					   cells, n)) {
-+		pr_err("%s: force-ro: bad fortinet,write-windows\n",
-+		       mmc_hostname(host));
-+		mmc_write_windows_disable("bad fortinet,write-windows");
-+		return;
-+	}
-+	for (i = 0; i < n / 2; i++) {
-+		if (!cells[2 * i + 1]) {
-+			pr_err("%s: force-ro: empty write window\n",
-+			       mmc_hostname(host));
-+			mmc_write_windows_disable("bad fortinet,write-windows");
-+			return;
-+		}
-+		mmc_write_windows[i].start = cells[2 * i];
-+		mmc_write_windows[i].count = cells[2 * i + 1];
-+	}
-+	mmc_write_windows_nr = n / 2;
-+
-+	for (i = 0; i < mmc_write_windows_nr; i++)
-+		pr_warn("%s: force-ro: write window LBA %u..%llu (%u sectors), disarmed\n",
-+			mmc_hostname(host), mmc_write_windows[i].start,
-+			(u64)mmc_write_windows[i].start +
-+			mmc_write_windows[i].count - 1,
-+			mmc_write_windows[i].count);
-+	WRITE_ONCE(mmc_write_windows_host, host);
-+	atomic_cmpxchg(&mmc_write_windows_state, MMC_WRWIN_INACTIVE,
-+		       MMC_WRWIN_DISARMED);
-+}
-+
-+/* The block device of this host may be opened for writing */
-+bool mmc_write_windows_on_host(struct mmc_host *host)
-+{
-+	return host == READ_ONCE(mmc_write_windows_host);
-+}
-+
-+static void mmc_write_windows_note_refused(const struct mmc_command *cmd)
-+{
-+	if (cmd->opcode == MMC_SWITCH &&
-+	    ((cmd->arg >> 16) & 0xff) == EXT_CSD_PART_CONFIG)
-+		mmc_write_windows_disable("PARTITION_CONFIG switch refused");
-+}
-+#else
-+static void mmc_write_windows_note_refused(const struct mmc_command *cmd)
-+{
-+}
-+
-+static bool mmc_write_window_ok(struct mmc_host *host,
-+				const struct mmc_request *mrq)
-+{
-+	return false;
-+}
-+#endif
-+
- static int mmc_force_ro_check(struct mmc_host *host, struct mmc_request *mrq)
+@@ -267,9 +267,16 @@ static int mmc_force_ro_check(struct mmc
  {
  	struct mmc_command *bad = NULL;
  
@@ -369,7 +130,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 +	/*
 +	 * Any data that is not a plain read is a write for the host driver
 +	 * (tmio: !MMC_DATA_READ means write): refused unless it is a CMD24/25
-+	 * entirely inside a write window (test image only).
++	 * entirely inside a write window (write-windows.c).
 +	 */
 +	if (mrq->data && ((mrq->data->flags & MMC_DATA_WRITE) ||
 +			  !(mrq->data->flags & MMC_DATA_READ))) {
@@ -379,7 +140,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  		bad = mrq->sbc;
  	else if (mrq->stop && mrq->stop->opcode != MMC_STOP_TRANSMISSION)
  		bad = mrq->stop;
-@@ -278,6 +564,8 @@ static int mmc_force_ro_check(struct mmc
+@@ -278,6 +285,8 @@ static int mmc_force_ro_check(struct mmc
  	if (!bad)
  		return 0;
  
@@ -388,7 +149,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	pr_warn_ratelimited("%s: force-ro: CMD%u arg %#010x refused\n",
  			    mmc_hostname(host), bad->opcode, bad->arg);
  	/*
-@@ -525,6 +813,10 @@ int mmc_cqe_start_req(struct mmc_host *h
+@@ -525,6 +534,10 @@ int mmc_cqe_start_req(struct mmc_host *h
  {
  	int err;
  
@@ -401,23 +162,15 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	 * while CQE is in use.  Re-tuning can happen here only when CQE has no
 --- a/drivers/mmc/core/core.h
 +++ b/drivers/mmc/core/core.h
-@@ -41,6 +41,16 @@ struct device_node *mmc_of_find_child_de
- 		unsigned func_num);
+@@ -11,6 +11,8 @@
+ #include <linux/delay.h>
+ #include <linux/sched.h>
  
- void mmc_init_erase(struct mmc_card *card);
-+#ifdef CONFIG_MMC_WRITE_WINDOWS
-+void mmc_write_windows_setup(struct mmc_host *host);
-+bool mmc_write_windows_on_host(struct mmc_host *host);
-+#else
-+static inline void mmc_write_windows_setup(struct mmc_host *host) { }
-+static inline bool mmc_write_windows_on_host(struct mmc_host *host)
-+{
-+	return false;
-+}
-+#endif
- 
- void mmc_set_chip_select(struct mmc_host *host, int mode);
- void mmc_set_clock(struct mmc_host *host, unsigned int hz);
++#include "write-windows.h"
++
+ struct mmc_host;
+ struct mmc_card;
+ struct mmc_request;
 --- a/drivers/mmc/core/host.c
 +++ b/drivers/mmc/core/host.c
 @@ -651,6 +651,15 @@ int mmc_add_host(struct mmc_host *host)

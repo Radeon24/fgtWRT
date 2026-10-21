@@ -1,4 +1,4 @@
-From 64bd1a465c926ed9346a289bdddacca8da90e807 Mon Sep 17 00:00:00 2001
+From 1e9ae4db637c4b2cec160041cc1daf53dbbb6328 Mon Sep 17 00:00:00 2001
 From: Radeon24 <Radeon24@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 11:40:29 +0200
 Subject: [PATCH 101/101] libfstools: add a volume driver for a device tree
@@ -46,9 +46,12 @@ refused rather than truncated.
 
 The kernel of these boards guards the disk and only lets writes through
 its windows; the range must be the one persistent window its witness
-(/sys/module/block/parameters/write_windows) shows, in a state where
-that window is open (disarmed, armed or expired). Without the witness,
-or with another window, there is no volume.
+shows, in a state where that window is open (disarmed, armed or
+expired). The witness is the one of the subsystem of the disk, read
+once the disk is found: /sys/module/mmc_core/parameters/write_windows
+for an eMMC (device on the mmc bus), else
+/sys/module/block/parameters/write_windows. Without the witness, or
+with another window, there is no volume.
 
 The range is only claimed when it already holds an ext4 filesystem
 labelled rootfs_data, an erase marker or a configuration backup; f2fs
@@ -56,7 +59,11 @@ is not claimed, the overlay is ext4 there. A blank or unknown range is
 left alone, so nothing is ever written to a disk that was not prepared
 for an overlay; on the described disk, it is logged as an error (an
 interrupted first format leaves the range so) and not formatted again
-automatically. Without a volume, mount_root mounts no overlay at all
+automatically. A range holding an erase marker (or a backup to restore)
+is only formatted when the kernel command line asks for an ext4 overlay
+(fstools_overlay_fstype=ext4): fstools would otherwise pick f2fs for a
+large range, which the driver never claims again. Without a volume,
+mount_root mounts no overlay at all
 (volume_identify() of no volume fails): the root stays the initramfs.
 A disk whose /dev node cannot be opened yet (its sysfs entry may come
 first) gives no volume either, with the open error in the log.
@@ -67,15 +74,15 @@ up after preinit is never formatted nor switched to by "mount_root
 done" under a running system. When preinit left /tmp/.fortisoc_disk_late
 (the disk did not show up in time), that case is logged as an error.
 
-The device tree, sysfs, /dev, witness, mounts and flag paths can be
-overridden at build time for host testing.
+The device tree, sysfs, /dev, witness, mounts, command line and flag
+paths can be overridden at build time for host testing.
 
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
  CMakeLists.txt        |   1 +
- libfstools/fortisoc.c | 893 ++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 894 insertions(+)
+ libfstools/fortisoc.c | 947 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 948 insertions(+)
  create mode 100644 libfstools/fortisoc.c
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -92,10 +99,10 @@ index e138f98..932f6e2 100644
  TARGET_LINK_LIBRARIES(fstools ubox)
 diff --git a/libfstools/fortisoc.c b/libfstools/fortisoc.c
 new file mode 100644
-index 0000000..05786a1
+index 0000000..951adef
 --- /dev/null
 +++ b/libfstools/fortisoc.c
-@@ -0,0 +1,893 @@
+@@ -0,0 +1,947 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Overlay volume described by the device tree as a range of a whole disk.
@@ -121,7 +128,9 @@ index 0000000..05786a1
 + *
 + * The kernel guards that disk: the range must be its one persistent write
 + * window, as the witness of the guard shows it (state "disarmed", "armed"
-+ * or "expired", then "persistent start+count"); otherwise no volume.
++ * or "expired", then "persistent start+count"); otherwise no volume. The
++ * witness is the one of the subsystem of the disk: the MMC core for an
++ * eMMC, the block layer otherwise.
 + *
 + * A range whose content is not recognised (no ext4 filesystem labelled
 + * rootfs_data, no erase marker, no configuration backup) is never claimed,
@@ -129,6 +138,9 @@ index 0000000..05786a1
 + * overlay. f2fs is not claimed either: the overlay is ext4 there. Such a
 + * range on the described disk is reported as an error: an interrupted
 + * first format leaves it so, and it is not formatted again automatically.
++ * A blank range or an erase marker is only formatted when the kernel
++ * command line asks for ext4 (fstools_overlay_fstype=ext4): an f2fs
++ * overlay would never be claimed again.
 + *
 + * Outside preinit, the range is claimed only while it is mounted: a disk
 + * that shows up after preinit is never formatted or switched to under a
@@ -149,8 +161,16 @@ index 0000000..05786a1
 +#ifndef FORTISOC_DEV_DIR
 +#define FORTISOC_DEV_DIR	"/dev"
 +#endif
++/* witness of the guard of the block layer (USB and SCSI disks) */
 +#ifndef FORTISOC_WRITE_WINDOWS
 +#define FORTISOC_WRITE_WINDOWS	"/sys/module/block/parameters/write_windows"
++#endif
++/* witness of the guard of the MMC core (eMMC) */
++#ifndef FORTISOC_WRITE_WINDOWS_MMC
++#define FORTISOC_WRITE_WINDOWS_MMC	"/sys/module/mmc_core/parameters/write_windows"
++#endif
++#ifndef FORTISOC_PROC_CMDLINE
++#define FORTISOC_PROC_CMDLINE	"/proc/cmdline"
 +#endif
 +#ifndef FORTISOC_PROC_MOUNTS
 +#define FORTISOC_PROC_MOUNTS	"/proc/self/mounts"
@@ -391,7 +411,8 @@ index 0000000..05786a1
 + * The witness of the write windows of the kernel guard must show the range
 + * as the one persistent window, in a state where that window is open.
 + */
-+static bool fortisoc_witness_ok(const struct fortisoc_desc *desc)
++static bool fortisoc_witness_ok(const struct fortisoc_desc *desc,
++				const char *path)
 +{
 +	char buf[512], want[48], *tok, *save;
 +	int seen = 0, in_persistent = 0, n_persistent = 0, words = 0;
@@ -399,10 +420,9 @@ index 0000000..05786a1
 +	ssize_t n;
 +	int fd;
 +
-+	fd = open(FORTISOC_WRITE_WINDOWS, O_RDONLY);
++	fd = open(path, O_RDONLY);
 +	if (fd < 0) {
-+		ULOG_ERR("no write window witness (%s): no overlay\n",
-+			 FORTISOC_WRITE_WINDOWS);
++		ULOG_ERR("no write window witness (%s): no overlay\n", path);
 +		return false;
 +	}
 +	n = read(fd, buf, sizeof(buf) - 1);
@@ -591,6 +611,32 @@ index 0000000..05786a1
 +}
 +
 +/*
++ * The witness of the guard of the disk /dev/<name>: the one of the MMC
++ * core when the device of the disk belongs to the mmc bus, the one of the
++ * block layer otherwise.
++ */
++static const char *fortisoc_witness_path(const char *disk)
++{
++	char path[FORTISOC_PATHLEN], link[FORTISOC_PATHLEN];
++	ssize_t n;
++
++	if (snprintf(path, sizeof(path), "%s/%s/device/subsystem",
++		     FORTISOC_SYS_BLOCK, fortisoc_basename(disk)) >=
++	    (int)sizeof(path))
++		return FORTISOC_WRITE_WINDOWS;
++
++	n = readlink(path, link, sizeof(link) - 1);
++	if (n <= 0)
++		return FORTISOC_WRITE_WINDOWS;
++	link[n] = '\0';
++
++	if (!strcmp(fortisoc_basename(link), "mmc"))
++		return FORTISOC_WRITE_WINDOWS_MMC;
++
++	return FORTISOC_WRITE_WINDOWS;
++}
++
++/*
 + * A loop device bound to exactly the range (offset and size limit) of the
 + * disk is mounted. The disk is matched by the base name of the backing
 + * file: sysfs shows the path as seen from the current root, and a loop
@@ -689,14 +735,15 @@ index 0000000..05786a1
 +	if (fortisoc_dt_read(&desc))
 +		return NULL;
 +
-+	if (!fortisoc_witness_ok(&desc))
-+		return NULL;
-+
 +	p = calloc(1, sizeof(*p));
 +	if (!p)
 +		return NULL;
 +
++	/* the disk first: its subsystem tells which witness to read */
 +	if (fortisoc_disk_find(&desc, p->disk, sizeof(p->disk)))
++		goto out;
++
++	if (!fortisoc_witness_ok(&desc, fortisoc_witness_path(p->disk)))
 +		goto out;
 +
 +	p->v.drv = &fortisoc_driver;
@@ -966,6 +1013,20 @@ index 0000000..05786a1
 +static int fortisoc_volume_init(struct volume *v)
 +{
 +	struct fortisoc_volume *p = container_of(v, struct fortisoc_volume, v);
++	char fstype[16];
++
++	/*
++	 * Anything but an ext4 overlay gets formatted below: only as ext4,
++	 * the one filesystem the range is claimed with afterwards.
++	 */
++	if (fortisoc_volume_identify(v) != FS_EXT4 &&
++	    (!get_var_from_file(FORTISOC_PROC_CMDLINE, "fstools_overlay_fstype",
++				fstype, sizeof(fstype)) ||
++	     strcmp(fstype, "ext4"))) {
++		ULOG_ERR("%s: kernel command line without fstools_overlay_fstype=ext4: range at sector %llu not formatted, no overlay\n",
++			 p->disk, (unsigned long long)(p->offset / 512));
++		return -1;
++	}
 +
 +	if (!p->loop_name[0] && fortisoc_create_loop(p) != 0) {
 +		ULOG_ERR("unable to create loop device\n");

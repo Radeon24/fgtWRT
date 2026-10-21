@@ -91,7 +91,8 @@
 # write_windows (USB guard) or /sys/module/mmc_core/parameters/
 # write_windows (eMMC guard), and refuses unless they are exactly the
 # expected ones (FGT_WW_EXPECTED), cover sector 0 and the target slot,
-# and allow the bytes of sector 0 it changes (USB guard). The target
+# and allow the bytes of sector 0 it changes (both guards list them,
+# "sector0" in the witness). The target
 # partition must also be the expected one (FGT_SLOT_LBA, FGT_SLOT_SIZE).
 # The closed list of header bytes is enforced here as well.
 # The windows are disarmed at boot: this script arms them, once per
@@ -365,7 +366,7 @@ fgt_disk_mmc() {
 # session windows ("<start>+<count>", in sectors of the whole disk, or
 # "none"), armed by this script; then, on boards with persistence
 # only, "persistent" followed by the windows the kernel keeps writable
-# at all times (rootfs_data); then, for the USB guard, "sector0"
+# at all times (rootfs_data); then "sector0" (both guards)
 # followed by the bytes of sector 0 that may change ("<offset
 # hex>+<count>", or "none"). Sets FGT_WW_LINE (the witness),
 # FGT_WW_STATE, FGT_WW_WINDOWS, FGT_WW_PERSISTENT and FGT_WW_BYTES in
@@ -396,7 +397,7 @@ fgt_ww_read() {
 			part=persistent
 			;;
 		sector0)
-			[ $part != sector0 ] && [ "$FGT_DISK_KIND" = usb ] ||
+			[ $part != sector0 ] ||
 				{ FGT_WW_STATE=unknown; return 0; }
 			part=sector0
 			;;
@@ -561,7 +562,7 @@ fgt_check_rootfs_data() {
 # FGT_SLOT_SECTORS (and FGT_RD_START, FGT_RD_COUNT with persistence);
 # the target partition must lie inside the write windows of the
 # kernel, and the bytes of the header this script changes must be
-# among those the kernel allows (USB guard).
+# among those the kernel allows.
 fgt_check_disk() { # <sector 0 file>
 	local s0="$1" disk part start size flags
 
@@ -637,10 +638,8 @@ fgt_check_disk() { # <sector 0 file>
 		{ fgt_refuse "partition $FGT_SLOT_PART differs from its MBR entry ($start+$size)"; return 1; }
 	[ "$start" = "$FGT_SLOT_LBA" ] && [ "$size" = "$FGT_SLOT_SIZE" ] ||
 		{ fgt_refuse "unexpected partition $FGT_SLOT_PART ($start+$size, expected $FGT_SLOT_LBA+$FGT_SLOT_SIZE)"; return 1; }
-	if [ "$FGT_DISK_KIND" = usb ]; then
-		[ "$(fgt_hex $(fgt_mbr $FGT_SLOT_PART 4) 1 "$s0")" = 83 ] ||
-			{ fgt_refuse "partition $FGT_SLOT_PART is not an ext partition"; return 1; }
-	fi
+	[ "$(fgt_hex $(fgt_mbr $FGT_SLOT_PART 4) 1 "$s0")" = 83 ] ||
+		{ fgt_refuse "partition $FGT_SLOT_PART is not an ext partition"; return 1; }
 	FGT_SLOT_START=$start
 	FGT_SLOT_SECTORS=$size
 
@@ -652,15 +651,13 @@ fgt_check_disk() { # <sector 0 file>
 		{ fgt_refuse "no write window over sector 0"; return 1; }
 	fgt_ww_covers "$FGT_SLOT_START" "$FGT_SLOT_SECTORS" ||
 		{ fgt_refuse "no write window over partition $FGT_SLOT_PART ($FGT_SLOT_START+$FGT_SLOT_SECTORS)"; return 1; }
-	if [ "$FGT_DISK_KIND" = usb ]; then
-		fgt_ww_bytes_cover "$FGT_NAME_OFS" $FGT_NAME_LEN &&
-			fgt_ww_bytes_cover "$FGT_BUILD_OFS" $FGT_BUILD_LEN ||
-			{ fgt_refuse "the kernel does not allow the name or the build number of image $FGT_SLOT_IMAGE to change"; return 1; }
-		if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ]; then
-			fgt_ww_bytes_cover "$FGT_FLAG_OFS" 1 &&
-				fgt_ww_bytes_cover "$FGT_OTHER_FLAG_OFS" 1 ||
-				{ fgt_refuse "the kernel does not allow the boot flags to change"; return 1; }
-		fi
+	fgt_ww_bytes_cover "$FGT_NAME_OFS" $FGT_NAME_LEN &&
+		fgt_ww_bytes_cover "$FGT_BUILD_OFS" $FGT_BUILD_LEN ||
+		{ fgt_refuse "the kernel does not allow the name or the build number of image $FGT_SLOT_IMAGE to change"; return 1; }
+	if [ "$FGT_SLOT_MAKE_DEFAULT" = 1 ]; then
+		fgt_ww_bytes_cover "$FGT_FLAG_OFS" 1 &&
+			fgt_ww_bytes_cover "$FGT_OTHER_FLAG_OFS" 1 ||
+			{ fgt_refuse "the kernel does not allow the boot flags to change"; return 1; }
 	fi
 
 	# rootfs_data: from the device tree, the persistent window
