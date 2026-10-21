@@ -12,25 +12,24 @@ boot without arming, for a file system kept in that slot, until "off";
 a refused PARTITION_CONFIG switch closes every window. Also refuse data
 writes through the block ioctl under the guard, window or not.
 
-The code lives in drivers/mmc/core/write-windows.c (files of the
-target); this patch hooks it up (core, host, block driver for the disk
-of the user area).
-
+The code lives in drivers/mmc/core/write-windows.c (our files); this
+patch hooks it up (core, host, block driver for the disk of the user
+area).
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/mmc/core/Kconfig  |   32 ++++++++++++++++++++++++++++++++
- drivers/mmc/core/block.c  |   10 +++++++++-
- drivers/mmc/core/core.c   |   19 ++++++++++++++++---
- drivers/mmc/core/core.h   |    2 ++
- drivers/mmc/core/host.c   |    9 +++++++++
- drivers/mmc/core/queue.c  |    4 ++++
- drivers/mmc/core/Makefile |    1 +
+ drivers/mmc/core/Kconfig  | 32 ++++++++++++++++++++++++++++++++
+ drivers/mmc/core/Makefile |  1 +
+ drivers/mmc/core/block.c  | 10 +++++++++-
+ drivers/mmc/core/core.c   | 19 ++++++++++++++++---
+ drivers/mmc/core/core.h   |  2 ++
+ drivers/mmc/core/host.c   |  9 +++++++++
+ drivers/mmc/core/queue.c  |  4 ++++
  7 files changed, 73 insertions(+), 4 deletions(-)
 
 --- a/drivers/mmc/core/Kconfig
 +++ b/drivers/mmc/core/Kconfig
-@@ -34,6 +34,38 @@
+@@ -34,6 +34,38 @@ config PWRSEQ_SIMPLE
  	  This driver can also be built as a module. If so, the module
  	  will be called pwrseq_simple.
  
@@ -69,9 +68,19 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  config MMC_BLOCK
  	tristate "MMC block device driver"
  	depends on BLOCK
+--- a/drivers/mmc/core/Makefile
++++ b/drivers/mmc/core/Makefile
+@@ -10,6 +10,7 @@ mmc_core-y			:= core.o bus.o host.o \
+ 				   sdio_cis.o sdio_io.o sdio_irq.o sd_uhs2.o\
+ 				   slot-gpio.o regulator.o
+ mmc_core-$(CONFIG_OF)		+= pwrseq.o
++mmc_core-$(CONFIG_MMC_WRITE_WINDOWS)	+= write-windows.o
+ obj-$(CONFIG_PWRSEQ_SIMPLE)	+= pwrseq_simple.o
+ obj-$(CONFIG_PWRSEQ_SD8787)	+= pwrseq_sd8787.o
+ obj-$(CONFIG_PWRSEQ_EMMC)	+= pwrseq_emmc.o
 --- a/drivers/mmc/core/block.c
 +++ b/drivers/mmc/core/block.c
-@@ -497,6 +497,10 @@
+@@ -497,6 +497,10 @@ static int __mmc_blk_ioctl_cmd(struct mm
  	if (idata->flags & MMC_BLK_IOC_DROP)
  		return 0;
  
@@ -82,7 +91,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	if (idata->flags & MMC_BLK_IOC_SBC && i > 0)
  		prev_idata = idatas[i - 1];
  
-@@ -2490,7 +2494,8 @@
+@@ -2490,7 +2494,8 @@ enum mmc_issued mmc_blk_mq_issue_rq(stru
  static inline int mmc_blk_readonly(struct mmc_card *card)
  {
  	return mmc_card_readonly(card) ||
@@ -92,7 +101,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	       !(card->csd.cmdclass & CCC_BLOCK_WRITE);
  }
  
-@@ -3058,6 +3063,7 @@
+@@ -3058,6 +3063,7 @@ static void mmc_blk_remove_req(struct mm
  	 * Flush remaining requests and free queues. It is freeing the queue
  	 * that stops new requests from being accepted.
  	 */
@@ -100,7 +109,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	del_gendisk(md->disk);
  	mmc_cleanup_queue(&md->queue);
  	mmc_blk_put(md);
-@@ -3299,6 +3305,8 @@
+@@ -3299,6 +3305,8 @@ static int mmc_blk_probe(struct mmc_card
  		ret = PTR_ERR(md);
  		goto out_free;
  	}
@@ -111,7 +120,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	if (ret)
 --- a/drivers/mmc/core/core.c
 +++ b/drivers/mmc/core/core.c
-@@ -267,9 +267,16 @@
+@@ -267,9 +267,16 @@ static int mmc_force_ro_check(struct mmc
  {
  	struct mmc_command *bad = NULL;
  
@@ -131,7 +140,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  		bad = mrq->sbc;
  	else if (mrq->stop && mrq->stop->opcode != MMC_STOP_TRANSMISSION)
  		bad = mrq->stop;
-@@ -278,6 +285,8 @@
+@@ -278,6 +285,8 @@ static int mmc_force_ro_check(struct mmc
  	if (!bad)
  		return 0;
  
@@ -140,7 +149,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	pr_warn_ratelimited("%s: force-ro: CMD%u arg %#010x refused\n",
  			    mmc_hostname(host), bad->opcode, bad->arg);
  	/*
-@@ -525,6 +534,10 @@
+@@ -525,6 +534,10 @@ int mmc_cqe_start_req(struct mmc_host *h
  {
  	int err;
  
@@ -164,7 +173,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  struct mmc_request;
 --- a/drivers/mmc/core/host.c
 +++ b/drivers/mmc/core/host.c
-@@ -651,6 +651,15 @@
+@@ -651,6 +651,15 @@ int mmc_add_host(struct mmc_host *host)
  	if (err)
  		return err;
  
@@ -182,7 +191,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  		return err;
 --- a/drivers/mmc/core/queue.c
 +++ b/drivers/mmc/core/queue.c
-@@ -179,6 +179,10 @@
+@@ -179,6 +179,10 @@ static void mmc_queue_setup_discard(stru
  {
  	unsigned max_discard;
  
@@ -193,13 +202,3 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	max_discard = mmc_calc_max_discard(card);
  	if (!max_discard)
  		return;
---- a/drivers/mmc/core/Makefile
-+++ b/drivers/mmc/core/Makefile
-@@ -10,6 +10,7 @@
- 				   sdio_cis.o sdio_io.o sdio_irq.o sd_uhs2.o\
- 				   slot-gpio.o regulator.o
- mmc_core-$(CONFIG_OF)		+= pwrseq.o
-+mmc_core-$(CONFIG_MMC_WRITE_WINDOWS)	+= write-windows.o
- obj-$(CONFIG_PWRSEQ_SIMPLE)	+= pwrseq_simple.o
- obj-$(CONFIG_PWRSEQ_SD8787)	+= pwrseq_sd8787.o
- obj-$(CONFIG_PWRSEQ_EMMC)	+= pwrseq_emmc.o

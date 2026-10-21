@@ -44,7 +44,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  };
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -566,7 +566,12 @@ static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct)
+@@ -566,7 +566,12 @@ static void nf_flow_table_extend_ct_time
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
@@ -60,7 +60,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	    nf_ct_is_dying(flow->ct) ||
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
-@@ -1106,6 +1106,7 @@ static void flow_offload_work_del(struct flow_offload_work *offload)
+@@ -1106,6 +1106,7 @@ static void flow_offload_work_del(struct
  	flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_ORIGINAL);
  	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
  		flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_REPLY);
@@ -68,7 +68,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  }
  
  static void flow_offload_tuple_stats(struct flow_offload_work *offload,
-@@ -1167,13 +1168,8 @@ static void flow_offload_work_handler(struct work_struct *work)
+@@ -1167,13 +1168,8 @@ static void flow_offload_work_handler(st
  		default:
  			WARN_ON_ONCE(1);
  	}
@@ -84,7 +84,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  
  	kfree(offload);
  }
-@@ -1200,12 +1196,12 @@ nf_flow_offload_work_alloc(struct nf_flowtable *flowtable,
+@@ -1200,12 +1196,12 @@ nf_flow_offload_work_alloc(struct nf_flo
  {
  	struct flow_offload_work *offload;
  
@@ -101,7 +101,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  
 --- a/net/sched/act_ct.c
 +++ b/net/sched/act_ct.c
-@@ -287,7 +287,7 @@ static bool tcf_ct_flow_is_outdated(const struct flow_offload *flow)
+@@ -287,7 +287,7 @@ static bool tcf_ct_flow_is_outdated(cons
  {
  	return test_bit(IPS_SEEN_REPLY_BIT, &flow->ct->status) &&
  	       test_bit(IPS_HW_OFFLOAD_BIT, &flow->ct->status) &&
