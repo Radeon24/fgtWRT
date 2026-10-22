@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/watchdog/fortinet,fsoc3-wdt.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 watchdog
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  Watchdog block of the Fortinet FortiSOC3 (FortiGate 60E and 100E). A
+  32-bit counter is loaded with the delay, reloaded by writing 1 to a
+  restart register and enabled by bit 0 of a control register. An
+  interrupt is raised on expiry; the SoC is reset at the second expiry,
+  twice the loaded delay after a reload. No input clock is described for this
+  block; its rate is given by clock-frequency.
+
+allOf:
+  - $ref: watchdog.yaml#
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-wdt
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+    description: Expiry interrupt (rising edge).
+
+  clock-frequency:
+    description: Rate of the counter input clock, in Hz.
+
+  fortinet,sysmgr:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The system manager (fortinet,fsoc3-sysmgr) node, used only by the
+      optional restart handler.
+
+required:
+  - compatible
+  - reg
+  - clock-frequency
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    watchdog@fbe01600 {
+        compatible = "fortinet,fsoc3-wdt";
+        reg = <0xfbe01600 0x100>;
+        interrupts = <GIC_SPI 11 IRQ_TYPE_EDGE_RISING>;
+        clock-frequency = <48000000>;
+        timeout-sec = <30>;
+    };

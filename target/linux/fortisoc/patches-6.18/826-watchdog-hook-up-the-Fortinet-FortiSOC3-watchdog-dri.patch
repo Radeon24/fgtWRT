@@ -1,0 +1,44 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] watchdog: hook up the Fortinet FortiSOC3 watchdog driver
+
+Build fsoc3-wdt (FSOC3_WATCHDOG).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/watchdog/Kconfig  | 14 ++++++++++++++
+ drivers/watchdog/Makefile |  1 +
+ 2 files changed, 15 insertions(+)
+
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -548,6 +548,20 @@ config FTWDT010_WATCHDOG
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called ftwdt010_wdt.
+ 
++config FSOC3_WATCHDOG
++	tristate "Fortinet FortiSOC3 watchdog"
++	depends on ARCH_FSOC3 || COMPILE_TEST
++	depends on OF && HAS_IOMEM
++	select WATCHDOG_CORE
++	select MFD_SYSCON
++	help
++	  Watchdog block of the Fortinet FortiSOC3 (FortiGate 60E and 100E).
++	  The block is never armed at probe and, unless the allow_stop
++	  parameter is set, never stopped once armed.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called fsoc3-wdt.
++
+ config IXP4XX_WATCHDOG
+ 	tristate "IXP4xx Watchdog"
+ 	depends on ARCH_IXP4XX || (ARM && COMPILE_TEST)
+--- a/drivers/watchdog/Makefile
++++ b/drivers/watchdog/Makefile
+@@ -50,6 +50,7 @@ obj-$(CONFIG_TWL4030_WATCHDOG) += twl403
+ obj-$(CONFIG_21285_WATCHDOG) += wdt285.o
+ obj-$(CONFIG_977_WATCHDOG) += wdt977.o
+ obj-$(CONFIG_FTWDT010_WATCHDOG) += ftwdt010_wdt.o
++obj-$(CONFIG_FSOC3_WATCHDOG) += fsoc3-wdt.o
+ obj-$(CONFIG_IXP4XX_WATCHDOG) += ixp4xx_wdt.o
+ obj-$(CONFIG_S3C2410_WATCHDOG) += s3c2410_wdt.o
+ obj-$(CONFIG_SA1100_WATCHDOG) += sa1100_wdt.o

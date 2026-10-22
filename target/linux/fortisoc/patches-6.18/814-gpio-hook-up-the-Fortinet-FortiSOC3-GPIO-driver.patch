@@ -5,23 +5,24 @@ Build gpio-fsoc3 (GPIO_FSOC3).
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/gpio/Kconfig  | 8 ++++++++
+ drivers/gpio/Kconfig  | 9 +++++++++
  drivers/gpio/Makefile | 1 +
- 2 files changed, 9 insertions(+)
+ 2 files changed, 10 insertions(+)
 
 --- a/drivers/gpio/Kconfig
 +++ b/drivers/gpio/Kconfig
-@@ -327,6 +327,14 @@ config GPIO_GE_FPGA
+@@ -327,6 +327,15 @@ config GPIO_GE_FPGA
  	  and write pin state) for GPIO implemented in a number of GE single
  	  board computers.
  
 +config GPIO_FSOC3
-+	bool "Fortinet FortiSOC3 GPIO (read-only)"
++	bool "Fortinet FortiSOC3 GPIO"
 +	depends on OF && (ARCH_FSOC3 || COMPILE_TEST)
++	select MFD_SYSCON
 +	help
-+	  Read-only driver for the 32 GPIO lines of the Fortinet FortiSOC3
-+	  network processor block (FortiGate 60E/100E): directions and levels
-+	  are read, nothing is ever written.
++	  Driver for the 32 GPIO lines of the Fortinet FortiSOC3 network
++	  processor block (FortiGate 60E/100E) and for the output lines of
++	  its system manager (front panel LEDs).
 +
  config GPIO_FTGPIO010
  	bool "Faraday FTGPIO010 GPIO"

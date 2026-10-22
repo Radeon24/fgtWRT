@@ -17,10 +17,11 @@ description: |
   interrupt mask (0x30) and status (0x38), output clear (0x48) and
   direction clear (0x50).
 
-  The block lies inside the register window of the network processor,
-  whose driver drives some of its lines itself (MDC lines, PHY and switch
-  resets): such lines are listed in gpio-reserved-ranges. No interrupt
-  line of the block is known.
+  The output, direction and their clear registers set or clear the bits
+  written as 1 only. The block lies inside the register window of the
+  network processor, whose driver drives some of its lines itself (MDC
+  lines, PHY and switch resets): such lines are listed in
+  gpio-reserved-ranges. No interrupt line of the block is known.
 
 properties:
   compatible:
@@ -41,6 +42,12 @@ properties:
 
   gpio-line-names:
     maxItems: 32
+
+patternProperties:
+  "-hog(-[0-9]+)?$":
+    type: object
+    required:
+      - gpio-hog
 
 required:
   - compatible

@@ -2,6 +2,9 @@
 /dts-v1/;
 
 #include "fsoc3.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
 
 / {
 	model = "Fortinet FortiGate 60E";
@@ -390,6 +393,205 @@
 			compatible = "mac-base";
 			reg = <0x5880 0x6>;
 			#nvmem-cell-cells = <1>;
+		};
+	};
+};
+
+/*
+ * Front panel wiring (established by observation):
+ * - STATUS and HA: one bicolour LED each, between two lines of the GPIO
+ *   block of the network processor, lit high: STATUS green line 0,
+ *   orange line 1; HA green line 2, orange line 3. Either colour only
+ *   lights while the other line is an output at the low level, so every
+ *   line of a pair is described (off = output low). Lines 16, 26 and 27
+ *   are outputs at the low level under the board firmware, without a
+ *   visible LED: kept so by hogs.
+ * - WAN ports: the link/activity LED is on the LED[1] pin of the port
+ *   PHY (Marvell 88E1514); the bicolour speed LED sits between the
+ *   LED[0] pin of the PHY and an output line of the system manager
+ *   (line 23 for wan1, 19 for wan2): green when LED[0] is lit (1000
+ *   Mbit/s link) and the line is high, orange when LED[0] is off and the
+ *   line is low. LED[2] is the interrupt pin (INTn) of the PHY on this
+ *   board: never an LED. The PHY LEDs and the orange half are driven by
+ *   the netdev trigger, set from user space.
+ * - Reset button: line 4 of the GPIO block, pressed low.
+ *
+ * USB: xHCI with the public R-Car "v2" firmware of linux-firmware commit
+ * 98d922b9 (renamed r8a779x_usb3_v2-98d922b9.dlmem, binary unmodified),
+ * port power on line 6 of the GPIO block (driven by the xHCI glue,
+ * reserved here), DMA not coherent.
+ *
+ * Watchdog: block at 0xfbe01600, about 48 MHz; its expiry interrupt
+ * restarts the SoC by software (the reset of the block itself freezes
+ * the next boot).
+ */
+
+/ {
+	aliases {
+		led-boot = &led_status_green;
+		led-failsafe = &led_status_orange;
+		led-running = &led_status_green;
+		led-upgrade = &led_status_orange;
+	};
+
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
+
+		button-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&np_gpio 4 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/* Output lines of the system manager: lines 19 and 23 only */
+	speed_gpio: gpio-sysmgr {
+		compatible = "fortinet,fsoc3-sysmgr-gpio";
+		fortinet,sysmgr = <&sysmgr>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		ngpios = <32>;
+		gpio-reserved-ranges = <0 19>, <20 3>, <24 8>;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_status_green: led-status-green {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&np_gpio 0 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_status_orange: led-status-orange {
+			color = <LED_COLOR_ID_ORANGE>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&np_gpio 1 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-ha-green {
+			color = <LED_COLOR_ID_GREEN>;
+			function = "ha";
+			gpios = <&np_gpio 2 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-ha-orange {
+			color = <LED_COLOR_ID_ORANGE>;
+			function = "ha";
+			gpios = <&np_gpio 3 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		/* Orange half of the speed LED of wan1 (100 Mbit/s) */
+		led-wan1-speed-orange {
+			color = <LED_COLOR_ID_ORANGE>;
+			function = LED_FUNCTION_SPEED_WAN;
+			function-enumerator = <1>;
+			gpios = <&speed_gpio 23 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led-wan2-speed-orange {
+			color = <LED_COLOR_ID_ORANGE>;
+			function = LED_FUNCTION_SPEED_WAN;
+			function-enumerator = <2>;
+			gpios = <&speed_gpio 19 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+	};
+};
+
+&{/soc} {
+	np_gpio: gpio@f500fc00 {
+		/* 6: USB port power, driven by the xHCI glue */
+		gpio-reserved-ranges = <6 1>, <17 2>, <20 6>;
+
+		line16-hog {
+			gpio-hog;
+			gpios = <16 GPIO_ACTIVE_HIGH>;
+			output-low;
+			line-name = "board-16";
+		};
+
+		line26-hog {
+			gpio-hog;
+			gpios = <26 GPIO_ACTIVE_HIGH>;
+			output-low;
+			line-name = "board-26";
+		};
+
+		line27-hog {
+			gpio-hog;
+			gpios = <27 GPIO_ACTIVE_HIGH>;
+			output-low;
+			line-name = "board-27";
+		};
+	};
+
+	usb: usb@f3008000 {
+		compatible = "fortinet,fsoc3-xhci";
+		reg = <0xf3008000 0x8000>,
+		      <0xf500fc00 0x80>;
+		interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
+		firmware-name = "r8a779x_usb3_v2-98d922b9.dlmem";
+		fortinet,vbus-line = <6>;
+	};
+
+	/*
+	 * Disabled until its expiry has been shown to restart the board
+	 * cleanly on three boots out of three.
+	 */
+	soc_wdt: watchdog@fbe01600 {
+		compatible = "fortinet,fsoc3-wdt";
+		reg = <0xfbe01600 0x100>;
+		interrupts = <GIC_SPI 11 IRQ_TYPE_EDGE_RISING>;
+		clock-frequency = <48000000>;	/* measured */
+		timeout-sec = <30>;
+		fortinet,sysmgr = <&sysmgr>;
+		status = "disabled";
+	};
+};
+
+&phy_wan1 {
+	leds {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* LED[0]: green half of the speed LED, 1000 Mbit/s link */
+		led@0 {
+			reg = <0>;
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_SPEED_WAN;
+		};
+
+		/* LED[1]: link/activity LED */
+		led@1 {
+			reg = <1>;
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_WAN;
+		};
+	};
+};
+
+&phy_wan2 {
+	leds {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		led@0 {
+			reg = <0>;
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_SPEED_WAN;
+		};
+
+		led@1 {
+			reg = <1>;
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_WAN;
 		};
 	};
 };

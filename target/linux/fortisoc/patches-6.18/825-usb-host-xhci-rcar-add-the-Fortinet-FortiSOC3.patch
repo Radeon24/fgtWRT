@@ -1,0 +1,126 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] usb: host: xhci-rcar: add the Fortinet FortiSOC3
+
+The xHCI of the FortiSOC3 (FortiGate 60E, 100E) takes the R-Car firmware
+download and Gen2 settings, without waiting for the PLL status (printed
+only), with a firmware named by the device tree (property
+firmware-name), and drives a GPIO of the network processor block after
+the download (optional fortinet,vbus-line, second register range).
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/usb/host/Kconfig     |  2 +-
+ drivers/usb/host/xhci-rcar.c | 84 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 85 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/host/Kconfig
++++ b/drivers/usb/host/Kconfig
+@@ -89,7 +89,7 @@ config USB_XHCI_MVEBU
+ config USB_XHCI_RCAR
+ 	tristate "xHCI support for Renesas R-Car SoCs"
+ 	depends on USB_XHCI_PLATFORM
+-	depends on ARCH_RENESAS || COMPILE_TEST
++	depends on ARCH_RENESAS || ARCH_FSOC3 || COMPILE_TEST
+ 	default ARCH_RENESAS
+ 	help
+ 	  Say 'Y' to enable the support for the xHCI host controller
+--- a/drivers/usb/host/xhci-rcar.c
++++ b/drivers/usb/host/xhci-rcar.c
+@@ -213,6 +213,87 @@ static int xhci_rcar_resume_quirk(struct
+  * long delay for the handshake of STS_HALT is neeed in xhci_suspend()
+  * by using the XHCI_SLOW_SUSPEND quirk.
+  */
++/*
++ * Fortinet FortiSOC3 (FortiGate 60E, 100E): an R-Car Gen2 xHCI. It takes
++ * a firmware of the same format as the R-Car one, then the Gen2
++ * settings; the PLL status is not waited for. The firmware name comes
++ * from the "firmware-name" property. The optional second register
++ * range is the GPIO block of the network processor: if
++ * "fortinet,vbus-line" is present, that line is driven high after the
++ * download (FortiGate 60E: line 6, presumably the VBUS switch of the
++ * port).
++ */
++#define FSOC3_GPIO_OUT_SET	0x08
++#define FSOC3_GPIO_DIR_OUT_SET	0x10
++
++static int xhci_fsoc3_init_quirk(struct usb_hcd *hcd)
++{
++	struct device *dev = hcd->self.controller;
++	struct platform_device *pdev = to_platform_device(dev);
++	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
++	struct resource *res;
++	void __iomem *gpio;
++	u32 line, val;
++	int ret;
++
++	if (!hcd->regs)
++		return 0;
++
++	of_property_read_string(dev->of_node, "firmware-name",
++				&priv->firmware_name);
++	dev_info(dev, "AXH_STA %08x DL_CTRL %08x, firmware %s\n",
++		 readl(hcd->regs + RCAR_USB3_AXH_STA),
++		 readl(hcd->regs + RCAR_USB3_DL_CTRL), priv->firmware_name);
++
++	ret = xhci_rcar_download_firmware(hcd);
++	dev_info(dev, "download: %d, DL_CTRL %08x\n", ret,
++		 readl(hcd->regs + RCAR_USB3_DL_CTRL));
++	if (ret)
++		return ret;
++
++	if (of_property_read_u32(dev->of_node, "fortinet,vbus-line", &line))
++		return 0;
++	if (line > 31)
++		return -EINVAL;
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (!res)
++		return -EINVAL;
++	/* Shared with the network processor driver: mapped, not requested */
++	gpio = ioremap(res->start, resource_size(res));
++	if (!gpio)
++		return -ENOMEM;
++	dev_info(dev, "GPIO before: out %08x dir %08x\n",
++		 readl(gpio + FSOC3_GPIO_OUT_SET),
++		 readl(gpio + FSOC3_GPIO_DIR_OUT_SET));
++	/* Direction, then level */
++	val = readl(gpio + FSOC3_GPIO_DIR_OUT_SET);
++	writel(val | BIT(line), gpio + FSOC3_GPIO_DIR_OUT_SET);
++	val = readl(gpio + FSOC3_GPIO_OUT_SET);
++	writel(val | BIT(line), gpio + FSOC3_GPIO_OUT_SET);
++	dev_info(dev, "GPIO %u high: out %08x dir %08x\n", line,
++		 readl(gpio + FSOC3_GPIO_OUT_SET),
++		 readl(gpio + FSOC3_GPIO_DIR_OUT_SET));
++	iounmap(gpio);
++
++	return 0;
++}
++
++/* Common start, then the Gen2 settings (the compatible is not a Gen2 one) */
++static void xhci_fsoc3_start(struct usb_hcd *hcd)
++{
++	xhci_rcar_start(hcd);
++	if (hcd->regs)
++		xhci_rcar_start_gen2(hcd);
++}
++
++static const struct xhci_plat_priv xhci_plat_fortinet_fsoc3 = {
++	.firmware_name = XHCI_RCAR_FIRMWARE_NAME_V1,
++	.quirks = XHCI_NO_64BIT_SUPPORT | XHCI_SLOW_SUSPEND,
++	.init_quirk = xhci_fsoc3_init_quirk,
++	.plat_start = xhci_fsoc3_start,
++	.resume_quirk = xhci_rcar_resume_quirk,
++};
++
+ #define SET_XHCI_PLAT_PRIV_FOR_RCAR(firmware)				\
+ 	.firmware_name = firmware,					\
+ 	.quirks = XHCI_NO_64BIT_SUPPORT |  XHCI_SLOW_SUSPEND,		\
+@@ -244,6 +325,9 @@ static const struct xhci_plat_priv xhci_
+ 
+ static const struct of_device_id usb_xhci_of_match[] = {
+ 	{
++		.compatible = "fortinet,fsoc3-xhci",
++		.data = &xhci_plat_fortinet_fsoc3,
++	}, {
+ 		.compatible = "renesas,xhci-r8a7790",
+ 		.data = &xhci_plat_renesas_rcar_gen2,
+ 	}, {

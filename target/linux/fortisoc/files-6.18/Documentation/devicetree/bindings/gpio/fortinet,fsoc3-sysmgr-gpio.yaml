@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpio/fortinet,fsoc3-sysmgr-gpio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 system manager output lines
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description: |
+  Output lines of the system manager of the Fortinet FortiSOC3
+  (fortinet,fsoc3-sysmgr): line n is bit n of three of its registers,
+  pin function (0xc0, 1 = general purpose line), output level (0xc8) and
+  output enable (0xd0). The lines are output only. On the FortiGate 60E,
+  lines 23 and 19 are the second terminal of the bicolour speed LED of
+  the wan1 and wan2 ports, whose first terminal is the LED[0] pin of the
+  port PHY: the LED is orange when the line is low and LED[0] is not
+  lit. The lines a board does not use are listed in gpio-reserved-ranges
+  and never written.
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-sysmgr-gpio
+
+  fortinet,sysmgr:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The system manager (fortinet,fsoc3-sysmgr) node.
+
+  gpio-controller: true
+
+  "#gpio-cells":
+    const: 2
+
+  ngpios:
+    const: 32
+
+  gpio-reserved-ranges: true
+
+required:
+  - compatible
+  - fortinet,sysmgr
+  - gpio-controller
+  - "#gpio-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    gpio {
+        compatible = "fortinet,fsoc3-sysmgr-gpio";
+        fortinet,sysmgr = <&sysmgr>;
+        gpio-controller;
+        #gpio-cells = <2>;
+        ngpios = <32>;
+        gpio-reserved-ranges = <0 19>, <20 3>, <24 8>;
+    };

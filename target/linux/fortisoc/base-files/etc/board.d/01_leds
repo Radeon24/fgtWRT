@@ -27,6 +27,29 @@ fortinet,fg60d)
 			"$phy:green:wan" "wan$port" "link tx rx"
 	done
 	;;
+fortinet,fg60e)
+	# STATUS is driven by diag.sh through the led-* aliases of the device
+	# tree (green blinking while booting, green once running, orange
+	# blinking in failsafe and during an upgrade); HA is left off.
+	# The speed LED of each WAN port is one bicolour LED between the
+	# LED[0] pin of its 88E1514 PHY and an output line of the system
+	# manager: green is offloaded to the PHY at 1000 Mbit/s, orange is
+	# that line driven low in software at 100 Mbit/s (off at 1000, which
+	# leaves the green half alone). The second LED shows the link and
+	# blinks on activity, offloaded to the PHY, so that it also sees the
+	# traffic forwarded by the network processor. The trigger is
+	# offloaded once the PHY is attached, when the port is brought up.
+	# PHY addresses: wan1 0, wan2 1
+	for port in 1 2; do
+		phy="f5000000.ethernet-mii0:0$((port - 1))"
+		ucidef_set_led_netdev "wan${port}_1000" "WAN${port} 1000" \
+			"$phy:green:speed-wan" "wan$port" "link_1000"
+		ucidef_set_led_netdev "wan${port}_100" "WAN${port} 100" \
+			"orange:speed-wan-$port" "wan$port" "link_100"
+		ucidef_set_led_netdev "wan${port}" "WAN${port}" \
+			"$phy:green:wan" "wan$port" "link tx rx"
+	done
+	;;
 esac
 
 board_config_flush
