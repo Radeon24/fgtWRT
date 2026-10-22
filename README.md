@@ -728,7 +728,7 @@ test tools); **earlier** = earlier OpenWrt lab image of the 60E, before the dmz 
 | Routing through an LACP bond of switch ports, hw | 939 | | earlier |
 | VLAN on a bond of switch ports, hw | 936 / 937 | | earlier |
 | Latency through the appliance, idle / line saturated | 0.28 / 1.5–1.9 ms | | earlier |
-| New connections per second with SNAT, hw (IPv4 / IPv6) | 8717 / 7332 | | current |
+| New connections per second with SNAT, hw (IPv4 / IPv6) | 8717 / 7332 | | current; IPv6: NAT66 is not offloaded, so these IPv6 flows stay on the CPU |
 | New connections per second with SNAT, software flow offload (IPv4 / IPv6) | 8123 / 7584 | | current |
 | Concurrent NATed TCP connections, hw, IPv4 | **48440**, all offloaded to the NP (limit of the test host, not of the NP) | | current |
 | Power-on to first LuCI response | 32.4–32.5 s (three cold boots) | | current |
