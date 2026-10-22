@@ -48,7 +48,7 @@ It adds a `fortisoc` target[^fortisoc-name] to OpenWrt for the Fortinet **FortiS
 |---|---|---|---|---|
 | SoC1 (FS1) | Faraday FA626TE (ARMv5) | 525 MHz (60C) | NPLite | VPN_LITE |
 | SoC2 | Faraday FA726TE (ARMv5TE) | 800 MHz (60D), 900 MHz (90D) | NP4Lite | on-chip VPN engine |
-| SoC3 | 4 × ARM Cortex-A9 (VFPv3-D16, no NEON) | about 1 GHz (60E) | NP6Lite | on-chip engine (no driver) |
+| SoC3 | 4 × ARM Cortex-A9 (VFPv3-D16, no NEON) | 1008 MHz (60E) | NP6Lite | on-chip engine (no driver) |
 
 The CPU clock depends on the model: the 60D and the 90D share the same SoC2 but run at different clocks.
 
@@ -76,7 +76,7 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 |---|---|---|---|---|---|---|
 | FortiGate 60D | SoC2 | 800 MHz | NP4Lite | on-chip VPN engine | BCM53128 | ✅ **Available** |
 | FortiGate 90D | SoC2 | 900 MHz | NP4Lite | on-chip VPN engine | 2 × BCM53128 | ✅ **Available** |
-| FortiGate 60E | SoC3 | about 1 GHz | NP6Lite | on-chip engine (no driver) | BCM53128 | ✅ **Available** |
+| FortiGate 60E | SoC3 | 1008 MHz | NP6Lite | on-chip engine (no driver) | BCM53128 | ✅ **Available** |
 | FortiGate 60C | SoC1 (FS1) | 525 MHz | NPLite | VPN_LITE | Marvell 88E6161 | 📋 **Planned** |
 | FortiGate 100D | x86 PC (no Fortinet SoC) | 1.8 GHz | none | CP8 (no driver) | BCM53314 | 🚧 **Work in progress** |
 
@@ -675,7 +675,7 @@ streams) and cut the fork/exec time by about a third.
 | Console | RJ-45 serial, 9600 8N1 |
 | RTC | on-chip, battery-backed |
 | LEDs / buttons | none supported yet |
-| Power | 12 V DC input; about 9 W, idle and under load (smart plug, 1 W resolution) |
+| Power | 12 V DC input; about 7 W, idle and under load (smart plug, 1 W resolution) |
 
 ### Hardware topology
 
@@ -728,11 +728,43 @@ test tools); **earlier** = earlier OpenWrt lab image of the 60E, before the dmz 
 | Routing through an LACP bond of switch ports, hw | 939 | | earlier |
 | VLAN on a bond of switch ports, hw | 936 / 937 | | earlier |
 | Latency through the appliance, idle / line saturated | 0.28 / 1.5–1.9 ms | | earlier |
-| New connections per second, software flow offload (IPv4 / IPv6) | 8499 / 7872 | | earlier |
-| Power-on to first LuCI response | 33–34 s (two cold boots) | | earlier |
-| Power | about 9 W, idle and under load (1 W resolution) | | test kernel |
+| New connections per second with SNAT, hw (IPv4 / IPv6) | 8717 / 7332 | | current |
+| New connections per second with SNAT, software flow offload (IPv4 / IPv6) | 8123 / 7584 | | current |
+| Concurrent NATed TCP connections, hw, IPv4 | **48440**, all offloaded to the NP (limit of the test host, not of the NP) | | current |
+| Power-on to first LuCI response | 32.4–32.5 s (three cold boots) | | current |
+| Power, idle / offloaded load (≈ 900 Mbit/s both ways) | about 7 W / 7 W (1 W resolution) | | current |
 
-IPsec, WireGuard and OpenVPN have not been measured on the 60E yet.
+#### IPsec, software (60E)
+
+Measured on the current image; manual-keyed SAs, as on the 60D. *in* / *out* as for the 60D.
+
+| Cipher | IPv4 tunnel, in / out | IPv4 transport, in / out | IPv6 tunnel, in / out | IPv6 transport, in / out |
+|---|---|---|---|---|
+| AES-128-CBC + HMAC-SHA1 | 103.2 / 95.9 | 96.2 / 95.1 | 100.9 / 93.0 | 93.4 / 93.5 |
+| AES-128-CBC + HMAC-SHA256 | 91.4 / 84.9 | 85.5 / 85.1 | 88.4 / 82.3 | 83.6 / 83.6 |
+| AES-128-GCM | 93.5 / 87.8 | 88.0 / 86.6 | 90.5 / 84.5 | 85.3 / 84.4 |
+| ChaCha20-Poly1305 | 220.2 / 198.2 | 184.1 / 186.5 | 212.6 / 188.6 | 179.2 / 177.7 |
+
+One flow of ESP is handled by one CPU core: one of the four cores is fully busy (about 25 % of the total CPU,
+up to 38 % in transport mode). The Cortex-A9 of the 60E has no NEON and no AES instructions, and the on-chip
+crypto engine has no driver: ChaCha20-Poly1305 runs about twice as fast as AES. In the tunnel tests, a counter
+on the host saw no clear-text packet of the protected flows leave the appliance.
+
+#### WireGuard and OpenVPN (60E, appliance as tunnel end point)
+
+Measured on the current image.
+
+| Tunnel | Outer IP | 1 stream, in / out | 8 streams, in / out | CPU (total of 4 cores) |
+|---|---|---|---|---|
+| WireGuard | IPv4 | 550.8 / 524.1 | 599.3 / 535.6 | 82–94 % |
+| WireGuard | IPv6 | 537.0 / 504.2 | 582.9 / 511.5 | 84–94 % |
+| OpenVPN, ChaCha20-Poly1305, kernel data channel (DCO) | IPv4 | 268.3 / 195.9 | 227.4 / 178.5 | about 25 % (one core) |
+| OpenVPN, ChaCha20-Poly1305, DCO | IPv6 | 259.4 / 180.8 | 213.9 / 165.9 | about 25 % (one core) |
+| OpenVPN, AES-256-CBC + HMAC-SHA256, user space | IPv4 | 45.4 / 43.6 | 44.8 / 42.1 | about 25 % (one core) |
+| OpenVPN, AES-256-CBC + HMAC-SHA256, user space | IPv6 | 42.5 / 39.8 | 41.9 / 38.7 | about 25 % (one core) |
+
+WireGuard spreads over the four cores; OpenVPN, with or without DCO, runs on one core. The peer runs OpenVPN
+without DCO.
 
 ### OpenWrt features
 
@@ -748,6 +780,8 @@ IPsec, WireGuard and OpenVPN have not been measured on the 60E yet.
 | VLANs, link aggregation (LACP, BCM53128 trunk) | 🧪 Partial: validated on an earlier image |
 | UDP offload (default) | ⚠️ Partial: validated on test kernels booted from RAM; rare freezes of offloaded UDP flows seen on the lab unit, cause not found (see [Known limitations](#known-limitations)) |
 | NAT66 | in software only |
+| IPsec in software (IPv4 and IPv6, tunnel and transport) | ✅ Validated |
+| WireGuard, OpenVPN (with DCO) | ✅ Validated (packages included in the 60E profile) |
 | Persistent storage (overlay) | ✅ Validated: survives reboots and power cuts |
 | `sysupgrade -n` | ✅ Validated |
 | `sysupgrade` (keep), `sysupgrade -b`, `firstboot` | 🧪 Partial: validated on an earlier image |
@@ -945,7 +979,7 @@ Benchmarks and installation notes: _to be completed_.
 - The behaviour under saturation of the link between the NP6Lite and the switch, described above for the 60D
   and the 90D, has not been measured on the 60E yet.
 - LEDs, buttons, USB, the crypto engine and the watchdog are not supported yet; IPsec runs in software.
-- **Boot time**: about 33–34 s from power-on to the web interface (earlier image).
+- **Boot time**: about 33 s from power-on to the web interface.
 
 **Other models.** The 60C and the 100D have no OpenWrt image.
 
