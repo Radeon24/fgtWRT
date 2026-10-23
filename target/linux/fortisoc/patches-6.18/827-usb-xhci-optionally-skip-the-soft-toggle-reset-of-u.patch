@@ -1,0 +1,97 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] usb: xhci: optionally skip the soft toggle reset of untouched
+ endpoints
+
+The USB core resets every endpoint of a new configuration; for a bulk or
+interrupt endpoint xhci_endpoint_reset() then sends Stop Endpoint and a
+Configure Endpoint that drops and adds it, to clear the host side
+toggle. On the FortiSOC3 with the public R-Car firmware, the first
+enumeration fails right there now and then (transfer event for a
+disabled endpoint, then urb submitted to a disabled endpoint).
+With the new quirk XHCI_SKIP_FRESH_EP_RESET, set by the FortiSOC3 glue
+from the device tree property fortinet,skip-fresh-ep-reset, a ring
+never used since it was set up is left alone: its toggle is still 0.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/usb/host/xhci.c      |   35 +++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci.h      |    1 +
+ drivers/usb/host/xhci-rcar.c |    6 ++++++
+ 3 files changed, 42 insertions(+)
+
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -3310,6 +3310,21 @@ done:
+  * resume. A new vdev will be allocated later by xhci_discover_or_reset_device()
+  */
+ 
++/*
++ * A transfer ring never used since it was set up: both pointers on the
++ * first TRB of the first segment, first lap, no TD. Its endpoint was just
++ * added by a Configure Endpoint command: its toggle/sequence is 0.
++ */
++static bool xhci_ring_untouched(struct xhci_ring *ring)
++{
++	return ring && list_empty(&ring->td_list) &&
++	       ring->cycle_state == 1 &&
++	       ring->enq_seg == ring->first_seg &&
++	       ring->deq_seg == ring->first_seg &&
++	       ring->enqueue == ring->first_seg->trbs &&
++	       ring->dequeue == ring->first_seg->trbs;
++}
++
+ static void xhci_endpoint_reset(struct usb_hcd *hcd,
+ 		struct usb_host_endpoint *host_ep)
+ {
+@@ -3376,6 +3391,26 @@ static void xhci_endpoint_reset(struct u
+ 	if (ep_flag == SLOT_FLAG || ep_flag == EP0_FLAG)
+ 		return;
+ 
++	/*
++	 * XHCI_SKIP_FRESH_EP_RESET (FortiSOC3 with a public R-Car firmware):
++	 * the core resets every endpoint of a new configuration; the Stop
++	 * Endpoint and Configure Endpoint (drop and add) pair sent for that
++	 * right after the configuration is where the first enumeration goes
++	 * wrong. The toggle of a ring never used is already 0: skip it.
++	 */
++	if (xhci->quirks & XHCI_SKIP_FRESH_EP_RESET) {
++		bool fresh;
++
++		spin_lock_irqsave(&xhci->lock, flags);
++		fresh = xhci_ring_untouched(ep->ring);
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		if (fresh) {
++			xhci_dbg(xhci, "slot %u ep %u: fresh ring, soft toggle reset skipped\n",
++				 udev->slot_id, ep_index);
++			return;
++		}
++	}
++
+ 	stop_cmd = xhci_alloc_command(xhci, true, GFP_NOWAIT);
+ 	if (!stop_cmd)
+ 		return;
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1637,6 +1637,7 @@ struct xhci_hcd {
+ #define XHCI_CDNS_SCTX_QUIRK	BIT_ULL(48)
+ #define XHCI_ETRON_HOST	BIT_ULL(49)
+ #define XHCI_LIMIT_ENDPOINT_INTERVAL_9 BIT_ULL(50)
++#define XHCI_SKIP_FRESH_EP_RESET	BIT_ULL(51)
+ 
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;
+--- a/drivers/usb/host/xhci-rcar.c
++++ b/drivers/usb/host/xhci-rcar.c
+@@ -269,6 +269,12 @@ static int xhci_fsoc3_init_quirk(struct
+ 	if (ret)
+ 		return ret;
+ 
++	if (of_property_read_bool(dev->of_node, "fortinet,skip-fresh-ep-reset")) {
++		/* See XHCI_SKIP_FRESH_EP_RESET in xhci.c */
++		hcd_to_xhci(hcd)->quirks |= XHCI_SKIP_FRESH_EP_RESET;
++		dev_info(dev, "no soft toggle reset of fresh endpoints\n");
++	}
++
+ 	if (of_property_read_u32(dev->of_node, "fortinet,vbus-line", &line))
+ 		return 0;
+ 	if (line > 31)

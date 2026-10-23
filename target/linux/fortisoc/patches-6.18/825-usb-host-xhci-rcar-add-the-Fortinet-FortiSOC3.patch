@@ -2,16 +2,19 @@ From: Radeon24 <Radeon24@users.noreply.github.com>
 Subject: [PATCH] usb: host: xhci-rcar: add the Fortinet FortiSOC3
 
 The xHCI of the FortiSOC3 (FortiGate 60E, 100E) takes the R-Car firmware
-download and Gen2 settings, without waiting for the PLL status (printed
-only), with a firmware named by the device tree (property
-firmware-name), and drives a GPIO of the network processor block after
-the download (optional fortinet,vbus-line, second register range).
+download and Gen2 settings. The PLL status is only printed, not waited
+for. The firmware file is named by the device tree property
+firmware-name. With the optional fortinet,vbus-line, a line of the GPIO
+block of the network processor (second register range) is driven high
+after the download; only the bit of that line is written to the
+write-1-to-set registers, so that a line changed meanwhile by another
+driver is never written back with a stale value.
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/usb/host/Kconfig     |  2 +-
- drivers/usb/host/xhci-rcar.c | 84 +++++++++++++++++++++++++++++++++++++
- 2 files changed, 85 insertions(+), 1 deletion(-)
+ drivers/usb/host/Kconfig     |    2 -
+ drivers/usb/host/xhci-rcar.c |   95 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 1 deletion(-)
 
 --- a/drivers/usb/host/Kconfig
 +++ b/drivers/usb/host/Kconfig
@@ -26,22 +29,40 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	  Say 'Y' to enable the support for the xHCI host controller
 --- a/drivers/usb/host/xhci-rcar.c
 +++ b/drivers/usb/host/xhci-rcar.c
-@@ -213,6 +213,87 @@ static int xhci_rcar_resume_quirk(struct
+@@ -213,6 +213,98 @@ static int xhci_rcar_resume_quirk(struct
   * long delay for the handshake of STS_HALT is neeed in xhci_suspend()
   * by using the XHCI_SLOW_SUSPEND quirk.
   */
 +/*
-+ * Fortinet FortiSOC3 (FortiGate 60E, 100E): an R-Car Gen2 xHCI. It takes
-+ * a firmware of the same format as the R-Car one, then the Gen2
-+ * settings; the PLL status is not waited for. The firmware name comes
-+ * from the "firmware-name" property. The optional second register
-+ * range is the GPIO block of the network processor: if
-+ * "fortinet,vbus-line" is present, that line is driven high after the
-+ * download (FortiGate 60E: line 6, presumably the VBUS switch of the
-+ * port).
++ * Fortinet FortiSOC3 (FortiGate 60E, 100E): an R-Car Gen2 xHCI, as
++ * established by observation for interoperability. It takes a firmware of
++ * the R-Car format, downloaded the R-Car way, then the Gen2 settings; the
++ * PLL status is only read and printed, not waited for. The firmware file is
++ * named by the "firmware-name" property. The optional second register range
++ * is the GPIO block of the network processor: with "fortinet,vbus-line",
++ * that line is driven high once the firmware is downloaded, so that the
++ * port is powered when the controller can serve it (FortiGate 60E: line 6,
++ * presumably the VBUS switch of the port).
 + */
 +#define FSOC3_GPIO_OUT_SET	0x08
 +#define FSOC3_GPIO_DIR_OUT_SET	0x10
++
++/*
++ * The GPIO block registers are write-1-to-set (and +0x48/+0x50
++ * write-1-to-clear): only the bit of the line is written, so that a line
++ * changed meanwhile by another driver (gpio-fsoc3, network processor) is
++ * never written back with a stale value.
++ */
++static void xhci_fsoc3_vbus_on(struct device *dev, void __iomem *gpio,
++			       u32 line)
++{
++	/* The line is made an output, then driven high */
++	writel(BIT(line), gpio + FSOC3_GPIO_DIR_OUT_SET);
++	writel(BIT(line), gpio + FSOC3_GPIO_OUT_SET);
++	dev_info(dev, "GPIO %u high: out %08x dir %08x\n", line,
++		 readl(gpio + FSOC3_GPIO_OUT_SET),
++		 readl(gpio + FSOC3_GPIO_DIR_OUT_SET));
++}
 +
 +static int xhci_fsoc3_init_quirk(struct usb_hcd *hcd)
 +{
@@ -50,7 +71,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 +	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
 +	struct resource *res;
 +	void __iomem *gpio;
-+	u32 line, val;
++	u32 line;
 +	int ret;
 +
 +	if (!hcd->regs)
@@ -82,14 +103,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 +	dev_info(dev, "GPIO before: out %08x dir %08x\n",
 +		 readl(gpio + FSOC3_GPIO_OUT_SET),
 +		 readl(gpio + FSOC3_GPIO_DIR_OUT_SET));
-+	/* Direction, then level */
-+	val = readl(gpio + FSOC3_GPIO_DIR_OUT_SET);
-+	writel(val | BIT(line), gpio + FSOC3_GPIO_DIR_OUT_SET);
-+	val = readl(gpio + FSOC3_GPIO_OUT_SET);
-+	writel(val | BIT(line), gpio + FSOC3_GPIO_OUT_SET);
-+	dev_info(dev, "GPIO %u high: out %08x dir %08x\n", line,
-+		 readl(gpio + FSOC3_GPIO_OUT_SET),
-+		 readl(gpio + FSOC3_GPIO_DIR_OUT_SET));
++	xhci_fsoc3_vbus_on(dev, gpio, line);
 +	iounmap(gpio);
 +
 +	return 0;
@@ -114,7 +128,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  #define SET_XHCI_PLAT_PRIV_FOR_RCAR(firmware)				\
  	.firmware_name = firmware,					\
  	.quirks = XHCI_NO_64BIT_SUPPORT |  XHCI_SLOW_SUSPEND,		\
-@@ -244,6 +325,9 @@ static const struct xhci_plat_priv xhci_
+@@ -244,6 +336,9 @@ static const struct xhci_plat_priv xhci_
  
  static const struct of_device_id usb_xhci_of_match[] = {
  	{

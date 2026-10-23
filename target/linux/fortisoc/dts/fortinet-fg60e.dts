@@ -532,6 +532,11 @@
 		};
 	};
 
+	/*
+	 * The first enumeration needs both quirks: no soft toggle reset of
+	 * endpoints whose ring was never used, and the output context of
+	 * configured endpoints checked against what the driver set.
+	 */
 	usb: usb@f3008000 {
 		compatible = "fortinet,fsoc3-xhci";
 		reg = <0xf3008000 0x8000>,
@@ -539,6 +544,8 @@
 		interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
 		firmware-name = "r8a779x_usb3_v2-98d922b9.dlmem";
 		fortinet,vbus-line = <6>;
+		fortinet,skip-fresh-ep-reset;
+		fortinet,trust-internal-ep-state;
 	};
 
 	/*

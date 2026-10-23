@@ -1,0 +1,446 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Subject: [PATCH] usb: xhci: FortiSOC3: do not trust the output context of
+ configured endpoints
+
+On the FortiSOC3 with the public R-Car firmware 98d922b9 each output
+context is written at the right place but sometimes with the content of
+the context the controller produced just before: an endpoint added by a
+successful Configure Endpoint can be read disabled, or running with the
+type, max packet and dequeue pointer of another endpoint; the slot can
+carry the words of an endpoint, or keep those of the Address Device with
+BSR; the dequeue pointer after Set TR Dequeue can be the one Reset
+Endpoint left. Linux then refuses the first bulk transfer (urb submitted
+to a disabled ep), drops its events, sends a wrong context back with the
+Configure Endpoint of the soft toggle reset, and skips Reset Device on a
+slot read disabled, so the next Address Device ends with a Context State
+Error.
+
+With the new quirk XHCI_TRUST_INTERNAL_EP_STATE, set by the FortiSOC3
+glue from the device tree property fortinet,trust-internal-ep-state,
+the output context of an endpoint added by a successful Configure
+Endpoint and not dropped since is compared with the input context saved
+then (state not disabled, same type, same max packet, dequeue pointer
+inside its own ring). On any difference, prepare_transfer() takes the
+endpoint as running and handle_tx_event() keeps its events; the soft
+toggle reset pair is built from the saved input context at the software
+dequeue pointer, also when only the slot differs or when the dequeue
+pointer is not the software one; a Set TR Dequeue that succeeded moves
+the ring to the queued position. After a successful Address Device the
+slot is taken as addressed whatever is read, so Reset Device is not
+skipped on a slot read disabled. Each case is logged at debug level,
+with a saturating per endpoint count for transfers and events; the
+first case on a controller is noted once.
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ drivers/usb/host/xhci.c      |  173 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci.h      |   27 +++++++
+ drivers/usb/host/xhci-rcar.c |    6 +
+ drivers/usb/host/xhci-ring.c |   59 ++++++++++++++
+ 4 files changed, 260 insertions(+), 5 deletions(-)
+
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -2961,6 +2961,50 @@ int xhci_usb_endpoint_maxp(struct usb_de
+ 	return usb_endpoint_maxp(&host_ep->desc);
+ }
+ 
++/* XHCI_TRUST_INTERNAL_EP_STATE, see xhci.h; called with xhci->lock */
++const char *xhci_fsoc3_ep_mismatch(struct xhci_hcd *xhci,
++				   struct xhci_virt_ep *ep,
++				   struct xhci_ep_ctx *ep_ctx)
++{
++	u32 info2 = le32_to_cpu(ep_ctx->ep_info2);
++	u32 saved = le32_to_cpu(ep->fsoc3_shadow.ep_info2);
++	dma_addr_t deq = le64_to_cpu(ep_ctx->deq) & TR_DEQ_PTR_MASK;
++	struct xhci_segment *seg;
++
++	if (!(xhci->quirks & XHCI_TRUST_INTERNAL_EP_STATE) ||
++	    !ep->fsoc3_added || !ep->ring || (ep->ep_state & EP_DROP_PENDING))
++		return NULL;
++	if (GET_EP_CTX_STATE(ep_ctx) == EP_STATE_DISABLED)
++		return "disabled";
++	if (CTX_TO_EP_TYPE(info2) != CTX_TO_EP_TYPE(saved))
++		return "type";
++	if (MAX_PACKET_DECODED(info2) != MAX_PACKET_DECODED(saved))
++		return "maxp";
++	/* with streams, deq points to the stream context array */
++	if (ep->ep_state & EP_HAS_STREAMS)
++		return NULL;
++	xhci_for_each_ring_seg(ep->ring->first_seg, seg)
++		if (deq >= seg->dma && deq < seg->dma + TRB_SEGMENT_SIZE)
++			return NULL;
++	return "deq";
++}
++
++/*
++ * XHCI_TRUST_INTERNAL_EP_STATE: count the transfers and events of @ep taken
++ * on trust (saturating); true on the first one and at each power of two, so
++ * that their debug message stays bounded. The first case on a controller is
++ * also noted once at info level.
++ */
++bool xhci_fsoc3_trusted(struct xhci_hcd *xhci, struct xhci_virt_ep *ep)
++{
++	if (ep->fsoc3_trusted < UINT_MAX)
++		ep->fsoc3_trusted++;
++	if (ep->fsoc3_trusted == 1)
++		dev_info_once(xhci_to_hcd(xhci)->self.controller,
++			      "output context of a configured endpoint does not match: endpoint trusted\n");
++	return is_power_of_2(ep->fsoc3_trusted);
++}
++
+ /* Issue a configure endpoint command or evaluate context command
+  * and wait for it to finish.
+  */
+@@ -3148,6 +3192,28 @@ int xhci_check_bandwidth(struct usb_hcd
+ 		/* Callee should call reset_bandwidth() */
+ 		goto command_cleanup;
+ 
++	if (xhci->quirks & XHCI_TRUST_INTERNAL_EP_STATE) {
++		/* What this command added, see xhci_fsoc3_ep_mismatch() */
++		u32 add = le32_to_cpu(ctrl_ctx->add_flags);
++		u32 drop = le32_to_cpu(ctrl_ctx->drop_flags);
++
++		for (i = 1; i < 31; i++) {
++			struct xhci_virt_ep *ep = &virt_dev->eps[i];
++
++			if (add & BIT(i + 1)) {
++				ep->fsoc3_added = true;
++				ep->fsoc3_trusted = 0;
++				ep->fsoc3_shadow = *xhci_get_ep_ctx(xhci,
++							command->in_ctx, i);
++			} else if (drop & BIT(i + 1)) {
++				ep->fsoc3_added = false;
++			}
++		}
++		if (add & ~(SLOT_FLAG | EP0_FLAG))
++			virt_dev->fsoc3_slot_shadow =
++				*xhci_get_slot_ctx(xhci, command->in_ctx);
++	}
++
+ 	/* Free any rings that were dropped, but not changed. */
+ 	for (i = 1; i < 31; i++) {
+ 		if ((le32_to_cpu(ctrl_ctx->drop_flags) & (1 << (i + 1))) &&
+@@ -3334,6 +3400,9 @@ static void xhci_endpoint_reset(struct u
+ 	struct xhci_virt_ep *ep;
+ 	struct xhci_input_control_ctx *ctrl_ctx;
+ 	struct xhci_command *stop_cmd, *cfg_cmd;
++	struct xhci_ep_ctx *out_ep;
++	const char *why;
++	bool slot_why = false;
+ 	unsigned int ep_index;
+ 	unsigned long flags;
+ 	u32 ep_flag;
+@@ -3467,6 +3536,65 @@ static void xhci_endpoint_reset(struct u
+ 	xhci_setup_input_ctx_for_config_ep(xhci, cfg_cmd->in_ctx, vdev->out_ctx,
+ 					   ctrl_ctx, ep_flag, ep_flag);
+ 	xhci_endpoint_copy(xhci, cfg_cmd->in_ctx, vdev->out_ctx, ep_index);
++	out_ep = xhci_get_ep_ctx(xhci, vdev->out_ctx, ep_index);
++	why = xhci_fsoc3_ep_mismatch(xhci, ep, out_ep);
++	if ((xhci->quirks & XHCI_TRUST_INTERNAL_EP_STATE) && ep->fsoc3_added &&
++	    ep->ring) {
++		struct xhci_slot_ctx *out_slot = xhci_get_slot_ctx(xhci,
++							vdev->out_ctx);
++		struct xhci_slot_ctx *saved = &vdev->fsoc3_slot_shadow;
++		dma_addr_t ring_deq = xhci_trb_virt_to_dma(ep->ring->deq_seg,
++							   ep->ring->dequeue);
++
++		/*
++		 * The ring is empty here: after the Stop Endpoint, the
++		 * dequeue pointer of the controller is the software one.
++		 */
++		if (!why && (le64_to_cpu(out_ep->deq) & TR_DEQ_PTR_MASK) != ring_deq)
++			why = "deq";
++		/* slot: what the driver set, and the state a Configure leaves */
++		if (out_slot->dev_info != saved->dev_info ||
++		    DEVINFO_TO_ROOT_HUB_PORT(le32_to_cpu(out_slot->dev_info2)) !=
++		    DEVINFO_TO_ROOT_HUB_PORT(le32_to_cpu(saved->dev_info2)) ||
++		    GET_SLOT_STATE(le32_to_cpu(out_slot->dev_state)) !=
++		    SLOT_STATE_CONFIGURED)
++			slot_why = true;
++	}
++	if (why || slot_why) {
++		/*
++		 * XHCI_TRUST_INTERNAL_EP_STATE: the output context of this
++		 * endpoint or of the slot does not match what the driver
++		 * configured (read disabled, or with the words of another
++		 * context); sent back, it made the controller end this
++		 * Configure Endpoint with a TRB Error, or store that context.
++		 * Take the input context of the Configure Endpoint that added
++		 * it instead, at the current dequeue pointer of the ring.
++		 */
++		struct xhci_ep_ctx *in_ep = xhci_get_ep_ctx(xhci,
++						cfg_cmd->in_ctx, ep_index);
++		struct xhci_slot_ctx *in_slot = xhci_get_slot_ctx(xhci,
++						cfg_cmd->in_ctx);
++		struct xhci_slot_ctx *out_slot = xhci_get_slot_ctx(xhci,
++						vdev->out_ctx);
++
++		xhci_dbg(xhci, "slot %u ep %u out %08x %08x deq %08llx slot %08x %08x (ep %s%s): soft toggle reset from the saved input context\n",
++			 udev->slot_id, ep_index, le32_to_cpu(out_ep->ep_info),
++			 le32_to_cpu(out_ep->ep_info2),
++			 (unsigned long long)le64_to_cpu(out_ep->deq),
++			 le32_to_cpu(out_slot->dev_info),
++			 le32_to_cpu(out_slot->dev_state),
++			 why ? why : "ok", slot_why ? ", slot differs" : "");
++		in_ep->ep_info = ep->fsoc3_shadow.ep_info;
++		in_ep->ep_info2 = ep->fsoc3_shadow.ep_info2;
++		in_ep->tx_info = ep->fsoc3_shadow.tx_info;
++		in_ep->deq = cpu_to_le64(xhci_trb_virt_to_dma(ep->ring->deq_seg,
++							      ep->ring->dequeue) |
++					 ep->ring->cycle_state);
++		in_slot->dev_info = vdev->fsoc3_slot_shadow.dev_info;
++		in_slot->dev_info2 = vdev->fsoc3_slot_shadow.dev_info2;
++		in_slot->tt_info = vdev->fsoc3_slot_shadow.tt_info;
++		in_slot->dev_state = vdev->fsoc3_slot_shadow.dev_state;
++	}
+ 
+ 	err = xhci_queue_configure_endpoint(xhci, cfg_cmd, cfg_cmd->in_ctx->dma,
+ 				      udev->slot_id, false);
+@@ -4006,8 +4134,26 @@ static int xhci_discover_or_reset_device
+ 	/* If device is not setup, there is no point in resetting it */
+ 	slot_ctx = xhci_get_slot_ctx(xhci, virt_dev->out_ctx);
+ 	if (GET_SLOT_STATE(le32_to_cpu(slot_ctx->dev_state)) ==
+-						SLOT_STATE_DISABLED)
+-		return 0;
++						SLOT_STATE_DISABLED) {
++		/*
++		 * XHCI_TRUST_INTERNAL_EP_STATE: the slot context is not
++		 * always written by the controller; a device that went
++		 * through Address Device is addressed or configured there, and
++		 * Address Device without Reset Device ends with a Context State
++		 * Error. Send Reset Device anyway (a slot really in the default
++		 * state only gives a Context State Error, taken as success).
++		 */
++		if ((xhci->quirks & XHCI_TRUST_INTERNAL_EP_STATE) &&
++		    (udev->state >= USB_STATE_ADDRESS ||
++		     virt_dev->fsoc3_addressed)) {
++			xhci_dbg(xhci, "slot %u read disabled, device %s%s: Reset Device sent anyway\n",
++				 slot_id, usb_state_string(udev->state),
++				 virt_dev->fsoc3_addressed ?
++				 ", Address Device done" : "");
++		} else {
++			return 0;
++		}
++	}
+ 
+ 	if (xhci->quirks & XHCI_ETRON_HOST) {
+ 		/*
+@@ -4072,12 +4218,16 @@ static int xhci_discover_or_reset_device
+ 				slot_id,
+ 				xhci_get_slot_state(xhci, virt_dev->out_ctx));
+ 		xhci_dbg(xhci, "Not freeing device rings.\n");
++		/* XHCI_TRUST_INTERNAL_EP_STATE: not addressed (Default or Enabled) */
++		virt_dev->fsoc3_addressed = false;
+ 		/* Don't treat this as an error.  May change my mind later. */
+ 		virt_dev->flags = 0;
+ 		ret = 0;
+ 		goto command_cleanup;
+ 	case COMP_SUCCESS:
+ 		xhci_dbg(xhci, "Successful reset device command.\n");
++		/* XHCI_TRUST_INTERNAL_EP_STATE: the slot is Default now */
++		virt_dev->fsoc3_addressed = false;
+ 		break;
+ 	default:
+ 		if (xhci_is_vendor_info_code(xhci, ret))
+@@ -4100,6 +4250,7 @@ static int xhci_discover_or_reset_device
+ 	for (i = 1; i < 31; i++) {
+ 		struct xhci_virt_ep *ep = &virt_dev->eps[i];
+ 
++		ep->fsoc3_added = false;
+ 		if (ep->ep_state & EP_HAS_STREAMS) {
+ 			xhci_warn(xhci, "WARN: endpoint 0x%02x has streams on device reset, freeing streams.\n",
+ 					xhci_get_endpoint_address(i));
+@@ -4524,6 +4675,24 @@ static int xhci_setup_device(struct usb_
+ 	ctrl_ctx->drop_flags = 0;
+ 	slot_ctx = xhci_get_slot_ctx(xhci, virt_dev->out_ctx);
+ 	udev->devaddr = (u8)(le32_to_cpu(slot_ctx->dev_state) & DEV_ADDR_MASK);
++	if ((xhci->quirks & XHCI_TRUST_INTERNAL_EP_STATE) &&
++	    setup == SETUP_CONTEXT_ADDRESS) {
++		u32 state = le32_to_cpu(slot_ctx->dev_state);
++
++		/*
++		 * XHCI_TRUST_INTERNAL_EP_STATE: the slot is addressed now,
++		 * whatever the output context says (it can keep the words of
++		 * the Address Device with BSR, or of another context); Reset
++		 * Device must not be skipped on it later, see
++		 * xhci_discover_or_reset_device().
++		 */
++		virt_dev->fsoc3_addressed = true;
++		if (GET_SLOT_STATE(state) != SLOT_STATE_ADDRESSED ||
++		    !(state & DEV_ADDR_MASK))
++			xhci_dbg(xhci, "slot %u read %08x after Address Device (state %u addr %u), expected addressed: taken as addressed\n",
++				 udev->slot_id, state, GET_SLOT_STATE(state),
++				 state & DEV_ADDR_MASK);
++	}
+ 
+ 	xhci_dbg_trace(xhci, trace_xhci_dbg_address,
+ 		       "Internal device address = %d",
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -665,6 +665,12 @@ struct xhci_virt_ep {
+ #define EP_SOFT_CLEAR_TOGGLE	(1 << 7)
+ /* usb_hub_clear_tt_buffer is in progress */
+ #define EP_CLEARING_TT		(1 << 8)
++	/* XHCI_TRUST_INTERNAL_EP_STATE: added by a successful Configure
++	 * Endpoint and not dropped since, with its input context then, and the
++	 * count of its transfers and events taken on trust (saturating) */
++	bool			fsoc3_added;
++	unsigned int		fsoc3_trusted;
++	struct xhci_ep_ctx	fsoc3_shadow;
+ 	/* ----  Related to URB cancellation ---- */
+ 	struct list_head	cancelled_td_list;
+ 	struct xhci_hcd		*xhci;
+@@ -725,6 +731,11 @@ struct xhci_interval_bw_table {
+ 
+ struct xhci_virt_device {
+ 	int				slot_id;
++	/* XHCI_TRUST_INTERNAL_EP_STATE: input slot context of the
++	 * last successful Configure Endpoint that added an endpoint; set by a
++	 * successful Address Device (BSR 0), cleared by Reset Device */
++	struct xhci_slot_ctx		fsoc3_slot_shadow;
++	bool				fsoc3_addressed;
+ 	struct usb_device		*udev;
+ 	/*
+ 	 * Commands to the hardware are passed an "input context" that
+@@ -1638,6 +1649,7 @@ struct xhci_hcd {
+ #define XHCI_ETRON_HOST	BIT_ULL(49)
+ #define XHCI_LIMIT_ENDPOINT_INTERVAL_9 BIT_ULL(50)
+ #define XHCI_SKIP_FRESH_EP_RESET	BIT_ULL(51)
++#define XHCI_TRUST_INTERNAL_EP_STATE	BIT_ULL(52)
+ 
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;
+@@ -1805,6 +1817,21 @@ void xhci_endpoint_copy(struct xhci_hcd
+ 		struct xhci_container_ctx *in_ctx,
+ 		struct xhci_container_ctx *out_ctx,
+ 		unsigned int ep_index);
++/*
++ * XHCI_TRUST_INTERNAL_EP_STATE (FortiSOC3 with the public R-Car firmware
++ * 98d922b9): the output context is not trusted for an endpoint
++ * added by a successful Configure Endpoint and not dropped since. The
++ * firmware writes each context at the right place but sometimes with the
++ * content of the context it produced just before: an endpoint can be read
++ * disabled, or running with the type, max packet and dequeue pointer of
++ * another one. Returns why the output context of such an endpoint does not
++ * match the saved input context (disabled, type, max packet, or dequeue
++ * pointer outside its ring), NULL if it matches or is not ours to judge.
++ */
++const char *xhci_fsoc3_ep_mismatch(struct xhci_hcd *xhci,
++				   struct xhci_virt_ep *ep,
++				   struct xhci_ep_ctx *ep_ctx);
++bool xhci_fsoc3_trusted(struct xhci_hcd *xhci, struct xhci_virt_ep *ep);
+ void xhci_slot_copy(struct xhci_hcd *xhci,
+ 		struct xhci_container_ctx *in_ctx,
+ 		struct xhci_container_ctx *out_ctx);
+--- a/drivers/usb/host/xhci-rcar.c
++++ b/drivers/usb/host/xhci-rcar.c
+@@ -275,6 +275,12 @@ static int xhci_fsoc3_init_quirk(struct
+ 		dev_info(dev, "no soft toggle reset of fresh endpoints\n");
+ 	}
+ 
++	if (of_property_read_bool(dev->of_node, "fortinet,trust-internal-ep-state")) {
++		/* See XHCI_TRUST_INTERNAL_EP_STATE in xhci.h */
++		hcd_to_xhci(hcd)->quirks |= XHCI_TRUST_INTERNAL_EP_STATE;
++		dev_info(dev, "output context of configured endpoints checked\n");
++	}
++
+ 	if (of_property_read_u32(dev->of_node, "fortinet,vbus-line", &line))
+ 		return 0;
+ 	if (line > 31)
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1527,6 +1527,23 @@ static void xhci_handle_cmd_set_deq(stru
+ 			 */
+ 			ep_ring->deq_seg = ep->queued_deq_seg;
+ 			ep_ring->dequeue = ep->queued_deq_ptr;
++		} else if ((xhci->quirks & XHCI_TRUST_INTERNAL_EP_STATE) &&
++			   ep->fsoc3_added && !(ep->ep_state & EP_HAS_STREAMS)) {
++			/*
++			 * XHCI_TRUST_INTERNAL_EP_STATE, see xhci.h: the
++			 * dequeue pointer read can be the one the previous
++			 * command (Reset Endpoint) left: the command succeeded,
++			 * take the position it was given.
++			 */
++			xhci_dbg(xhci, "slot %d ep %u Set TR Deq: read %08llx, queued %08llx: queued taken\n",
++				 slot_id, ep_index, (unsigned long long)deq,
++				 (unsigned long long)xhci_trb_virt_to_dma(ep->queued_deq_seg,
++									   ep->queued_deq_ptr));
++			/* Update the ring's dequeue segment and dequeue pointer
++			 * to reflect the new position.
++			 */
++			ep_ring->deq_seg = ep->queued_deq_seg;
++			ep_ring->dequeue = ep->queued_deq_ptr;
+ 		} else {
+ 			xhci_warn(xhci, "Mismatch between completed Set TR Deq Ptr command & xHCI internal state.\n");
+ 			xhci_warn(xhci, "ep deq seg = %p, deq ptr = %p\n",
+@@ -2698,6 +2715,7 @@ static int handle_tx_event(struct xhci_h
+ 	union xhci_trb *ep_trb;
+ 	int status = -EINPROGRESS;
+ 	struct xhci_ep_ctx *ep_ctx;
++	const char *why;
+ 	u32 trb_comp_code;
+ 	bool ring_xrun_event = false;
+ 
+@@ -2715,7 +2733,22 @@ static int handle_tx_event(struct xhci_h
+ 	ep_ring = xhci_dma_to_transfer_ring(ep, ep_trb_dma);
+ 	ep_ctx = xhci_get_ep_ctx(xhci, ep->vdev->out_ctx, ep_index);
+ 
+-	if (GET_EP_CTX_STATE(ep_ctx) == EP_STATE_DISABLED) {
++	why = xhci_fsoc3_ep_mismatch(xhci, ep, ep_ctx);
++	if (why) {
++		/*
++		 * XHCI_TRUST_INTERNAL_EP_STATE, see xhci.h: the output
++		 * context of this endpoint does not match what the driver
++		 * configured (read disabled, or with the words of
++		 * another context): the completion of a transfer queued by
++		 * prepare_transfer() on the same grounds must not be dropped.
++		 */
++		if (xhci_fsoc3_trusted(xhci, ep))
++			xhci_dbg(xhci, "slot %u ep %u out %08x %08x deq %08llx (%s), added by Configure Endpoint: event %u taken (%u)\n",
++				 slot_id, ep_index, le32_to_cpu(ep_ctx->ep_info),
++				 le32_to_cpu(ep_ctx->ep_info2),
++				 (unsigned long long)le64_to_cpu(ep_ctx->deq),
++				 why, trb_comp_code, ep->fsoc3_trusted);
++	} else if (GET_EP_CTX_STATE(ep_ctx) == EP_STATE_DISABLED) {
+ 		xhci_err(xhci,
+ 			 "ERROR Transfer event for disabled endpoint slot %u ep %u\n",
+ 			  slot_id, ep_index);
+@@ -3394,6 +3427,9 @@ static int prepare_transfer(struct xhci_
+ 	struct xhci_td	*td;
+ 	struct xhci_ring *ep_ring;
+ 	struct xhci_ep_ctx *ep_ctx = xhci_get_ep_ctx(xhci, xdev->out_ctx, ep_index);
++	struct xhci_virt_ep *ep = &xdev->eps[ep_index];
++	const char *why;
++	u32 ep_state;
+ 
+ 	ep_ring = xhci_triad_to_transfer_ring(xhci, xdev->slot_id, ep_index,
+ 					      stream_id);
+@@ -3403,8 +3439,25 @@ static int prepare_transfer(struct xhci_
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = prepare_ring(xhci, ep_ring, GET_EP_CTX_STATE(ep_ctx),
+-			   num_trbs, mem_flags);
++	ep_state = GET_EP_CTX_STATE(ep_ctx);
++	why = xhci_fsoc3_ep_mismatch(xhci, ep, ep_ctx);
++	if (why) {
++		/*
++		 * XHCI_TRUST_INTERNAL_EP_STATE, see xhci.h: the state read
++		 * belongs to no context of this endpoint: take it as running,
++		 * the driver's own flags (EP_HALTED...) still gate the
++		 * doorbell.
++		 */
++		if (xhci_fsoc3_trusted(xhci, ep))
++			xhci_dbg(xhci, "slot %d ep %u out %08x %08x deq %08llx (%s), added by Configure Endpoint: queued anyway (%u)\n",
++				 xdev->slot_id, ep_index,
++				 le32_to_cpu(ep_ctx->ep_info),
++				 le32_to_cpu(ep_ctx->ep_info2),
++				 (unsigned long long)le64_to_cpu(ep_ctx->deq),
++				 why, ep->fsoc3_trusted);
++		ep_state = EP_STATE_RUNNING;
++	}
++	ret = prepare_ring(xhci, ep_ring, ep_state, num_trbs, mem_flags);
+ 	if (ret)
+ 		return ret;
+ 

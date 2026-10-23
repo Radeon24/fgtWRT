@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/usb/fortinet,fsoc3-xhci.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 xHCI controller
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description: |
+  The USB 3.0 host controller of the Fortinet FortiSOC3 (FortiGate 60E,
+  100E): an R-Car Gen2 compatible xHCI, which runs a firmware of the R-Car
+  format downloaded by the driver (xhci-rcar), then takes the Gen2
+  settings.
+
+  The port power switch can hang on a line of the GPIO block of the NP6Lite
+  network processor (fortinet,fsoc3-gpio): that block is then given as a
+  second register range, and the line in fortinet,vbus-line. The driver
+  drives the line high once the firmware is downloaded, writing only its
+  bit to the write-1-to-set registers of the block; the line must be
+  listed in the gpio-reserved-ranges of the GPIO block.
+
+allOf:
+  - $ref: usb-xhci.yaml
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-xhci
+
+  reg:
+    minItems: 1
+    items:
+      - description: xHCI registers
+      - description: GPIO block of the network processor (port power line)
+
+  interrupts:
+    maxItems: 1
+
+  firmware-name:
+    maxItems: 1
+    description:
+      File name of the controller firmware, R-Car format (for example a
+      public R-Car USB 3.0 firmware of linux-firmware).
+
+  dma-coherent: true
+
+  fortinet,vbus-line:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 31
+    description:
+      Line of the GPIO block (second register range) that powers the port,
+      driven high after the firmware download. Requires the second register
+      range.
+
+  fortinet,skip-fresh-ep-reset:
+    type: boolean
+    description:
+      Do not send the Stop Endpoint and Configure Endpoint pair that clears
+      the host side toggle of a bulk or interrupt endpoint whose transfer
+      ring was never used since the endpoint was configured (its toggle is
+      still 0). The first enumeration can fail on that pair with the
+      public R-Car "v2" firmware.
+
+  fortinet,trust-internal-ep-state:
+    type: boolean
+    description:
+      Check the output context of each endpoint added by a successful
+      Configure Endpoint against the input context sent then (state not
+      disabled, same type and max packet, dequeue pointer inside its ring),
+      and on a difference keep the endpoint running, build its soft toggle
+      reset from the saved input context, and never skip Reset Device on an
+      addressed slot read disabled. With the public R-Car "v2" firmware the
+      controller sometimes writes an output context with the content of the
+      context it wrote just before.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    usb@f3008000 {
+        compatible = "fortinet,fsoc3-xhci";
+        reg = <0xf3008000 0x8000>,
+              <0xf500fc00 0x80>;
+        interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
+        firmware-name = "r8a779x_usb3_v2-98d922b9.dlmem";
+        fortinet,vbus-line = <6>;
+        fortinet,skip-fresh-ep-reset;
+        fortinet,trust-internal-ep-state;
+    };
