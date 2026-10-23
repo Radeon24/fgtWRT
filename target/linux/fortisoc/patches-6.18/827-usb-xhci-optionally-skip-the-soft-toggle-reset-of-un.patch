@@ -1,6 +1,5 @@
 From: Radeon24 <Radeon24@users.noreply.github.com>
-Subject: [PATCH] usb: xhci: optionally skip the soft toggle reset of untouched
- endpoints
+Subject: [PATCH] usb: xhci: optionally skip the soft toggle reset of untouched endpoints
 
 The USB core resets every endpoint of a new configuration; for a bulk or
 interrupt endpoint xhci_endpoint_reset() then sends Stop Endpoint and a
@@ -14,11 +13,26 @@ never used since it was set up is left alone: its toggle is still 0.
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/usb/host/xhci.c      |   35 +++++++++++++++++++++++++++++++++++
- drivers/usb/host/xhci.h      |    1 +
- drivers/usb/host/xhci-rcar.c |    6 ++++++
+ drivers/usb/host/xhci-rcar.c |  6 ++++++
+ drivers/usb/host/xhci.c      | 35 +++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci.h      |  1 +
  3 files changed, 42 insertions(+)
 
+--- a/drivers/usb/host/xhci-rcar.c
++++ b/drivers/usb/host/xhci-rcar.c
+@@ -269,6 +269,12 @@ static int xhci_fsoc3_init_quirk(struct
+ 	if (ret)
+ 		return ret;
+ 
++	if (of_property_read_bool(dev->of_node, "fortinet,skip-fresh-ep-reset")) {
++		/* See XHCI_SKIP_FRESH_EP_RESET in xhci.c */
++		hcd_to_xhci(hcd)->quirks |= XHCI_SKIP_FRESH_EP_RESET;
++		dev_info(dev, "no soft toggle reset of fresh endpoints\n");
++	}
++
+ 	if (of_property_read_u32(dev->of_node, "fortinet,vbus-line", &line))
+ 		return 0;
+ 	if (line > 31)
 --- a/drivers/usb/host/xhci.c
 +++ b/drivers/usb/host/xhci.c
 @@ -3310,6 +3310,21 @@ done:
@@ -80,18 +94,3 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  
  	unsigned int		num_active_eps;
  	unsigned int		limit_active_eps;
---- a/drivers/usb/host/xhci-rcar.c
-+++ b/drivers/usb/host/xhci-rcar.c
-@@ -269,6 +269,12 @@ static int xhci_fsoc3_init_quirk(struct
- 	if (ret)
- 		return ret;
- 
-+	if (of_property_read_bool(dev->of_node, "fortinet,skip-fresh-ep-reset")) {
-+		/* See XHCI_SKIP_FRESH_EP_RESET in xhci.c */
-+		hcd_to_xhci(hcd)->quirks |= XHCI_SKIP_FRESH_EP_RESET;
-+		dev_info(dev, "no soft toggle reset of fresh endpoints\n");
-+	}
-+
- 	if (of_property_read_u32(dev->of_node, "fortinet,vbus-line", &line))
- 		return 0;
- 	if (line > 31)

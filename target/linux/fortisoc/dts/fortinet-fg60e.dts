@@ -121,10 +121,12 @@
 	};
 
 	/*
-	 * NP6Lite msc GPIO block, read only. Reserved: 17-18 (MDC lines) and
-	 * 20-25 (resets and interrupts of the WAN PHYs and of the switch),
-	 * owned by the NP6Lite driver. The block lies inside the NP6Lite
-	 * window: the GPIO driver maps it without requesting the region.
+	 * NP6Lite msc GPIO block: front panel lines 0-3 and board lines 16,
+	 * 26, 27 driven (below), line 4 read (button). Reserved: 6 (USB port power,
+	 * driven by the xHCI glue), 17-18 (MDC lines) and 20-25 (resets and
+	 * interrupts of the WAN PHYs and of the switch), owned by the NP6Lite
+	 * driver. The block lies inside the NP6Lite window: the GPIO driver
+	 * maps it without requesting the region.
 	 */
 	gpio@f500fc00 {
 		compatible = "fortinet,fsoc3-gpio";
@@ -132,7 +134,27 @@
 		gpio-controller;
 		#gpio-cells = <2>;
 		ngpios = <32>;
-		gpio-reserved-ranges = <17 2>, <20 6>;
+		gpio-reserved-ranges = <6 1>, <17 2>, <20 6>;
+	};
+
+	/*
+	 * xHCI (R-Car Gen2 compatible) with the public R-Car "v2" firmware of
+	 * linux-firmware commit 98d922b9, renamed, binary unmodified. Port
+	 * power on line 6 of the GPIO block above (second register range),
+	 * driven high after the firmware download. DMA not coherent. The first
+	 * enumeration needs both quirks: no soft toggle reset of endpoints
+	 * whose ring was never used, and the output context of configured
+	 * endpoints checked against what the driver set.
+	 */
+	usb@f3008000 {
+		compatible = "fortinet,fsoc3-xhci";
+		reg = <0xf3008000 0x8000>,
+		      <0xf500fc00 0x80>;
+		interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
+		firmware-name = "r8a779x_usb3_v2-98d922b9.dlmem";
+		fortinet,vbus-line = <6>;
+		fortinet,skip-fresh-ep-reset;
+		fortinet,trust-internal-ep-state;
 	};
 
 	/* Internal RTC, read only: never written. */
@@ -416,14 +438,9 @@
  *   the netdev trigger, set from user space.
  * - Reset button: line 4 of the GPIO block, pressed low.
  *
- * USB: xHCI with the public R-Car "v2" firmware of linux-firmware commit
- * 98d922b9 (renamed r8a779x_usb3_v2-98d922b9.dlmem, binary unmodified),
- * port power on line 6 of the GPIO block (driven by the xHCI glue,
- * reserved here), DMA not coherent.
- *
  * Watchdog: block at 0xfbe01600, about 48 MHz; its expiry interrupt
  * restarts the SoC by software (the reset of the block itself freezes
- * the next boot).
+ * the next boot). Described, disabled.
  */
 
 / {
@@ -507,9 +524,6 @@
 
 &{/soc} {
 	np_gpio: gpio@f500fc00 {
-		/* 6: USB port power, driven by the xHCI glue */
-		gpio-reserved-ranges = <6 1>, <17 2>, <20 6>;
-
 		line16-hog {
 			gpio-hog;
 			gpios = <16 GPIO_ACTIVE_HIGH>;
@@ -532,21 +546,6 @@
 		};
 	};
 
-	/*
-	 * The first enumeration needs both quirks: no soft toggle reset of
-	 * endpoints whose ring was never used, and the output context of
-	 * configured endpoints checked against what the driver set.
-	 */
-	usb: usb@f3008000 {
-		compatible = "fortinet,fsoc3-xhci";
-		reg = <0xf3008000 0x8000>,
-		      <0xf500fc00 0x80>;
-		interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
-		firmware-name = "r8a779x_usb3_v2-98d922b9.dlmem";
-		fortinet,vbus-line = <6>;
-		fortinet,skip-fresh-ep-reset;
-		fortinet,trust-internal-ep-state;
-	};
 
 	/*
 	 * Disabled until its expiry has been shown to restart the board

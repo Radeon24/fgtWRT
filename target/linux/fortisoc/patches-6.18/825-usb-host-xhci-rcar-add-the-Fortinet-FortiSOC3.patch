@@ -12,8 +12,8 @@ driver is never written back with a stale value.
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/usb/host/Kconfig     |    2 -
- drivers/usb/host/xhci-rcar.c |   95 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/Kconfig     |  2 +-
+ drivers/usb/host/xhci-rcar.c | 95 +++++++++++++++++++++++++++++++++++++
  2 files changed, 96 insertions(+), 1 deletion(-)
 
 --- a/drivers/usb/host/Kconfig

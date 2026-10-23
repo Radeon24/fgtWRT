@@ -12,7 +12,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=fortinet
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=GPL-2.0-only
 
 include $(INCLUDE_DIR)/package.mk
@@ -99,7 +99,8 @@ endef
 define KernelPackage/fortinet-np6lite
   SUBMENU:=Network Devices
   TITLE:=Fortinet NP6Lite network processor
-  DEPENDS:=@TARGET_fortisoc_fsoc3 +kmod-nf-flow
+  DEPENDS:=@TARGET_fortisoc_fsoc3 +kmod-nf-flow \
+	+kmod-crypto-md5 +kmod-crypto-sha1
   FILES:=$(PKG_BUILD_DIR)/fortinet-np6lite.ko
   AUTOLOAD:=$(call AutoLoad,20,fortinet-np6lite,1)
   KCONFIG:=
@@ -108,7 +109,34 @@ endef
 define KernelPackage/fortinet-np6lite/description
  Host interface of the NP6Lite network processor: MDIO master, one network
  interface per directly attached port, and the offload of flow table flows
- to the session engine. Once loaded, the module cannot be unloaded.
+ to the session engine. The IPsec ESP offload is built into the module
+ only with kmod-fortinet-np6lite-ipsec. Once loaded, the module cannot be
+ unloaded.
+endef
+
+# As for the NP4Lite: the IPsec engine glue (np6lite-ipsec.o) is linked into
+# fortinet-np6lite.ko when the kernel has XFRM_OFFLOAD and INET_ESP_OFFLOAD
+# (src/Kbuild); this package asks for them and ships esp4_offload.ko.
+define KernelPackage/fortinet-np6lite-ipsec
+  SUBMENU:=Network Devices
+  TITLE:=Fortinet NP6Lite IPsec ESP offload
+  DEPENDS:=@TARGET_fortisoc_fsoc3 +kmod-fortinet-np6lite +kmod-ipsec4
+  KCONFIG:= \
+	CONFIG_INET_ESP_OFFLOAD=y \
+	CONFIG_XFRM_OFFLOAD=y \
+	CONFIG_NF_FLOW_TABLE_XFRM_OFFLOAD=y
+  FILES:=$(LINUX_DIR)/net/ipv4/esp4_offload.ko
+  AUTOLOAD:=$(call AutoLoad,33,esp4_offload)
+endef
+
+define KernelPackage/fortinet-np6lite-ipsec/description
+ IPsec ESP offload of the NP6Lite network processor (FortiSOC3): outbound
+ IPv4 ESP states added with "offload packet" on a port of the network
+ processor are handled by its in-line IPsec engine (AES-CBC or 3DES-CBC
+ with HMAC-MD5, HMAC-SHA1 or HMAC-SHA256); inbound states stay in software.
+ Selecting this package builds the offload into kmod-fortinet-np6lite and
+ turns on the kernel options it needs (INET_ESP_OFFLOAD, XFRM_OFFLOAD,
+ NF_FLOW_TABLE_XFRM_OFFLOAD).
 endef
 
 define KernelPackage/fortinet-cp7
@@ -155,4 +183,5 @@ endef
 $(eval $(call KernelPackage,fortinet-np4lite))
 $(eval $(call KernelPackage,fortinet-np4lite-ipsec))
 $(eval $(call KernelPackage,fortinet-np6lite))
+$(eval $(call KernelPackage,fortinet-np6lite-ipsec))
 $(eval $(call KernelPackage,fortinet-cp7))

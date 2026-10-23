@@ -30,7 +30,8 @@ define Device/fortinet_fg-60e
 	fstools_ignore_partname=1
   DEVICE_DTS := fortinet-fg60e
   DEVICE_PACKAGES := firewall4 kmod-nft-offload kmod-bonding proto-bonding \
-	ethtool ip-full kmod-fortinet-np6lite fortigate-dualslot \
+	ethtool ip-full kmod-fortinet-np6lite kmod-fortinet-np6lite-ipsec \
+	fortigate-dualslot \
 	kmod-ipsec kmod-ipsec4 kmod-ipsec6 kmod-crypto-seqiv \
 	kmod-crypto-chacha20poly1305 kmod-crypto-sha256 \
 	e2fsprogs luci kmod-wireguard wireguard-tools openvpn-openssl \

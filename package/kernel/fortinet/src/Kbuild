@@ -7,7 +7,8 @@
 #
 #   FORTINET_SOC       fsoc1, fsoc2 or fsoc3 (sub-target)
 #   FORTINET_NP4LITE   m to build fortinet-np4lite.ko
-#   FORTINET_NP6LITE   m to build fortinet-np6lite.ko
+#   FORTINET_NP6LITE   m to build fortinet-np6lite.ko (with its IPsec engine
+#                      glue on the FortiSOC3 when the kernel has the options)
 #   FORTINET_CP7       m to build fortinet-cp7.ko
 #
 # The options of the in-tree Kconfig that the code still tests are defined
@@ -50,18 +51,35 @@ endif
 np6lite-defs := -DCONFIG_FORTINET_NP6LITE_POLL_MS=0 \
 		-DCONFIG_FORTINET_NP6LITE_FLOW_OFFLOAD=1
 
+# The in-line IPsec engine of the FortiSOC3: built in when the kernel can
+# offload ESP states to a device (the in-tree Kconfig entry depends on
+# XFRM_OFFLOAD and INET_ESP_OFFLOAD).
+ifeq ($(FORTINET_SOC),fsoc3)
+ifeq ($(CONFIG_XFRM_OFFLOAD),y)
+ifneq ($(CONFIG_INET_ESP_OFFLOAD),)
+np6lite-defs += -DCONFIG_FORTINET_NP6LITE_IPSEC=1
+np6lite-ipsec-obj := np6lite/np6lite-ipsec.o
+endif
+endif
+ifeq ($(np6lite-ipsec-obj),)
+$(warning NP6Lite IPsec offload left out: no XFRM_OFFLOAD or INET_ESP_OFFLOAD)
+endif
+endif
+
 # Per-object flags are keyed by the path of the object below this directory.
 CFLAGS_np4lite/np4lite-core.o := $(np4lite-defs)
 CFLAGS_np4lite/np4lite-ipsec.o := $(np4lite-defs)
 CFLAGS_np6lite/np6lite-core.o := $(np6lite-defs)
+CFLAGS_np6lite/np6lite-ipsec.o := $(np6lite-defs)
 
 # NP4Lite: the port driver; on the FortiSOC2, the IPsec engine glue too.
 obj-$(FORTINET_NP4LITE) += fortinet-np4lite.o
 fortinet-np4lite-y := np4lite/np4lite-core.o $(np4lite-ipsec-obj)
 
-# NP6Lite: host interface and MDIO master.
+# NP6Lite: host interface and MDIO master; on the FortiSOC3, the IPsec engine
+# glue too.
 obj-$(FORTINET_NP6LITE) += fortinet-np6lite.o
-fortinet-np6lite-y := np6lite/np6lite-core.o
+fortinet-np6lite-y := np6lite/np6lite-core.o $(np6lite-ipsec-obj)
 
 # CP7: crypto engine (FortiSOC1 and FortiSOC2 only).
 obj-$(FORTINET_CP7) += fortinet-cp7.o

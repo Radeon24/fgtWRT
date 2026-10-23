@@ -1,6 +1,5 @@
 From: Radeon24 <Radeon24@users.noreply.github.com>
-Subject: [PATCH] usb: xhci: FortiSOC3: do not trust the output context of
- configured endpoints
+Subject: [PATCH] usb: xhci: FortiSOC3: do not trust the output context of configured endpoints
 
 On the FortiSOC3 with the public R-Car firmware 98d922b9 each output
 context is written at the right place but sometimes with the content of
@@ -33,10 +32,10 @@ first case on a controller is noted once.
 Assisted-by: LLM
 Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 ---
- drivers/usb/host/xhci.c      |  173 ++++++++++++++++++++++++++++++++++++++++++
- drivers/usb/host/xhci.h      |   27 +++++++
- drivers/usb/host/xhci-rcar.c |    6 +
- drivers/usb/host/xhci-ring.c |   59 ++++++++++++++
+ drivers/usb/host/xhci.c      | 173 ++++++++++++++++++++++++++++++++++++-
+ drivers/usb/host/xhci.h      |  27 ++++++
+ drivers/usb/host/xhci-rcar.c |   6 +
+ drivers/usb/host/xhci-ring.c |  59 ++++++++++++-
  4 files changed, 260 insertions(+), 5 deletions(-)
 
 --- a/drivers/usb/host/xhci.c
