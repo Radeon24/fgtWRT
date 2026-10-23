@@ -56,7 +56,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
 +	struct xhci_segment *seg;
 +
 +	if (!(xhci->quirks & XHCI_TRUST_INTERNAL_EP_STATE) ||
-+	    !ep->fsoc3_added || !ep->ring || (ep->ep_state & EP_DROP_PENDING))
++	    !ep->fsoc3_added || !ep->ring)
 +		return NULL;
 +	if (GET_EP_CTX_STATE(ep_ctx) == EP_STATE_DISABLED)
 +		return "disabled";
