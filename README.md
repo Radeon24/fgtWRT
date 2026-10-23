@@ -214,11 +214,12 @@ given revision, plus a debug console and test tools (see [Benchmark methodology]
 | 60D, 90D | commit `59b1585d5e1` | see [Known limitations](#known-limitations) for later revisions |
 | 60E | the published `fgtwrt` branch, or commit `db82bd67325` (same code) | — |
 
-On later revisions, the 60E profile also brings `kmod-gpio-button-hotplug` (reset button) and
-`r8a779x-usb3-firmware` (firmware of the xHCI, downloaded from linux-firmware and checked against its SHA-256),
-with the kernel support of the LEDs, the button, USB and the watchdog: such an image is **not** the one that
-was measured. To leave the two packages out, deselect them under `Kernel modules` → `GPIO support` and
-`Firmware` in `make menuconfig`; the kernel support stays built in.
+On later revisions, the 60E profile also brings `kmod-gpio-button-hotplug` (reset button),
+`r8a779x-usb3-firmware` (firmware of the xHCI, downloaded from linux-firmware and checked against its SHA-256)
+and USB disk support (`kmod-usb-storage`, `kmod-fs-vfat`, `kmod-nls-cp437`, `kmod-nls-iso8859-1`), with the
+kernel support of the LEDs, the button, USB and the watchdog: such an image is **not** the one that was
+measured. To leave these packages out, deselect them in `make menuconfig` (`Kernel modules` → `GPIO support`,
+`USB Support`, `Filesystems`, `Native Language Support`, and `Firmware`); the kernel support stays built in.
 
 Then build:
 
@@ -803,7 +804,7 @@ without DCO.
 | STATUS and HA LEDs (boot / running / failsafe / upgrade) | 🧪 Partial: in the source tree, not in the published image; the LED lines were checked on the lab unit by direct register access only, the driver is not tested yet |
 | WAN link/activity and speed LEDs | 🧪 Partial: in the source tree, not in the published image; link/activity and the green (1000 Mbit/s) halves validated on one boot of a test kernel; the orange (100 Mbit/s) halves not tested with the driver |
 | Reset button / failsafe | 🧪 Partial: in the source tree, not in the published image; key presses seen on one boot of a test kernel; failsafe and the long press (factory reset) not tested |
-| USB-A port | 🧪 Partial: in the source tree (xHCI, public R-Car v2 firmware), not in the published image; a USB disk mounted read-only on test kernels, the first enumeration sometimes fails; needs more tests |
+| USB-A port | 🧪 Partial: in the source tree (xHCI, public R-Car v2 firmware, two xHCI quirks for the first enumeration), not in the published image; on test kernels a USB disk was enumerated and read on 6 boots out of 6, but a software re-enumeration without a power cycle of the port sometimes fails; not booted yet under OpenWrt; needs more tests |
 | Watchdog | ❌ driver in the source tree, disabled in the device tree until a clean restart on expiry is shown on three boots |
 | Crypto engine | ❌ no driver yet |
 | RTC | ❓ read only, not re-tested under OpenWrt |
