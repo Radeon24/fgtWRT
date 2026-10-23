@@ -109,9 +109,9 @@ Routing/NAT Offloading → Hardware flow offloading* (`flow_offloading_hw` in `/
 | IPv4 routing, TCP and UDP | 🧪 | ✅ | ✅ | line rate on the 60D and the 60E (see [Benchmarks](#benchmarks)). NP6Lite: UDP flows are offloaded by default |
 | IPv4 SNAT / DNAT, with port translation | 🧪 | ✅ | ✅ | NP6Lite: 48440 concurrent IPv4 NAT connections, all offloaded, on the 60E |
 | IPv6 routing, TCP and UDP | — | — | 🧪 | NPLite and NP4Lite flow entries are IPv4 only: IPv6 is always forwarded by the CPU. NP6Lite: line rate measured on an earlier 60E image |
-| IPv6 NAT | — | — | ❌ | NP6Lite: not offloaded in this repository and the published images, the driver refuses IPv6 address rewriting; NAT66 works in software. Offloaded NAT66 is implemented and tested on the lab unit, for a later release |
+| IPv6 NAT | — | — | ❌ | NP6Lite: software only (the driver refuses IPv6 address rewriting, NAT66 is handled by the CPU) |
 | ICMP | ❌ | ❌ | ❌ | handled by the CPU: the three NPs can offload ICMP, but the Linux flow table used by the drivers carries TCP and UDP only |
-| GRE | — | — | — | handled by the CPU |
+| GRE | — | — | — | handled by the CPU. NP6Lite: not supported by the hardware per Fortinet documentation; NP6XLite (FortiGate 40F) to be investigated |
 | 802.1Q VLAN (one tag) | 🧪 | 🧪 | 🧪 | NP4Lite: needs `rx-vlan-offload` and `tx-vlan-offload`, off by default |
 | QinQ / 802.1ad | — | — | ❌ | NPLite / NP4Lite flow entries carry a single tag. NP6Lite: hardware support not established |
 | PPPoE | — | — | ❌ | NP6Lite: hardware support not established |
@@ -671,10 +671,11 @@ streams) and cut the fork/exec time by about a third.
 | Ethernet ports | 10 × 1 GbE: `wan1`, `wan2`, `dmz`, `internal1`…`internal7` |
 | Boot disk | internal eMMC (Micron), 3.56 GiB: two firmware slots and a data partition |
 | Boot flash | SPI NOR Macronix, 2 MiB (read-only; holds the base MAC address) |
-| USB | none usable yet |
+| USB | one USB-A port (USB 2.0, xHCI) |
 | Console | RJ-45 serial, 9600 8N1 |
 | RTC | on-chip, battery-backed |
-| LEDs / buttons | none supported yet |
+| LEDs | STATUS and HA (bicolour); WAN link/activity (driven by the PHYs) and speed (bicolour) |
+| Buttons | reset |
 | Power | 12 V DC input; about 7 W, idle and under load (smart plug, 1 W resolution) |
 
 ### Hardware topology
@@ -779,15 +780,19 @@ without DCO.
 | Switch bridging (`br-lan`) offloaded | 🧪 Partial: a bridge over `dmz` validated; `dmz` + one internal port on test kernels; the default bridge over `internal1`–`internal7` not measured |
 | VLANs, link aggregation (LACP, BCM53128 trunk) | 🧪 Partial: validated on an earlier image |
 | UDP offload (default) | ⚠️ Partial: validated on test kernels booted from RAM; rare freezes of offloaded UDP flows seen on the lab unit, cause not found (see [Known limitations](#known-limitations)) |
-| NAT66 | in software only (offload planned for a later image) |
+| NAT66 | Software only |
 | IPsec in software (IPv4 and IPv6, tunnel and transport) | ✅ Validated |
 | WireGuard, OpenVPN (with DCO) | ✅ Validated (packages included in the 60E profile) |
 | Persistent storage (overlay) | ✅ Validated: survives reboots and power cuts |
 | `sysupgrade -n` | ✅ Validated |
 | `sysupgrade` (keep), `sysupgrade -b`, `firstboot` | 🧪 Partial: validated on an earlier image |
 | Back to stock with [B] and back to OpenWrt | 🧪 Partial: validated on an earlier image |
-| LEDs, buttons | ❌ not described yet |
-| USB, crypto engine, watchdog | ❌ no driver yet |
+| STATUS and HA LEDs (boot / running / failsafe / upgrade) | 🧪 Partial: in the source tree, not in the published image; the LED lines were checked on the lab unit by direct register access only, the driver is not tested yet |
+| WAN link/activity and speed LEDs | 🧪 Partial: in the source tree, not in the published image; link/activity and the green (1000 Mbit/s) halves validated on one boot of a test kernel; the orange (100 Mbit/s) halves not tested with the driver |
+| Reset button / failsafe | 🧪 Partial: in the source tree, not in the published image; key presses seen on one boot of a test kernel; failsafe and the long press (factory reset) not tested |
+| USB-A port | 🧪 Partial: in the source tree (xHCI, public R-Car v2 firmware), not in the published image; a USB disk mounted read-only on test kernels, the first enumeration sometimes fails; needs more tests |
+| Watchdog | ❌ driver in the source tree, disabled in the device tree until a clean restart on expiry is shown on three boots |
+| Crypto engine | ❌ no driver yet |
 | RTC | ❓ read only, not re-tested under OpenWrt |
 
 ### Installation notes
@@ -975,11 +980,12 @@ Benchmarks and installation notes: _to be completed_.
   being forwarded in rare power cycles (all freezes seen within 1 of 11 observed power cycles), on test kernels
   and under OpenWrt alike; the cause is not found yet. If UDP traffic stalls, keep UDP on the CPU:
   `echo 0 > /sys/module/fortinet_np6lite/parameters/ft_udp`.
-- IPv6 NAT (NAT66) is not offloaded in the published image; IPv6 routing is. NAT66 offload is planned for a
-  later image.
+- IPv6 NAT (NAT66) runs in software only; IPv6 routing is offloaded.
 - The behaviour under saturation of the link between the NP6Lite and the switch, described above for the 60D
   and the 90D, has not been measured on the 60E yet.
-- LEDs, buttons, USB, the crypto engine and the watchdog are not supported yet; IPsec runs in software.
+- The published image does not support the LEDs, the reset button, USB, the watchdog or the crypto engine;
+  IPsec runs in software. Support for the LEDs, the button and USB is in the source tree and not fully tested
+  yet; the watchdog driver is there too, disabled in the device tree (see the 60E feature table).
 - **Boot time**: about 33 s from power-on to the web interface.
 
 **Other models.** The 60C and the 100D have no OpenWrt image.
