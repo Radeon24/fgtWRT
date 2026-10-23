@@ -109,22 +109,22 @@ Routing/NAT Offloading → Hardware flow offloading* (`flow_offloading_hw` in `/
 | IPv4 routing, TCP and UDP | 🧪 | ✅ | ✅ | line rate on the 60D and the 60E (see [Benchmarks](#benchmarks)). NP6Lite: UDP flows are offloaded by default |
 | IPv4 SNAT / DNAT, with port translation | 🧪 | ✅ | ✅ | NP6Lite: 48440 concurrent IPv4 NAT connections, all offloaded, on the 60E |
 | IPv6 routing, TCP and UDP | — | — | 🧪 | NPLite and NP4Lite flow entries are IPv4 only: IPv6 is always forwarded by the CPU. NP6Lite: line rate measured on an earlier 60E image |
-| IPv6 NAT | — | — | ❌ | NP6Lite: software only (the driver refuses IPv6 address rewriting, NAT66 is handled by the CPU) |
+| IPv6 NAT | — | — | 🧪 | NP6Lite: in the source tree, not in the published image: NAT66 of one address per flow (source or destination, NPTv6 included) offloaded, `ft_nat66` parameter of `fortinet_np6lite` (1 by default; 0 = CPU); a flow with both source and destination NAT stays on the CPU; validated on test kernels (3 boots) |
 | ICMP | ❌ | ❌ | ❌ | handled by the CPU: the three NPs can offload ICMP, but the Linux flow table used by the drivers carries TCP and UDP only |
 | GRE | — | — | — | handled by the CPU. NP6Lite: not supported by the hardware per Fortinet documentation; NP6XLite (FortiGate 40F) to be investigated |
 | 802.1Q VLAN (one tag) | 🧪 | 🧪 | 🧪 | NP4Lite: needs `rx-vlan-offload` and `tx-vlan-offload`, off by default |
 | QinQ / 802.1ad | — | — | ❌ | NPLite / NP4Lite flow entries carry a single tag. NP6Lite: hardware support not established |
 | PPPoE | — | — | ❌ | NP6Lite: hardware support not established |
 | Flows through the ports of the switch | ❌ | ✅ | 🧪 | NP4Lite: one logical interface per switch port in the device tree, validated on the 60D and the 90D; frames from the CPU to the switch ports are dropped when offloaded traffic saturates the NP–switch link (see [Known limitations](#known-limitations)). NP6Lite: `dmz`, single switch ports, bonds of switch ports and bridged switch ports; `dmz` and a bridge over `dmz` validated on the 60E image, the other cases on test kernels and earlier images |
-| Link aggregation (bonding) endpoints | ❌ | ✅ | 🧪 | no aggregation in the NP itself: the bond is handled by the driver. NPLite: driver code, not tested. NP4Lite: active-backup, balance-xor, 802.3ad (LACP validated on the 60D and the 90D); the switch chips aggregate their own ports (90D: groups within one switch chip, two groups at most for both chips). NP6Lite: bonds of switch ports |
+| Link aggregation (bonding) endpoints | ❌ | ✅ | 🧪 | NPLite / NP4Lite: no aggregation in the NP itself, the bond is handled by the driver. NPLite: driver code, not tested. NP4Lite: active-backup, balance-xor, 802.3ad (LACP validated on the 60D and the 90D); the switch chips aggregate their own ports (90D: groups within one switch chip, two groups at most for both chips). NP6Lite: bonds of switch ports; in the source tree, not in the published image, a bond of `wan1` + `wan2` is offloaded through the output trunk of the NP (`ft_trunk` parameter, 2 by default), validated on test kernels (3 boots) |
 | Offloaded connections | 4096 connections (8192 flow entries) | **4096 connections** (8192 flow entries, one per direction) | 65536 connections | driver limit; further connections stay on the CPU. NP6Lite: also the default conntrack limit of OpenWrt |
 | Per-flow byte / packet counters | 🧪 | 🧪 | ❌ | NPLite: about a hundred counters only. NP4Lite: limited number of counters. NP6Lite: activity only |
 | L2 bridge / FDB offload in the NP | — | — | — | bridging is done by the switch chip |
 | QoS / shaping offload | ❌ | — | ❌ | NP4Lite: no traffic shaping in the hardware |
 | **Inline IPsec (ESP) in the NP** | | | | |
-| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | ❌ | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on both |
-| ESP ciphers | — | AES-CBC 128/192/256, 3DES-CBC | ❌ | as implemented in the NP4Lite driver; measured with AES-128-CBC |
-| ESP integrity | — | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 | ❌ | as implemented in the NP4Lite driver; measured with HMAC-SHA1-96 |
+| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | 🧪 | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on both. NP6Lite: in the source tree, not in the published image: **outbound** packets only are encrypted by the NP, inbound packets stay in software; package `kmod-fortinet-np6lite-ipsec`, in the 60E profile; validated on test kernels (3 boots, about 710 Mbit/s) |
+| ESP ciphers | — | AES-CBC 128/192/256, 3DES-CBC | AES-CBC, 3DES-CBC (outbound) | as implemented in the drivers; measured with AES-128-CBC |
+| ESP integrity | — | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 (outbound) | as implemented in the drivers; measured with HMAC-SHA1-96 |
 | ESN, NAT-T, transport mode | — | ❌ | ❌ | handled in software |
 | IPsec over IPv6 | — | — | ❌ | NP4Lite: software only (works, see [Benchmarks](#benchmarks)) |
 | **Host interface** | | | | |
@@ -192,7 +192,7 @@ In `make menuconfig`, select:
 | Target Profile | `FortiGate 60D` | `FortiGate 90D` | `FortiGate 60E` |
 
 The device profile brings the drivers, the firewall with hardware flow offload, IPsec (IPv4 and IPv6, with
-the NP4Lite offload on the 60D and the 90D) and the installer. It also **includes** the web interface and
+the NP4Lite offload on the 60D and the 90D, and, on later revisions, the outbound NP6Lite offload on the 60E) and the installer. It also **includes** the web interface and
 the VPN packages; nothing else has to be selected:
 
 | Package (included in the 60D, 90D and 60E profiles) | For |
@@ -214,11 +214,13 @@ given revision, plus a debug console and test tools (see [Benchmark methodology]
 | 60D, 90D | commit `59b1585d5e1` | see [Known limitations](#known-limitations) for later revisions |
 | 60E | the published `fgtwrt` branch, or commit `db82bd67325` (same code) | — |
 
-On later revisions, the 60E profile also brings `kmod-gpio-button-hotplug` (reset button),
+On later revisions, the 60E profile also brings `kmod-fortinet-np6lite-ipsec` (outbound IPsec offload in the NP),
+`kmod-gpio-button-hotplug` (reset button),
 `r8a779x-usb3-firmware` (firmware of the xHCI, downloaded from linux-firmware and checked against its SHA-256)
 and USB disk support (`kmod-usb-storage`, `kmod-fs-vfat`, `kmod-nls-cp437`, `kmod-nls-iso8859-1`), with the
-kernel support of the LEDs, the button, USB and the watchdog: such an image is **not** the one that was
-measured. To leave these packages out, deselect them in `make menuconfig` (`Kernel modules` → `GPIO support`,
+kernel support of the LEDs, the button, USB and the watchdog, and the driver changes listed as "in the source tree"
+(NAT66 offload, bond of `wan1` + `wan2`, WAN ports at 100 Mbit/s): such an image is **not** the one that was
+measured. To leave these packages out, deselect them in `make menuconfig` (`Kernel modules` → `Network Devices`, `GPIO support`,
 `USB Support`, `Filesystems`, `Native Language Support`, and `Firmware`); the kernel support stays built in.
 
 Then build:
@@ -793,9 +795,12 @@ without DCO.
 | Hardware flow offload through `dmz` | ✅ Validated |
 | Switch bridging (`br-lan`) offloaded | 🧪 Partial: a bridge over `dmz` validated; `dmz` + one internal port on test kernels; the default bridge over `internal1`–`internal7` not measured |
 | VLANs, link aggregation (LACP, BCM53128 trunk) | 🧪 Partial: validated on an earlier image |
+| Bond of `wan1` + `wan2` offloaded (NP trunk) | 🧪 Partial: in the source tree, not in the published image; validated on test kernels (3 boots); the balancing over the two ports needs more work |
+| `wan1`, `wan2` at 100 Mbit/s | 🧪 Partial: in the source tree, not in the published image (the published one forwards no traffic on a WAN port linked at 100 Mbit/s or less); validated on test kernels (3 boots) |
 | UDP offload (default) | ⚠️ Partial: validated on test kernels booted from RAM; rare freezes of offloaded UDP flows seen on the lab unit, cause not found (see [Known limitations](#known-limitations)) |
-| NAT66 | Software only |
+| NAT66 | 🧪 Partial: software only in the published image; offloaded in the source tree (one translated address per flow), validated on test kernels (3 boots), not booted yet under OpenWrt |
 | IPsec in software (IPv4 and IPv6, tunnel and transport) | ✅ Validated |
+| IPsec offload in the NP (IPv4 tunnel mode, outbound only) | 🧪 Partial: in the source tree, not in the published image (`kmod-fortinet-np6lite-ipsec`); validated on test kernels (3 boots, about 710 Mbit/s); not booted yet under OpenWrt; inbound offload not written yet |
 | WireGuard, OpenVPN (with DCO) | ✅ Validated (packages included in the 60E profile) |
 | Persistent storage (overlay) | ✅ Validated: survives reboots and power cuts |
 | `sysupgrade -n` | ✅ Validated |
@@ -994,12 +999,12 @@ Benchmarks and installation notes: _to be completed_.
   being forwarded in rare power cycles (all freezes seen within 1 of 11 observed power cycles), on test kernels
   and under OpenWrt alike; the cause is not found yet. If UDP traffic stalls, keep UDP on the CPU:
   `echo 0 > /sys/module/fortinet_np6lite/parameters/ft_udp`.
-- IPv6 NAT (NAT66) runs in software only; IPv6 routing is offloaded.
+- In the published image, IPv6 NAT (NAT66) runs in software only (offloaded in the source tree); IPv6 routing is offloaded.
 - The behaviour under saturation of the link between the NP6Lite and the switch, described above for the 60D
   and the 90D, has not been measured on the 60E yet.
 - The published image does not support the LEDs, the reset button, USB, the watchdog or the crypto engine;
-  IPsec runs in software. Support for the LEDs, the button and USB is in the source tree and not fully tested
-  yet; the watchdog driver is there too, disabled in the device tree (see the 60E feature table).
+  IPsec runs in software. Support for the LEDs, the button, USB and the outbound IPsec offload of the NP is in
+  the source tree and not fully tested yet (the IPsec offload is about 710 Mbit/s, below the NP4Lite); the watchdog driver is there too, disabled in the device tree (see the 60E feature table).
 - **Boot time**: about 33 s from power-on to the web interface.
 
 **Other models.** The 60C and the 100D have no OpenWrt image.
