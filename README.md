@@ -193,8 +193,7 @@ In `make menuconfig`, select:
 
 The device profile brings the drivers, the firewall with hardware flow offload, IPsec (IPv4 and IPv6, with
 the NP4Lite offload on the 60D and the 90D) and the installer. It also **includes** the web interface and
-the VPN packages, so that the profile alone builds the image that was measured; nothing else has to be
-selected:
+the VPN packages; nothing else has to be selected:
 
 | Package (included in the 60D, 90D and 60E profiles) | For |
 |---|---|
@@ -206,6 +205,20 @@ selected:
 On FortiSOC2, the ramdisk compression also defaults to gzip, which the boot loader requires (see
 [Image layout](#image-layout)) and which the build checks. All the measurements below were made with these
 packages built in.
+
+**Which revision builds the measured image.** The measured images were built from the device profile at a
+given revision, plus a debug console and test tools (see [Benchmark methodology](#benchmark-methodology)):
+
+| Model | Revision to check out before `make menuconfig` | Notes |
+|---|---|---|
+| 60D, 90D | commit `59b1585d5e1` | see [Known limitations](#known-limitations) for later revisions |
+| 60E | the published `fgtwrt` branch, or commit `db82bd67325` (same code) | — |
+
+On later revisions, the 60E profile also brings `kmod-gpio-button-hotplug` (reset button) and
+`r8a779x-usb3-firmware` (firmware of the xHCI, downloaded from linux-firmware and checked against its SHA-256),
+with the kernel support of the LEDs, the button, USB and the watchdog: such an image is **not** the one that
+was measured. To leave the two packages out, deselect them under `Kernel modules` → `GPIO support` and
+`Firmware` in `make menuconfig`; the kernel support stays built in.
 
 Then build:
 
