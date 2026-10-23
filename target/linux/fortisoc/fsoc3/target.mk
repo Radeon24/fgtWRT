@@ -7,6 +7,8 @@ FEATURES+=fpu
 # The kernel takes its initramfs from the rootfs.gz of the container
 # (option "separate ramdisk", see image/Makefile)
 FEATURES+=separate_ramdisk
+# xHCI of the 60E (USB storage packages of its profile)
+FEATURES+=usb
 
 define Target/Description
 	Build images for the FortiSOC3 (four ARM Cortex-A9 r4p1 cores,
