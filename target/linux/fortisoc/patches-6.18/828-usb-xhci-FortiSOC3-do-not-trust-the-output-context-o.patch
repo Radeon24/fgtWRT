@@ -35,8 +35,8 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  drivers/usb/host/xhci.c      | 173 ++++++++++++++++++++++++++++++++++++-
  drivers/usb/host/xhci.h      |  27 ++++++
  drivers/usb/host/xhci-rcar.c |   6 +
- drivers/usb/host/xhci-ring.c |  59 ++++++++++++-
- 4 files changed, 260 insertions(+), 5 deletions(-)
+ drivers/usb/host/xhci-ring.c |  67 +++++++++++++-
+ 4 files changed, 268 insertions(+), 5 deletions(-)
 
 --- a/drivers/usb/host/xhci.c
 +++ b/drivers/usb/host/xhci.c
@@ -349,7 +349,22 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	if (line > 31)
 --- a/drivers/usb/host/xhci-ring.c
 +++ b/drivers/usb/host/xhci-ring.c
-@@ -1527,6 +1527,23 @@ static void xhci_handle_cmd_set_deq(stru
+@@ -712,6 +712,14 @@ static int xhci_move_dequeue_past_td(str
+ 	}
+ 
+ 	hw_dequeue = xhci_get_hw_deq(xhci, dev, ep_index, stream_id) & TR_DEQ_PTR_MASK;
++	/*
++	 * XHCI_TRUST_INTERNAL_EP_STATE: the dequeue pointer of the output
++	 * context may be stale (not updated by a previous Set TR Dequeue), so
++	 * do not wait for it: move just past the TD, as later kernels do.
++	 */
++	if ((xhci->quirks & XHCI_TRUST_INTERNAL_EP_STATE) && ep->fsoc3_added &&
++	    !(ep->ep_state & EP_HAS_STREAMS))
++		hw_dequeue_found = true;
+ 	new_seg = ep_ring->deq_seg;
+ 	new_deq = ep_ring->dequeue;
+ 	new_cycle = le32_to_cpu(td->end_trb->generic.field[3]) & TRB_CYCLE;
+@@ -1527,6 +1535,23 @@ static void xhci_handle_cmd_set_deq(stru
  			 */
  			ep_ring->deq_seg = ep->queued_deq_seg;
  			ep_ring->dequeue = ep->queued_deq_ptr;
@@ -373,7 +388,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  		} else {
  			xhci_warn(xhci, "Mismatch between completed Set TR Deq Ptr command & xHCI internal state.\n");
  			xhci_warn(xhci, "ep deq seg = %p, deq ptr = %p\n",
-@@ -2698,6 +2715,7 @@ static int handle_tx_event(struct xhci_h
+@@ -2698,6 +2723,7 @@ static int handle_tx_event(struct xhci_h
  	union xhci_trb *ep_trb;
  	int status = -EINPROGRESS;
  	struct xhci_ep_ctx *ep_ctx;
@@ -381,7 +396,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  	u32 trb_comp_code;
  	bool ring_xrun_event = false;
  
-@@ -2715,7 +2733,22 @@ static int handle_tx_event(struct xhci_h
+@@ -2715,7 +2741,22 @@ static int handle_tx_event(struct xhci_h
  	ep_ring = xhci_dma_to_transfer_ring(ep, ep_trb_dma);
  	ep_ctx = xhci_get_ep_ctx(xhci, ep->vdev->out_ctx, ep_index);
  
@@ -405,7 +420,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  		xhci_err(xhci,
  			 "ERROR Transfer event for disabled endpoint slot %u ep %u\n",
  			  slot_id, ep_index);
-@@ -3394,6 +3427,9 @@ static int prepare_transfer(struct xhci_
+@@ -3394,6 +3435,9 @@ static int prepare_transfer(struct xhci_
  	struct xhci_td	*td;
  	struct xhci_ring *ep_ring;
  	struct xhci_ep_ctx *ep_ctx = xhci_get_ep_ctx(xhci, xdev->out_ctx, ep_index);
@@ -415,7 +430,7 @@ Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
  
  	ep_ring = xhci_triad_to_transfer_ring(xhci, xdev->slot_id, ep_index,
  					      stream_id);
-@@ -3403,8 +3439,25 @@ static int prepare_transfer(struct xhci_
+@@ -3403,8 +3447,25 @@ static int prepare_transfer(struct xhci_
  		return -EINVAL;
  	}
  
