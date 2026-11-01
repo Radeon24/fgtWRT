@@ -1,0 +1,61 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Adds the sections of /etc/config/fgtwrt for the features of this board
+# and, on boards with a USB management port, the static interface "usb"
+# (usb0, the network function of the port) with its firewall zone and
+# DHCP server, apart from lan. Nothing that already exists is changed.
+
+. /lib/functions/fgtwrt.sh
+
+caps="$(fgtwrt_caps_file)" || exit 0
+
+if [ -n "$(jsonfilter -i "$caps" -e '@.fan.hwmon')" ] &&
+   [ -z "$(uci -q get fgtwrt.fan)" ]; then
+	uci set fgtwrt.fan=fan
+	uci set fgtwrt.fan.profile=default
+fi
+
+# Software calibration of the CPU sensor (per board, set from the command
+# line only; "calibrated" 0 = provisional values of the capabilities).
+if [ -n "$(jsonfilter -i "$caps" -e '@.fan.calibration.sensor')" ] &&
+   [ -z "$(uci -q get fgtwrt.cputin)" ]; then
+	uci set fgtwrt.cputin=sensor
+	uci set fgtwrt.cputin.gain="$(jsonfilter -i "$caps" -e '@.fan.calibration.gain')"
+	uci set fgtwrt.cputin.offset="$(jsonfilter -i "$caps" -e '@.fan.calibration.offset')"
+	uci set fgtwrt.cputin.calibrated=0
+fi
+
+if [ -n "$(jsonfilter -i "$caps" -e '@.usb.gadget.modes[0]')" ]; then
+	if [ -z "$(uci -q get fgtwrt.usb)" ]; then
+		uci set fgtwrt.usb=usb
+		uci set fgtwrt.usb.mode=off
+	fi
+	if [ -z "$(uci -q get network.usb)" ]; then
+		uci set network.usb=interface
+		uci set network.usb.proto=static
+		uci set network.usb.device=usb0
+		uci set network.usb.ipaddr=192.168.2.1
+		uci set network.usb.netmask=255.255.255.0
+		uci commit network
+		if [ -z "$(uci -q get dhcp.usb)" ]; then
+			uci set dhcp.usb=dhcp
+			uci set dhcp.usb.interface=usb
+			uci set dhcp.usb.start=100
+			uci set dhcp.usb.limit=50
+			uci set dhcp.usb.leasetime=1h
+			uci commit dhcp
+		fi
+		if [ -z "$(uci -q get firewall.fgtwrt_usb)" ]; then
+			uci set firewall.fgtwrt_usb=zone
+			uci set firewall.fgtwrt_usb.name=usb
+			uci add_list firewall.fgtwrt_usb.network=usb
+			uci set firewall.fgtwrt_usb.input=ACCEPT
+			uci set firewall.fgtwrt_usb.output=ACCEPT
+			uci set firewall.fgtwrt_usb.forward=REJECT
+			uci commit firewall
+		fi
+	fi
+fi
+
+uci commit fgtwrt
+exit 0

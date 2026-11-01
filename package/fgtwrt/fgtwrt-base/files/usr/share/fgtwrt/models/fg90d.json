@@ -1,0 +1,21 @@
+{
+	"id": "fg90d",
+	"name": "FortiGate 90D",
+	"fan": null,
+	"usb": {
+		"host": true,
+		"gadget": {
+			"port": "MGMT",
+			"udc": "f0300000.usb",
+			"modes": [ "off", "console", "network" ]
+		}
+	},
+	"np": {
+		"module": "fortinet_np4lite",
+		"params": [ "switch_offload", "bridge_offload", "same_switch_offload" ]
+	},
+	"leds": [],
+	"leds_missing": [ "ha", "alarm" ],
+	"button": null,
+	"watchdog": "ftwdt010"
+}

@@ -1,0 +1,288 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Applies the fgtwrt settings of /etc/config/fgtwrt that this board
+# supports (/usr/share/fgtwrt/models/<model>.json). Fan: the "default"
+# profile writes nothing; any other profile is undone on stop, on reload
+# and on error, the chip going back to the values it had before (with the
+# "smartfan" strategy, the table of the chip is rewritten once; the
+# "custom" profile writes the user's three points, on the board sensor or
+# on the calibrated CPU sensor, the latter with a board temperature guard
+# run here). USB
+# management port: the mode ("off", "console" or "network") selects a
+# preset of the usbgadget package (section "fgtwrt" of
+# /etc/config/usbgadget); "console" adds a login on /dev/ttyGS0,
+# "network" brings up the static interface "usb" (usb0, outside lan).
+
+START=19
+STOP=90
+USE_PROCD=1
+
+FAN=/usr/sbin/fgtwrt-fan
+USB_CONSOLE=/usr/libexec/fgtwrt-usb-console
+GADGET_PRESETS=/usr/share/usbgadget
+
+. /lib/functions/fgtwrt.sh
+
+fan_pwm_path() {
+	local caps="$1" hw n dir
+	hw="$(jsonfilter -i "$caps" -e '@.fan.hwmon')"
+	n="$(jsonfilter -i "$caps" -e '@.fan.pwm')"
+	[ -n "$hw" ] && [ -n "$n" ] || return 1
+	dir="$(fgtwrt_hwmon_dir "$hw")" || {
+		logger -t fgtwrt -p daemon.warn "fan: no hwmon device '$hw'"
+		return 1
+	}
+	echo "$dir/pwm$n"
+}
+
+fan_temps() {
+	local caps="$1" hw n dir i=0 temps=
+	while :; do
+		hw="$(jsonfilter -i "$caps" -e "@.fan.temps[$i].hwmon")"
+		[ -n "$hw" ] || break
+		n="$(jsonfilter -i "$caps" -e "@.fan.temps[$i].input")"
+		dir="$(fgtwrt_hwmon_dir "$hw")" &&
+			temps="$temps -t $dir/temp${n}_input"
+		i=$((i + 1))
+	done
+	echo "$temps"
+}
+
+fan_err() {
+	logger -t fgtwrt -p daemon.err "fan: $*"
+}
+
+fan_point() {
+	points="${points:+$points }$1"
+}
+
+# User defined table (profile "custom"): source "systin" or "cputin",
+# three points "T:P" (true degrees), bounds of the capabilities checked
+# again by fgtwrt-fan. On the CPU sensor, the calibration of the section
+# "cputin" converts the points, and the board temperature guard is
+# mandatory. Any refusal leaves the firmware table (put back just before).
+fan_custom() {
+	local caps="$1" pwm="$2" factory="$3"
+	local source src points= pmin t3 guard gain= offset cal n rpm gt dir
+
+	pmin="$(jsonfilter -i "$caps" -e '@.fan.custom.pwm_min')"
+	[ -n "$pmin" ] || { fan_err "no user defined table on this board"; return 1; }
+	config_get source fan source systin
+	case " $(jsonfilter -i "$caps" -e '@.fan.custom.sources[*]' | tr '\n' ' ') " in
+	*" $source "*) ;;
+	*) fan_err "source '$source' not supported on this board"; return 1 ;;
+	esac
+	case "$source" in
+	systin) src=1 ;;
+	cputin) src=2 ;;
+	*) fan_err "bad source '$source'"; return 1 ;;
+	esac
+	config_list_foreach fan point fan_point
+	[ -n "$points" ] ||
+		points="$(jsonfilter -i "$caps" -e "@.fan.custom.default_points.$source")"
+	t3="$(jsonfilter -i "$caps" -e "@.fan.custom.t3_max.$source")"
+	[ -n "$points" ] && [ -n "$t3" ] || { fan_err "no points for '$source'"; return 1; }
+
+	if [ "$src" = 2 ]; then
+		config_get gain cputin gain "$(jsonfilter -i "$caps" -e '@.fan.calibration.gain')"
+		config_get offset cputin offset "$(jsonfilter -i "$caps" -e '@.fan.calibration.offset')"
+		config_get cal cputin calibrated 0
+		[ -n "$gain" ] && [ -n "$offset" ] || { fan_err "no CPUTIN calibration"; return 1; }
+		config_get guard fan guard_systin "$(jsonfilter -i "$caps" -e '@.fan.custom.guard_systin')"
+		case "$guard" in
+		''|*[!0-9]*)
+			fan_err "source cputin needs the board temperature guard (guard_systin), not '$guard'"
+			return 1
+			;;
+		esac
+		[ "$cal" = 1 ] ||
+			logger -t fgtwrt -p daemon.notice "fan: provisional CPUTIN calibration (gain $gain, offset $offset)"
+	fi
+
+	"$FAN" -p "$pwm" ${factory:+-D "$factory"} -S "$points" -X "$src" \
+		-B "$pmin $t3" ${gain:+-K "$gain $offset"} || return 1
+	[ "$src" = 2 ] || return 0
+
+	dir="${pwm%/*}"
+	gt="$(jsonfilter -i "$caps" -e '@.fan.custom.guard_temp')"
+	n="$(jsonfilter -i "$caps" -e '@.fan.fan')"
+	rpm="$(jsonfilter -i "$caps" -e '@.fan.custom.guard_rpm')"
+	procd_open_instance guard
+	procd_set_param command "$FAN" -p "$pwm" -W -t "$dir/temp${gt:-1}_input" \
+		${n:+-f "$dir/fan${n}_input"} -g "$guard" ${rpm:+-r "$rpm"} -H 5 -i 10 -S "$points"
+	procd_set_param respawn 3600 10 5
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+fan_start() {
+	local caps pwm profile strategy mode target tol curve min crit
+	local n temps fan factory interval duty points
+
+	caps="$(fgtwrt_caps_file)" || return 0
+	pwm="$(fan_pwm_path "$caps")" || return 0
+	config_get profile fan profile default
+	factory="$(jsonfilter -i "$caps" -e '@.fan.factory')"
+
+	# Anything a previous profile left (crash, kill -9, warm reboot when
+	# the firmware values are documented) goes first.
+	"$FAN" -p "$pwm" ${factory:+-D "$factory"} -R
+
+	[ "$profile" = default ] && return 0
+	case "$profile" in
+	*[!a-z0-9_]*|'')
+		logger -t fgtwrt -p daemon.err "fan: bad profile name '$profile'"
+		return 1
+		;;
+	esac
+
+	strategy="$(jsonfilter -i "$caps" -e '@.fan.strategy')"
+	case "$strategy" in
+	smartfan)
+		# Table followed by the chip itself: written once, the hardware
+		# keeps regulating without this service.
+		if [ "$profile" = custom ]; then
+			fan_custom "$caps" "$pwm" "$factory"
+			return
+		fi
+		points="$(jsonfilter -i "$caps" -e "@.fan.profiles.$profile.points")"
+		[ -n "$points" ] || {
+			logger -t fgtwrt -p daemon.err "fan: profile '$profile' unknown on this board"
+			return 1
+		}
+		"$FAN" -p "$pwm" ${factory:+-D "$factory"} -S "$points"
+		;;
+	cruise)
+		mode="$(jsonfilter -i "$caps" -e '@.fan.auto_mode')"
+		target="$(jsonfilter -i "$caps" -e "@.fan.profiles.$profile.target")"
+		tol="$(jsonfilter -i "$caps" -e "@.fan.profiles.$profile.tolerance")"
+		[ -n "$mode" ] && [ -n "$target" ] || {
+			logger -t fgtwrt -p daemon.err "fan: profile '$profile' unknown on this board"
+			return 1
+		}
+		"$FAN" -p "$pwm" ${factory:+-D "$factory"} -a "$mode" -T "$target" ${tol:+-O "$tol"}
+		;;
+	fixed|loop)
+		if [ "$strategy" = fixed ]; then
+			# Constant duty cycle, still under the critical temperature
+			# guard (when the board has one) and the stall detection of
+			# the loop.
+			duty="$(jsonfilter -i "$caps" -e "@.fan.profiles.$profile.pwm")"
+			curve="${duty:+0:$duty}"
+			min=0
+		else
+			config_get curve fan curve
+			[ -n "$curve" ] ||
+				curve="$(jsonfilter -i "$caps" -e "@.fan.profiles.$profile.curve")"
+			min="$(jsonfilter -i "$caps" -e '@.fan.min_pwm')"
+		fi
+		[ -n "$curve" ] || {
+			logger -t fgtwrt -p daemon.err "fan: profile '$profile' unknown on this board"
+			return 1
+		}
+		# No critical temperature in the capabilities: guard off (sensors
+		# not calibrated), the stall detection stays.
+		crit="$(jsonfilter -i "$caps" -e '@.fan.critical')"
+		crit="${crit:-off}"
+		interval="$(jsonfilter -i "$caps" -e '@.fan.interval')"
+		temps="$(fan_temps "$caps")"
+		[ -n "$temps" ] || {
+			logger -t fgtwrt -p daemon.err "fan: no temperature source"
+			return 1
+		}
+		n="$(jsonfilter -i "$caps" -e '@.fan.fan')"
+		fan="${n:+-f ${pwm%/*}/fan${n}_input}"
+
+		procd_open_instance fan
+		# shellcheck disable=SC2086
+		procd_set_param command "$FAN" -p "$pwm" $temps $fan -c "$curve" \
+			${min:+-m "$min"} ${crit:+-C "$crit"} ${interval:+-i "$interval"} \
+			${factory:+-D "$factory"} $([ "$strategy" = fixed ] && echo -F)
+		procd_set_param respawn 3600 10 3
+		procd_set_param stderr 1
+		procd_close_instance
+		;;
+	*)
+		logger -t fgtwrt -p daemon.err "fan: unknown strategy '$strategy'"
+		return 1
+		;;
+	esac
+}
+
+# Gadget of the USB management port. The usbgadget configuration is only
+# rewritten when the mode changes; usbgadget is restarted then, unless it
+# has not run yet (first boot: it starts after this service).
+usb_start() {
+	local caps mode modes udc preset cur want
+
+	caps="$(fgtwrt_caps_file)" || return 0
+	modes="$(jsonfilter -i "$caps" -e '@.usb.gadget.modes[*]')"
+	[ -n "$modes" ] || return 0
+	config_get mode usb mode off
+	case " $(echo $modes) " in
+	*" $mode "*) ;;
+	*)
+		logger -t fgtwrt -p daemon.err "usb: mode '$mode' not supported on this board"
+		return 1
+		;;
+	esac
+	preset="$(fgtwrt_usb_preset "$mode")"
+
+	want=
+	if [ -n "$preset" ]; then
+		[ -r "$GADGET_PRESETS/$preset" ] || {
+			logger -t fgtwrt -p daemon.err "usb: package usbgadget-$preset not installed"
+			return 1
+		}
+		udc="$(fgtwrt_udc "$(jsonfilter -i "$caps" -e '@.usb.gadget.udc')")" || {
+			logger -t fgtwrt -p daemon.err "usb: no USB device controller (kernel without gadget support?)"
+			return 1
+		}
+		want="$preset $udc"
+	fi
+
+	cur="$(uci -q get usbgadget.fgtwrt.name) $(uci -q get usbgadget.fgtwrt.UDC)"
+	[ "$cur" = " " ] && cur=
+	if [ "$cur" != "$want" ]; then
+		uci -q delete usbgadget.fgtwrt
+		if [ -n "$want" ]; then
+			uci set usbgadget.fgtwrt=preset
+			uci set usbgadget.fgtwrt.name="$preset"
+			uci set usbgadget.fgtwrt.UDC="$udc"
+		fi
+		uci commit usbgadget
+		[ -d /sys/kernel/config/usb_gadget ] && [ -x /etc/init.d/usbgadget ] &&
+			/etc/init.d/usbgadget restart
+		logger -t fgtwrt "usb: mode $mode${udc:+ on $udc}"
+	fi
+
+	[ "$mode" = console ] || return 0
+	procd_open_instance usbconsole
+	procd_set_param command "$USB_CONSOLE" /dev/ttyGS0
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
+
+start_service() {
+	config_load fgtwrt
+	fan_start
+	usb_start
+}
+
+service_stopped() {
+	local caps pwm factory
+	caps="$(fgtwrt_caps_file)" || return 0
+	pwm="$(fan_pwm_path "$caps")" || return 0
+	factory="$(jsonfilter -i "$caps" -e '@.fan.factory')"
+	"$FAN" -p "$pwm" ${factory:+-D "$factory"} -R
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger fgtwrt
+}

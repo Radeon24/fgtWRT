@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Login console on the serial function of the USB management port
+# (/dev/ttyGS0), run by /etc/init.d/fgtwrt when the "usb" mode is
+# "console". The tty only exists once the gadget is bound: wait for it a
+# little, then let procd respawn this script. Same prompt as the system
+# console ("Please press Enter to activate this console.").
+
+TTY="${1:-/dev/ttyGS0}"
+i=0
+while [ ! -c "$TTY" ]; do
+	[ "$i" -lt 30 ] || exit 1
+	sleep 1
+	i=$((i + 1))
+done
+
+exec setsid -c /sbin/askfirst /usr/libexec/login.sh \
+	< "$TTY" > "$TTY" 2>&1

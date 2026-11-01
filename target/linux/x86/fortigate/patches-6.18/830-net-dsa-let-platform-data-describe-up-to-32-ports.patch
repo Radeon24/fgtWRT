@@ -1,0 +1,29 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:30:00 +0200
+Subject: [PATCH] net: dsa: let platform data describe up to 32 ports
+
+A switch probed through platform data (no device tree, as on x86
+boards) can only name DSA_MAX_PORTS ports, 12 today. The BCM53314 of
+the FortiGate 100D has 25 ports (CPU management port 0, ports 1-24),
+of which 19 front ports and the CPU link are to be described, at their
+hardware indexes. Raise the limit to 32, the number of addresses of an
+MDIO bus, which DSA already uses to find the PHY of a user port.
+
+Only the size of the arrays of struct dsa_chip_data changes; drivers
+that size their own tables with DSA_MAX_PORTS (b53, bcm_sf2, ksz,
+mv88e6xxx) are not built for the x86/fortigate subtarget.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/include/linux/platform_data/dsa.h
++++ b/include/linux/platform_data/dsa.h
+@@ -6,7 +6,7 @@
+ struct net_device;
+ 
+ #define DSA_MAX_SWITCHES	4
+-#define DSA_MAX_PORTS		12
++#define DSA_MAX_PORTS		32
+ #define DSA_RTABLE_NONE		-1
+ 
+ struct dsa_chip_data {

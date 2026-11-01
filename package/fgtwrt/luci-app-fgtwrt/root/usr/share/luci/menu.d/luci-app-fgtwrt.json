@@ -1,0 +1,45 @@
+{
+	"admin/system/fgtwrt": {
+		"title": "fgtWRT",
+		"order": 85,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-fgtwrt" ]
+		}
+	},
+
+	"admin/system/fgtwrt/overview": {
+		"title": "Overview",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "fgtwrt/overview"
+		}
+	},
+
+	"admin/system/fgtwrt/fan": {
+		"title": "Fan",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "fgtwrt/fan"
+		},
+		"depends": {
+			"uci": { "fgtwrt": { "fan": "fan" } }
+		}
+	},
+
+	"admin/system/fgtwrt/usb": {
+		"title": "USB management port",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "fgtwrt/usb"
+		},
+		"depends": {
+			"uci": { "fgtwrt": { "usb": "usb" } }
+		}
+	}
+}

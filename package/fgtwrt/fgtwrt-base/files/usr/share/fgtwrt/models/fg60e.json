@@ -1,0 +1,17 @@
+{
+	"id": "fg60e",
+	"name": "FortiGate 60E",
+	"fan": null,
+	"usb": {
+		"host": true,
+		"gadget": null
+	},
+	"np": {
+		"module": "fortinet_np6lite",
+		"params": [ "ft_nat66", "ft_udp", "ft_trunk", "bridge_offload" ]
+	},
+	"leds": [ "green:status", "orange:status", "green:ha", "orange:ha" ],
+	"leds_missing": [],
+	"button": "reset",
+	"watchdog": null
+}

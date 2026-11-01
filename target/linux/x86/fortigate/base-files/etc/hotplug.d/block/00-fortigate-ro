@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The internal disk holds the stock firmware: every disk is made read-only
+# as soon as it appears, before 10-mount (fstools) may mount anything.
+# blockdev --setro on the whole disk covers its partitions.
+#
+# Except the disk holding the overlay: when the kernel command line
+# describes a rootfs_data (fortinet.rootfs_data=) and a loop device is
+# backed by that disk (bound by preinit before this runs), the disk is
+# left writable, or every write of the overlay would fail; the write
+# windows of the kernel then keep the rest of it out of reach. The
+# backing file of the loop device reads "/sdX" once the root has been
+# pivoted (the /dev of preinit): its base name is compared.
+
+[ "$ACTION" = add ] || exit 0
+[ "$DEVTYPE" = disk ] || exit 0
+case "$DEVNAME" in
+sd*[!0-9]) ;;
+*) exit 0 ;;
+esac
+if grep -qsE '(^| )fortinet[.]rootfs_data=' /proc/cmdline; then
+	for f in /sys/block/loop*/loop/backing_file; do
+		[ -r "$f" ] || continue
+		read -r b < "$f" || continue
+		[ "${b##*/}" = "$DEVNAME" ] || continue
+		echo "fortigate-ro: $DEVNAME holds the overlay, left writable (write windows)" > /dev/kmsg
+		exit 0
+	done
+fi
+blockdev --setro "/dev/$DEVNAME" 2>/dev/null &&
+	echo "fortigate-ro: $DEVNAME read-only" > /dev/kmsg ||
+	echo "fortigate-ro: $DEVNAME could not be made read-only" > /dev/kmsg

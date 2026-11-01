@@ -1,0 +1,61 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 20:00:00 +0200
+Subject: [PATCH] usb: gadget: net2280: optionally move the NET228x data by PIO
+
+On the FortiGate 100D (NET2282 on a conventional PCI bus, legacy INTx
+shared with the EHCI and UHCI controllers), a sustained host-to-device
+transfer on a CDC NCM gadget hits the WARN_ON() of start_dma(): after
+a short OUT packet, handle_ep_small() writes DMA_ABORT and waits 50 us
+for DMA_ENABLE to clear, ignores the timeout, and restarts the queue
+while the engine still reports enabled. The OUT endpoint then stops
+completing requests and the host side times out its transmit queue.
+
+Bring back the use_dma module parameter (removed in 2014, when the DMA
+was deemed reliable), default on, NET2280/NET2282 only: with use_dma=0
+endpoints ep-a to ep-d use the PIO paths the driver still has for
+ep-e/ep-f, so that the DMA engines can be ruled in or out on such a
+board. Nothing changes with the default value.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/drivers/usb/gadget/udc/net2280.c
++++ b/drivers/usb/gadget/udc/net2280.c
+@@ -142,6 +142,18 @@
+ /* "modprobe net2280 enable_suspend=1" etc */
+ module_param(enable_suspend, bool, 0444);
+ 
++/* use_dma -- When disabled, endpoints ep-{a,b,c,d} of the NET2280 and
++ * NET2282 move their data by PIO, one interrupt per packet, instead of
++ * through their DMA engines: slower, with more CPU load, but it keeps
++ * the DMA engines out of the way on a board where they misbehave.
++ * The USB338x always uses DMA.
++ */
++static bool use_dma = true;
++
++/* "modprobe net2280 use_dma=0" */
++module_param(use_dma, bool, 0444);
++MODULE_PARM_DESC(use_dma, "NET2280/NET2282: use the DMA engines of ep-a to ep-d (default: yes)");
++
+ #define	DIR_STRING(bAddress) (((bAddress) & USB_DIR_IN) ? "in" : "out")
+ 
+ static char *type_string(u8 bmAttributes)
+@@ -533,7 +545,8 @@
+ 	/* synch memory views with the device */
+ 	(void)readl(&ep->cfg->ep_cfg);
+ 
+-	if (!ep->dma && ep->num >= 1 && ep->num <= 4)
++	if (!ep->dma && ep->num >= 1 && ep->num <= 4 &&
++	    (use_dma || (ep->dev->quirks & PLX_PCIE)))
+ 		ep->dma = &ep->dev->dma[ep->num - 1];
+ 
+ 	spin_unlock_irqrestore(&ep->dev->lock, flags);
+@@ -2163,7 +2176,7 @@
+ 
+ 		if (tmp > 0 && tmp <= 4) {
+ 			ep->fifo_size = 1024;
+-			ep->dma = &dev->dma[tmp - 1];
++			ep->dma = use_dma ? &dev->dma[tmp - 1] : NULL;
+ 		} else
+ 			ep->fifo_size = 64;
+ 		ep->regs = &dev->epregs[tmp];

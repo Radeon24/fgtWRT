@@ -1,0 +1,33 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:30:00 +0200
+Subject: [PATCH] net: dsa: reserve a tag protocol for the BCM5331x VLAN tagger
+
+The Broadcom BCM53314 (StrataXGS) has no CPU header on its Ethernet
+ports: the port of a frame exchanged with the host is told by an
+802.1Q tag, one VLAN per front port. The tag_8021q encoding codes the
+port on 4 bits and does not fit its 19 front ports, so the board uses
+a tagger of its own, built out of tree. Give it a protocol number,
+outside of the range used upstream.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -57,6 +57,8 @@
+ #define DSA_TAG_PROTO_BRCM_LEGACY_FCS_VALUE	29
+ #define DSA_TAG_PROTO_MXL862_VALUE		30
+ #define DSA_TAG_PROTO_MXL862_8021Q_VALUE	31
++/* Local value, kept clear of the upstream range */
++#define DSA_TAG_PROTO_BCM5331X_8021Q_VALUE	64
+ 
+ enum dsa_tag_protocol {
+ 	DSA_TAG_PROTO_NONE		= DSA_TAG_PROTO_NONE_VALUE,
+@@ -91,6 +93,7 @@
+ 	DSA_TAG_PROTO_VSC73XX_8021Q	= DSA_TAG_PROTO_VSC73XX_8021Q_VALUE,
+ 	DSA_TAG_PROTO_MXL862		= DSA_TAG_PROTO_MXL862_VALUE,
+ 	DSA_TAG_PROTO_MXL862_8021Q	= DSA_TAG_PROTO_MXL862_8021Q_VALUE,
++	DSA_TAG_PROTO_BCM5331X_8021Q	= DSA_TAG_PROTO_BCM5331X_8021Q_VALUE,
+ };
+ 
+ struct dsa_switch;

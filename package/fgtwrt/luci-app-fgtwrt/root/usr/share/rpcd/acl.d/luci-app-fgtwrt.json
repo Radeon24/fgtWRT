@@ -1,0 +1,14 @@
+{
+	"luci-app-fgtwrt": {
+		"description": "Grant access to the FortiGate specific settings",
+		"read": {
+			"ubus": {
+				"luci.fgtwrt": [ "status" ]
+			},
+			"uci": [ "fgtwrt" ]
+		},
+		"write": {
+			"uci": [ "fgtwrt" ]
+		}
+	}
+}

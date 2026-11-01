@@ -1,0 +1,14 @@
+{
+	"id": "fg60c",
+	"name": "FortiGate 60C",
+	"fan": null,
+	"usb": {
+		"host": true,
+		"gadget": null
+	},
+	"np": null,
+	"leds": [ "status:green", "status:red", "alarm:green", "alarm:red" ],
+	"leds_missing": [ "ha" ],
+	"button": "reset",
+	"watchdog": "ftwdt010"
+}

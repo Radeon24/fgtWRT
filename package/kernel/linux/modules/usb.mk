@@ -1872,6 +1872,11 @@ define KernelPackage/usb-net2280
   DEPENDS:=@PCI_SUPPORT +kmod-usb-gadget
   FILES:=$(LINUX_DIR)/drivers/usb/gadget/udc/net2280.ko
   AUTOLOAD:=$(call AutoLoad,46,net2280)
+  # FortiGate 100D (x86/fortigate): DMA, with the NET2282 kept off Memory
+  # Write and Invalidate (subtarget patch 823), which stalled the OUT
+  # endpoint of a CDC NCM gadget; use_dma=0 (subtarget patch 821) moves
+  # the data by PIO instead.
+  MODPARAMS.net2280:=$(if $(CONFIG_TARGET_x86_fortigate),use_dma=1)
   $(call AddDepends/usb)
 endef
 

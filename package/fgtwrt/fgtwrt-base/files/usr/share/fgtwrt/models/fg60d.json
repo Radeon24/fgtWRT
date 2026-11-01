@@ -1,0 +1,21 @@
+{
+	"id": "fg60d",
+	"name": "FortiGate 60D",
+	"fan": null,
+	"usb": {
+		"host": true,
+		"gadget": {
+			"port": "MGMT",
+			"udc": "f0300000.usb",
+			"modes": [ "off", "console", "network" ]
+		}
+	},
+	"np": {
+		"module": "fortinet_np4lite",
+		"params": [ "switch_offload", "bridge_offload", "same_switch_offload" ]
+	},
+	"leds": [ "green:status", "orange:status", "green:ha", "orange:ha" ],
+	"leds_missing": [ "alarm" ],
+	"button": "reset",
+	"watchdog": "ftwdt010"
+}

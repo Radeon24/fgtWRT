@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# These appliances have no DMI table: the board is named after its PCI
+# fingerprint. A board given on the kernel command line (fgt.board=,
+# passed by the flatkc stub) must match it; nothing is named otherwise.
+
+fortigate_pci_has() {
+	local dev
+
+	for dev in /sys/bus/pci/devices/*; do
+		[ "$(cat "$dev/vendor" 2>/dev/null)" = "0x$1" ] || continue
+		[ "$(cat "$dev/device" 2>/dev/null)" = "0x$2" ] && return 0
+	done
+	return 1
+}
+
+do_sysinfo_fortigate() {
+	local arg board= found= model
+
+	for arg in $(cat /proc/cmdline); do
+		case "$arg" in
+		fgt.board=*) board="${arg#fgt.board=}" ;;
+		esac
+	done
+
+	# FortiGate 100D: ICH8M LPC bridge and BCM53314 switch
+	fortigate_pci_has 8086 2815 && fortigate_pci_has 14e4 c314 && found=fg100d
+
+	if [ -n "$board" ] && [ "$board" != "$found" ]; then
+		echo "fortigate: fgt.board=$board does not match the hardware (${found:-unknown})" > /dev/kmsg
+		return
+	fi
+
+	case "$found" in
+	fg100d) model="Fortinet FortiGate 100D" ;;
+	*) return ;;
+	esac
+
+	mkdir -p /tmp/sysinfo
+	echo "fortinet,$found" > /tmp/sysinfo/board_name
+	echo "$model" > /tmp/sysinfo/model
+}
+
+boot_hook_add preinit_main do_sysinfo_fortigate

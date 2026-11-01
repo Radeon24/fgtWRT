@@ -1,0 +1,74 @@
+{
+	"id": "fg100d",
+	"name": "FortiGate 100D",
+	"fan": {
+		"hwmon": "w83627dhg",
+		"pwm": 2,
+		"fan": 2,
+		"strategy": "smartfan",
+		"factory": "pwm2_auto_point1_temp 45000,pwm2_auto_point2_temp 50000,pwm2_auto_point3_temp 60000,pwm2_auto_point1_pwm 63,pwm2_auto_point2_pwm 102,pwm2_auto_point3_pwm 255,pwm2_auto_channels_temp 1,pwm2_enable 5",
+		"temps": [
+			{
+				"hwmon": "w83627dhg",
+				"input": 1,
+				"label": "SYSTIN"
+			},
+			{
+				"hwmon": "w83627dhg",
+				"input": 2,
+				"label": "CPUTIN"
+			}
+		],
+		"profiles": {
+			"quiet": {
+				"points": "45:16 50:102 60:255"
+			},
+			"medium": {
+				"points": "45:128 50:128 60:255"
+			},
+			"full": {
+				"points": "45:255 50:255 60:255"
+			}
+		},
+		"custom": {
+			"sources": [ "systin", "cputin" ],
+			"pwm_min": 16,
+			"t3_max": {
+				"systin": 60,
+				"cputin": 80
+			},
+			"default_points": {
+				"systin": "40:48 46:102 55:255",
+				"cputin": "50:48 65:128 80:255"
+			},
+			"guard_systin": 55,
+			"guard_temp": 1,
+			"guard_rpm": 1000
+		},
+		"calibration": {
+			"sensor": "cputin",
+			"input": 2,
+			"gain": "1.000",
+			"offset": "22.5"
+		},
+		"experimental": true
+	},
+	"usb": {
+		"host": true,
+		"gadget": {
+			"port": "USB MGMT",
+			"controller": "net2280",
+			"udc": null,
+			"modes": [
+				"off",
+				"console",
+				"network"
+			]
+		}
+	},
+	"np": null,
+	"leds": [ "green:status", "red:status", "green:ha", "red:ha", "red:alarm", "amber:alarm" ],
+	"leds_missing": [],
+	"button": null,
+	"watchdog": null
+}

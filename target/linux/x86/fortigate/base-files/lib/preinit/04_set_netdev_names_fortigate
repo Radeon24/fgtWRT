@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Name the network interfaces outside the switch after the marking of
+# their front port, from their PCI address, before anything brings them
+# up. The two other 82574L of the 100D (0e:00.0, 0f:00.0) are the CPU
+# ports of the switch: they keep their ethN name and get no interface.
+
+fortigate_set_netdev_names() {
+	local dev name
+
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
+	fortinet,fg100d) ;;
+	*) return ;;
+	esac
+
+	for dev in /sys/class/net/eth*; do
+		[ -e "$dev/device" ] || continue
+		case "$(basename "$(readlink -f "$dev/device")")" in
+		0000:05:00.0) name=wan1 ;;
+		0000:06:00.0) name=dmz ;;
+		*) continue ;;
+		esac
+		[ -e "/sys/class/net/$name" ] && continue
+		ip link set dev "${dev##*/}" name "$name"
+	done
+}
+
+boot_hook_add preinit_main fortigate_set_netdev_names

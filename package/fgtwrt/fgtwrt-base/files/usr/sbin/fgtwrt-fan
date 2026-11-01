@@ -1,0 +1,855 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# fgtwrt-fan: fan control of one hwmon PWM channel, three strategies:
+#  - "loop": temperature to PWM curve run here, channel in manual mode;
+#  - "cruise": one-shot programming of the automatic mode of the chip
+#    (pwmN_enable, pwmN_target, pwmN_tolerance), for chips that take the
+#    duty cycle back from software in manual mode;
+#  - "smartfan": one-shot programming of a three-point temperature to PWM
+#    table that the chip follows by itself (pwmN_auto_point[1-3]_temp and
+#    _pwm, pwmN_enable 5: SmartFan III+ of the W83627DHG-P), so that the
+#    hardware keeps regulating if the service dies.
+#
+# Used by /etc/init.d/fgtwrt for a profile other than "default"; the
+# "default" profile writes nothing and leaves the chip as the firmware
+# set it. Only volatile hwmon attributes are written; the hardware loses
+# them at the next reset, nothing is saved in the chip.
+#
+# Safety:
+#  - at or above the critical temperature, the PWM is forced to 255;
+#  - a temperature that cannot be read, a PWM write that fails or a
+#    stalled fan (no tachometer pulses) ends the loop with an error;
+#  - on exit (TERM, INT, HUP, error), pwmN_enable and pwmN are put back
+#    to the values found when the service first took the channel; these
+#    are kept in a state file under /var/run, so a restart after a crash
+#    restores the firmware values, not the ones the loop left behind;
+#  - with -D, the documented firmware values of the board are used
+#    instead of the values read, so that settings that survived a warm
+#    reboot (state file lost) are not taken for the firmware ones;
+#  - a restore writes only the attributes that differ.
+#
+# Usage: fgtwrt-fan -p PWM -t TEMP [-t TEMP ...] -c CURVE [options]
+#   -p PWM       sysfs path of pwmN (pwmN_enable is next to it)
+#   -t TEMP      sysfs path of a tempN_input (millidegrees C); the highest
+#                of all sources drives the curve
+#   -f FAN       sysfs path of fanN_input (optional, stall detection)
+#   -c CURVE     "T:P T:P ...": degrees C to PWM (0-255), T ascending
+#   -m MIN       lowest PWM ever written (default 64)
+#   -C CRIT      critical temperature in degrees C (default 80); "off"
+#                disables the guard, for boards whose sensors are not
+#                calibrated (a guard on a reading that is too low would only
+#                give a false sense of safety); the stall detection stays
+#   -H HYST      hysteresis in degrees C before lowering (default 3)
+#   -i SECONDS   polling interval (default 5)
+#   -s FILE      state file (default /var/run/fgtwrt/fan-<pwm name>.orig)
+#   -F           write mode and duty cycle again at every step, for chips
+#                that take the duty cycle back in manual mode
+#   -D "A V,..." firmware values ("pwm2_enable 2,..."), see above
+#   -1           one iteration, no loop and no restore (tests)
+#   -R           restore the saved values and exit (with -D and no state
+#                file: put back the firmware values where they differ)
+#
+# Cruise strategy: fgtwrt-fan -p PWM -a MODE [-T TARGET] [-O TOL] [-s FILE]
+#   -a MODE      value written to pwmN_enable (automatic mode of the chip)
+#   -T TARGET    pwmN_target, degrees C
+#   -O TOL       pwmN_tolerance, degrees C
+# applies the settings once and exits; -R puts the firmware values back.
+#
+# SmartFan strategy: fgtwrt-fan -p PWM -S "T:P T:P T:P" [-s FILE] [-D ...]
+#   -S POINTS    three points, degrees C (strictly ascending) to PWM
+#                (0-255, ascending), written to the table of the chip;
+#                the channel is then routed to the table (pwmN_enable 5)
+# applies the table once and exits; -R puts the firmware table back. The
+# chip refuses a table that is not ascending at any time: points are
+# raised from the top and lowered from the bottom.
+# After a table write, below T1, the source of the table is switched to
+# another sensor and back (pwmN_auto_channels_temp, at most 10 s) so that
+# the chip applies the new table at once; see table_apply.
+#   -X SRC       source of the table held after the write (1 temp1, 2 temp2,
+#                4 temp3, pwmN_auto_channels_temp); switching to it is what
+#                makes the chip apply the new table. Source 2 (CPUTIN of the
+#                W83627DHG-P) needs -K and temp2_offset 0 (no double
+#                correction)
+#   -K "G O"     software calibration of source 2: T_true = G * T_read + O
+#                (gain 0.5-2, offset -20 to 40 C, up to three decimals); the
+#                temperatures of -S are then true degrees, written to the
+#                chip as read degrees, rounded down (the fan speeds up
+#                earlier, never later)
+#   -B "P T"     bounds of a user defined table: DC/PWM1 at least P, DC/PWM3
+#                255, T3 at most T (true degrees, before the calibration);
+#                P itself at least 16 (lowest duty cycle measured to keep
+#                the FortiGate 100D fan turning: below, it may stall)
+#   -A           apply the table when the other sensor alone is below T1
+#                (tests of the application rule)
+#
+# Guard: fgtwrt-fan -p PWM -W -t BOARD_TEMP [-f FAN] -g GUARD [-r RPM]
+#                   [-H HYST] [-i SECONDS] -S POINTS
+#   while the table runs on another sensor than the board one, the board
+#   temperature is no longer watched by the chip: at or above GUARD C, with
+#   an unreadable temperature or fan speed, or with the fan below RPM on
+#   two readings in a row, DC/PWM1-3 are set to 255 (as the "full"
+#   profile) and the source is switched to another sensor and back so that
+#   the chip applies it at once; the duty cycles of POINTS come back once
+#   the board temperature is below GUARD - HYST. Nothing is written while
+#   all is well; on exit nothing is written either (the service puts the
+#   firmware table back). RPM defaults to 1000. A reading of 0 is either a
+#   stopped fan or a count out of range: the w83627ehf driver then doubles
+#   the fan divisor (fanN_div next to FAN, never lowered). With a divisor
+#   of 8 or less after the reading, the speed is read again 2 s later (at
+#   most 3 times) before the 0 is counted as a low reading.
+#
+# Conversions: fgtwrt-fan -K "G O" -q READ_MILLIDEGREES (prints true
+# millidegrees) or -Q TRUE_DEGREES (prints the read degrees written to the
+# chip for that point).
+
+PWM=
+FAN=
+TEMPS=
+CURVE=
+MIN=64
+CRIT=80
+HYST=3
+INTERVAL=5
+STATE=
+ONCE=0
+RESTORE_ONLY=0
+AUTO=
+TARGET=
+TOL=
+REASSERT=0
+FACTORY=
+POINTS=
+HOLD=
+KAL=
+BOUNDS=
+RELAX=0
+WATCH=0
+GUARD=
+RPMMIN=1000
+PWM1_FLOOR=16
+REREAD=2
+QREAD=
+QTRUE=
+
+log() {
+	local level="$1"; shift
+	if [ -n "$FGTWRT_FAN_STDERR" ]; then
+		echo "fgtwrt-fan: $level: $*" >&2
+	else
+		logger -t fgtwrt-fan -p "daemon.$level" "$*"
+	fi
+}
+
+die() {
+	log err "$*"
+	exit 2
+}
+
+is_uint() {
+	case "$1" in
+	''|*[!0-9]*) return 1 ;;
+	esac
+	return 0
+}
+
+while getopts "p:t:f:c:m:C:H:i:s:1Ra:T:O:FD:S:X:K:B:AWg:r:q:Q:" opt; do
+	case "$opt" in
+	p) PWM="$OPTARG" ;;
+	t) TEMPS="$TEMPS $OPTARG" ;;
+	f) FAN="$OPTARG" ;;
+	c) CURVE="$OPTARG" ;;
+	m) MIN="$OPTARG" ;;
+	C) CRIT="$OPTARG" ;;
+	H) HYST="$OPTARG" ;;
+	i) INTERVAL="$OPTARG" ;;
+	s) STATE="$OPTARG" ;;
+	1) ONCE=1 ;;
+	R) RESTORE_ONLY=1 ;;
+	a) AUTO="$OPTARG" ;;
+	T) TARGET="$OPTARG" ;;
+	O) TOL="$OPTARG" ;;
+	F) REASSERT=1 ;;
+	D) FACTORY="$OPTARG" ;;
+	S) POINTS="$OPTARG" ;;
+	X) HOLD="$OPTARG" ;;
+	K) KAL="$OPTARG" ;;
+	B) BOUNDS="$OPTARG" ;;
+	A) RELAX=1 ;;
+	W) WATCH=1 ;;
+	g) GUARD="$OPTARG" ;;
+	r) RPMMIN="$OPTARG" ;;
+	q) QREAD="$OPTARG" ;;
+	Q) QTRUE="$OPTARG" ;;
+	*) die "usage: see the header of $0" ;;
+	esac
+done
+
+# Leading zeros dropped (ash reads 010 as octal).
+strip0() {
+	local x="${1#"${1%%[!0]*}"}"
+	echo "${x:-0}"
+}
+
+# Decimal "[+-]I[.F]" (at most three decimals) times 1000.
+fixed_milli() {
+	local v="$1" sg= i f
+	case "$v" in
+	+*) v="${v#+}" ;;
+	-*) v="${v#-}"; sg=- ;;
+	esac
+	case "$v" in
+	*.*) i="${v%%.*}"; f="${v#*.}" ;;
+	*) i="$v"; f= ;;
+	esac
+	[ -n "$i" ] || i=0
+	is_uint "$i" || return 1
+	case "$f" in *[!0-9]*) return 1 ;; esac
+	[ "${#f}" -le 3 ] || return 1
+	[ "${#i}" -le 6 ] || return 1
+	f="${f}000"
+	f="${f%"${f#???}"}"
+	echo "$sg$(( $(strip0 "$i") * 1000 + $(strip0 "$f") ))"
+}
+
+# Calibration of -K: gain in thousandths (CAL_G), offset in millidegrees
+# (CAL_O).
+CAL_G=
+CAL_O=
+parse_cal() {
+	set -- $1
+	[ $# = 2 ] || die "calibration needs 'GAIN OFFSET': '$*'"
+	CAL_G="$(fixed_milli "$1")" && CAL_O="$(fixed_milli "$2")" ||
+		die "bad calibration '$*'"
+	[ "$CAL_G" -ge 500 ] && [ "$CAL_G" -le 2000 ] || die "calibration gain out of 0.5-2: '$1'"
+	[ "$CAL_O" -ge -20000 ] && [ "$CAL_O" -le 40000 ] || die "calibration offset out of -20 to 40 C: '$2'"
+}
+
+# Read degrees (rounded down) of a true temperature in degrees; fails below
+# the offset (no negative point).
+raw_of_true() {
+	local n=$(( ($1 * 1000 - CAL_O) * 1000 ))
+	[ "$n" -ge 0 ] || return 1
+	echo $(( n / CAL_G / 1000 ))
+}
+
+# True millidegrees of a read value in millidegrees.
+true_of_raw() {
+	echo $(( $1 * CAL_G / 1000 + CAL_O ))
+}
+
+[ -z "$KAL" ] || parse_cal "$KAL"
+if [ -n "$QREAD$QTRUE" ]; then
+	[ -n "$KAL" ] || die "conversion needs a calibration (-K)"
+	if [ -n "$QREAD" ]; then
+		case "$QREAD" in -*) is_uint "${QREAD#-}" ;; *) is_uint "$QREAD" ;; esac ||
+			die "not an integer: '$QREAD'"
+		true_of_raw "$QREAD"
+	else
+		is_uint "$QTRUE" || die "not an unsigned integer: '$QTRUE'"
+		raw_of_true "$QTRUE" || die "$QTRUE C is below the calibration offset"
+	fi
+	exit 0
+fi
+
+[ -n "$PWM" ] || die "no PWM channel (-p)"
+ENABLE="${PWM}_enable"
+[ -n "$STATE" ] || STATE="/var/run/fgtwrt/fan-${PWM##*/}.orig"
+
+[ "$CRIT" = off ] || is_uint "$CRIT" || die "not an unsigned integer: '$CRIT'"
+for v in "$MIN" "$HYST" "$INTERVAL"; do
+	is_uint "$v" || die "not an unsigned integer: '$v'"
+done
+[ "$MIN" -le 255 ] || die "minimum PWM above 255: $MIN"
+[ "$INTERVAL" -ge 1 ] || die "interval below 1 s"
+
+# Firmware values of every attribute this tool may write, saved once in
+# the state file as "<attribute> <value>" lines, pwmN_enable last.
+SAVED=0
+
+# Value of an attribute in the state file, nothing if absent.
+state_get() {
+	local attr val
+	while read -r attr val; do
+		[ "$attr" = "$1" ] && { echo "$val"; return 0; }
+	done < "$STATE"
+	return 0
+}
+
+# Set once a point of the table was written.
+TABLE_WRITTEN=0
+
+# The SmartFan III+ engine of the W83627DHG-P computes its output when its
+# input temperature changes, not when the table is written (nor when the
+# fan is routed off the table and back). After a table write, the source
+# of the table is switched for a moment to another sensor, then back: the
+# engine sees its input change and computes the output from the new table.
+# Only below T1 for both sensors, where the output is DC/PWM1 whatever the
+# sensor, so the switch causes no jump; at or above T1, or when the output
+# does not reach DC/PWM1 within SWITCH_WAIT seconds, the chip applies the
+# table at the next change of the temperature. The source is always put
+# back and read back, also on TERM/INT/HUP.
+SWITCH_WAIT=10
+SRC_ORIG=
+
+# Sensor (tempN_input) of a source bit of pwmN_auto_channels_temp.
+src_temp() {
+	case "$1" in
+	1) echo "${PWM%/*}/temp1_input" ;;
+	2) echo "${PWM%/*}/temp2_input" ;;
+	4) echo "${PWM%/*}/temp3_input" ;;
+	esac
+}
+
+# Put the source back (and read it back), once.
+src_back() {
+	local a="${PWM}_auto_channels_temp" i
+	[ -n "$SRC_ORIG" ] || return 0
+	for i in 1 2 3; do
+		echo "$SRC_ORIG" > "$a" 2>/dev/null
+		[ "$(cat "$a" 2>/dev/null)" = "$SRC_ORIG" ] && { SRC_ORIG=; return 0; }
+		sleep 1
+	done
+	log err "${a##*/}: cannot put the source $SRC_ORIG back"
+	SRC_ORIG=
+	return 1
+}
+
+table_later() {
+	log notice "${PWM##*/}: table applied at the next temperature change ($*)"
+}
+
+table_apply() {
+	local a="${PWM}_auto_channels_temp" src alt t1 p1 ts ta n rc=0 seen=0
+	[ "$TABLE_WRITTEN" = 1 ] || return 0
+	[ "$(cat "$ENABLE" 2>/dev/null)" = 5 ] || return 0
+	[ -w "$a" ] || { table_later "source not writable"; return 0; }
+	src="$(cat "$a" 2>/dev/null)"
+	case "$src" in
+	1) alt=2 ;;
+	2|4) alt=1 ;;
+	*) table_later "source '$src' unknown"; return 0 ;;
+	esac
+	t1="$(cat "${PWM}_auto_point1_temp" 2>/dev/null)"
+	p1="$(cat "${PWM}_auto_point1_pwm" 2>/dev/null)"
+	ts="$(cat "$(src_temp "$src")" 2>/dev/null)"
+	ta="$(cat "$(src_temp "$alt")" 2>/dev/null)"
+	is_uint "$t1" && is_uint "$p1" || { table_later "table unreadable"; return 0; }
+	is_uint "$ts" && is_uint "$ta" || { table_later "temperature unreadable"; return 0; }
+	[ "$(cat "$PWM" 2>/dev/null)" = "$p1" ] && return 0
+	if [ "$RELAX" = 1 ]; then
+		# Other sensor below T1: the output goes to DC/PWM1 (at least the
+		# floor of the table) for the time of the switch.
+		[ "$ta" -lt "$t1" ] ||
+			{ table_later "other sensor at or above T1"; return 0; }
+	else
+		[ "$ts" -lt "$t1" ] && [ "$ta" -lt "$t1" ] ||
+			{ table_later "temperature at or above T1"; return 0; }
+	fi
+	SRC_ORIG="$src"
+	trap 'src_back; exit 1' TERM INT HUP
+	if echo "$alt" > "$a" 2>/dev/null; then
+		n=0
+		while [ "$n" -lt "$SWITCH_WAIT" ]; do
+			[ "$(cat "$PWM" 2>/dev/null)" = "$p1" ] && { seen=1; break; }
+			sleep 1
+			n=$(( n + 1 ))
+		done
+	else
+		log err "cannot write ${a##*/}=$alt"
+	fi
+	src_back || rc=1
+	trap - TERM INT HUP
+	if [ "$seen" = 1 ]; then
+		log info "${PWM##*/}: table applied (source switched $src -> $alt -> $src)"
+	else
+		table_later "no new output within ${SWITCH_WAIT} s"
+	fi
+	return $rc
+}
+
+# Hold the source of the table at $1 (read back, three tries).
+src_hold() {
+	local a="${PWM}_auto_channels_temp" i
+	for i in 1 2 3; do
+		echo "$1" > "$a" 2>/dev/null
+		[ "$(cat "$a" 2>/dev/null)" = "$1" ] && return 0
+		sleep 1
+	done
+	log err "${a##*/}: cannot hold the source at $1"
+	return 1
+}
+
+# With DC/PWM1-3 all at 255 the output is 255 whatever the sensor: switch
+# the source to another sensor until the output reads 255 (at most
+# SWITCH_WAIT s), then back, so that the chip applies it at once.
+src_kick() {
+	local a="${PWM}_auto_channels_temp" src alt n=0
+	src="$(cat "$a" 2>/dev/null)"
+	case "$src" in
+	1) alt=2 ;;
+	2|4) alt=1 ;;
+	*) return 0 ;;
+	esac
+	SRC_ORIG="$src"
+	trap 'src_back; exit 1' TERM INT HUP
+	if echo "$alt" > "$a" 2>/dev/null; then
+		while [ "$n" -lt "$SWITCH_WAIT" ]; do
+			[ "$(cat "$PWM" 2>/dev/null)" = 255 ] && break
+			sleep 1
+			n=$(( n + 1 ))
+		done
+	fi
+	src_back
+	trap - TERM INT HUP
+}
+
+# write_points temp|pwm FIRST SECOND THIRD: the three points of the
+# table, each one written only if it differs; raised from the top, then
+# lowered from the bottom, so that the table stays ascending after every
+# write.
+write_points() {
+	local kind="$1" i v cur a rc=0
+	shift
+	for i in 3 2 1; do
+		eval v=\${$i}
+		a="${PWM}_auto_point${i}_$kind"
+		cur="$(cat "$a" 2>/dev/null)"
+		is_uint "$v" && is_uint "$cur" || { log err "cannot read ${a##*/}"; return 1; }
+		[ "$v" -gt "$cur" ] || continue
+		echo "$v" > "$a" 2>/dev/null && TABLE_WRITTEN=1 ||
+			{ log err "cannot write ${a##*/}=$v"; rc=1; }
+	done
+	for i in 1 2 3; do
+		eval v=\${$i}
+		a="${PWM}_auto_point${i}_$kind"
+		cur="$(cat "$a" 2>/dev/null)"
+		[ "$v" -lt "$cur" ] || continue
+		echo "$v" > "$a" 2>/dev/null && TABLE_WRITTEN=1 ||
+			{ log err "cannot write ${a##*/}=$v"; rc=1; }
+	done
+	return $rc
+}
+
+restore() {
+	[ "$SAVED" = 1 ] || return 0
+	SAVED=0
+	# Already restored by "fgtwrt-fan -R" (service_stopped of the init
+	# script racing the TERM of the loop): nothing left to do.
+	[ -r "$STATE" ] || return 0
+	local attr val rc=0 t1 t2 t3 p1 p2 p3 srcset=
+	# Table of the chip first, in an order the chip accepts.
+	t1=$(state_get "${PWM##*/}_auto_point1_temp")
+	t2=$(state_get "${PWM##*/}_auto_point2_temp")
+	t3=$(state_get "${PWM##*/}_auto_point3_temp")
+	p1=$(state_get "${PWM##*/}_auto_point1_pwm")
+	p2=$(state_get "${PWM##*/}_auto_point2_pwm")
+	p3=$(state_get "${PWM##*/}_auto_point3_pwm")
+	if [ -n "$t1$t2$t3" ]; then
+		write_points temp "$t1" "$t2" "$t3" || rc=1
+	fi
+	if [ -n "$p1$p2$p3" ]; then
+		write_points pwm "$p1" "$p2" "$p3" || rc=1
+	fi
+	while read -r attr val; do
+		case "$attr" in
+		*/*|''|.*|*_auto_point*) continue ;;
+		esac
+		[ "$(cat "${PWM%/*}/$attr" 2>/dev/null)" = "$val" ] && continue
+		if echo "$val" > "${PWM%/*}/$attr" 2>/dev/null; then
+			case "$attr" in
+			*_auto_channels_temp) srcset="$val" ;;
+			esac
+		else
+			log err "cannot restore $attr=$val"
+			rc=1
+		fi
+	done < "$STATE"
+	# A source put back is itself what makes the chip compute the output
+	# from the firmware table: no switch on top of it.
+	if [ -n "$srcset" ]; then
+		log info "${PWM##*/}: table source put back to $srcset"
+	else
+		table_apply || rc=1
+	fi
+	if [ "$rc" = 0 ]; then
+		log info "restored the firmware fan settings of ${PWM##*/}"
+		rm -f "$STATE"
+	fi
+}
+
+load_state() {
+	local a v
+	if [ ! -r "$STATE" ] && [ -n "$FACTORY" ]; then
+		mkdir -p "${STATE%/*}" &&
+			echo "$FACTORY" | tr ',' '\n' | sed 's/^ *//' > "$STATE.new" &&
+			mv "$STATE.new" "$STATE" || die "cannot write the state file $STATE"
+		grep -q "^${ENABLE##*/} " "$STATE" ||
+			die "firmware values without ${ENABLE##*/}: '$FACTORY'"
+	elif [ ! -r "$STATE" ]; then
+		v="$(cat "$ENABLE" 2>/dev/null)"
+		is_uint "$v" || die "cannot read $ENABLE"
+		mkdir -p "${STATE%/*}" && : > "$STATE.new" ||
+			die "cannot write the state file $STATE"
+		for a in "$PWM" "${PWM}_target" "${PWM}_tolerance" \
+			"${PWM}_auto_point1_temp" "${PWM}_auto_point2_temp" \
+			"${PWM}_auto_point3_temp" "${PWM}_auto_point1_pwm" \
+			"${PWM}_auto_point2_pwm" "${PWM}_auto_point3_pwm" \
+			"${PWM}_auto_channels_temp" "$ENABLE"; do
+			[ -r "$a" ] || continue
+			v="$(cat "$a" 2>/dev/null)"
+			is_uint "$v" && echo "${a##*/} $v" >> "$STATE.new"
+		done
+		mv "$STATE.new" "$STATE" || die "cannot write the state file $STATE"
+	fi
+	grep -q "^${ENABLE##*/} [0-9][0-9]*\$" "$STATE" || die "bad state file $STATE"
+	SAVED=1
+}
+
+# Duty cycles of the three points of -S (validated), in GP1 GP2 GP3.
+points_pwm() {
+	local pt p prevp=0 n=0
+	set -- $POINTS
+	[ $# = 3 ] || die "three points needed: '$POINTS'"
+	for pt in "$@"; do
+		p="${pt#*:}"
+		is_uint "$p" && [ "$p" -le 255 ] && [ "$p" -ge "$prevp" ] ||
+			die "bad duty cycle at '$pt'"
+		prevp="$p"
+		n=$(( n + 1 ))
+		eval GP$n=\$p
+	done
+}
+
+table_pwms() {
+	echo "$(cat "${PWM}_auto_point1_pwm" 2>/dev/null) $(cat "${PWM}_auto_point2_pwm" 2>/dev/null) $(cat "${PWM}_auto_point3_pwm" 2>/dev/null)"
+}
+
+G_ALARM=0
+G_LOW=0
+SLEEPER=
+GSTATE=
+# Exit of the guard: nothing written to the chip, status removed. Set
+# again after src_kick, which has its own trap while it switches.
+guard_trap() {
+	trap '[ -n "$SLEEPER" ] && kill "$SLEEPER" 2>/dev/null; src_back; rm -f "$GSTATE"; exit 0' TERM INT HUP
+}
+# Status of the guard for LuCI: "ok" or "alarm: <why>" (tmpfs only).
+guard_status() {
+	[ "$(cat "$GSTATE" 2>/dev/null)" = "$1" ] && return 0
+	echo "$1" > "$GSTATE.new" 2>/dev/null && mv "$GSTATE.new" "$GSTATE" 2>/dev/null
+}
+
+# Fan speed for the guard. A 0 from the w83627ehf driver is a stopped fan
+# or a saturated count (0xff); on a saturated count the driver doubles
+# fanN_div at once (up to 128, never lowered). While the divisor read
+# just after is 8 or less, read again REREAD s later, at most 3 times
+# (2 -> 4 -> 8 -> 16): a 0 with a divisor of 16 or more, or still 0 after
+# 3 tries, is a low reading. Without a divisor file, a 0 is a low reading.
+# Result in FRPM (no subshell: a TERM stops the wait at once).
+FRPM=
+fan_read() {
+	local d n=0
+	FRPM="$(cat "$FAN" 2>/dev/null)"
+	while [ "$FRPM" = 0 ] && [ "$n" -lt 3 ]; do
+		d="$(cat "${FAN%_input}_div" 2>/dev/null)"
+		is_uint "$d" && [ "$d" -le 8 ] || break
+		n=$(( n + 1 ))
+		sleep "$REREAD" &
+		SLEEPER=$!
+		wait "$SLEEPER"
+		SLEEPER=
+		FRPM="$(cat "$FAN" 2>/dev/null)"
+	done
+}
+
+guard_step() {
+	local t rpm why=
+	t="$(cat "$GSENSOR" 2>/dev/null)"
+	if ! is_uint "$t"; then
+		why="board temperature unreadable"
+	elif [ "$t" -ge $(( GUARD * 1000 )) ]; then
+		why="board temperature $(( t / 1000 )) C at or above $GUARD C"
+	elif [ -n "$FAN" ]; then
+		fan_read
+		rpm="$FRPM"
+		if ! is_uint "$rpm"; then
+			why="fan speed unreadable"
+		elif [ "$rpm" -lt "$RPMMIN" ]; then
+			G_LOW=$(( G_LOW + 1 ))
+			[ "$G_LOW" -lt 2 ] || why="fan at $rpm RPM, below $RPMMIN"
+		else
+			G_LOW=0
+		fi
+	fi
+	if [ -n "$why" ]; then
+		guard_status "alarm: $why"
+		[ "$G_ALARM" = 1 ] && [ "$(table_pwms)" = "255 255 255" ] && return 0
+		write_points pwm 255 255 255 ||
+			{ log crit "guard: $why, cannot set the fan to full speed"; return 1; }
+		src_kick
+		[ "$ONCE" = 1 ] || guard_trap
+		[ "$G_ALARM" = 1 ] || log crit "guard: $why: fan at full speed"
+		G_ALARM=1
+		return 0
+	fi
+	if [ "$G_ALARM" = 1 ] && [ "$t" -lt $(( (GUARD - HYST) * 1000 )) ]; then
+		write_points pwm "$GP1" "$GP2" "$GP3" ||
+			{ log err "guard: cannot put the duty cycles '$GP1 $GP2 $GP3' back"; return 1; }
+		log notice "guard: board temperature $(( t / 1000 )) C, fan back to the table"
+		G_ALARM=0
+	fi
+	[ "$G_ALARM" = 1 ] || guard_status ok
+	return 0
+}
+
+if [ "$WATCH" = 1 ]; then
+	set -- $TEMPS
+	GSENSOR="$1"
+	[ -n "$GSENSOR" ] || die "guard needs the board sensor (-t)"
+	is_uint "$GUARD" && [ "$GUARD" -ge 20 ] && [ "$GUARD" -le 60 ] ||
+		die "guard temperature out of 20-60 C: '$GUARD'"
+	is_uint "$RPMMIN" || die "not an unsigned integer: '$RPMMIN'"
+	[ "$HYST" -lt "$GUARD" ] || die "hysteresis not below the guard temperature"
+	points_pwm
+	GSTATE="${STATE%/*}/guard-${PWM##*/}"
+	mkdir -p "${GSTATE%/*}" 2>/dev/null
+	for i in 1 2 3; do
+		[ -r "${PWM}_auto_point${i}_pwm" ] ||
+			die "no hardware table for ${PWM##*/} (driver without SmartFan III+?)"
+	done
+	if [ "$ONCE" = 1 ]; then
+		guard_step
+		exit $?
+	fi
+	SLEEPER=
+	guard_trap
+	log info "guard on ${GSENSOR##*/}: full speed at $GUARD C${FAN:+ or below $RPMMIN RPM}"
+	while :; do
+		guard_step || { rm -f "$GSTATE"; exit 1; }
+		sleep "$INTERVAL" &
+		SLEEPER=$!
+		wait "$SLEEPER"
+		SLEEPER=
+	done
+fi
+
+if [ "$RESTORE_ONLY" = 1 ]; then
+	[ -r "$STATE" ] || [ -n "$FACTORY" ] || exit 0
+	load_state
+	restore
+	exit 0
+fi
+
+if [ -n "$POINTS" ]; then
+	set -- $POINTS
+	[ $# = 3 ] || die "smartfan needs three points: '$POINTS'"
+	prev=-1; prevp=0; TS=; PS=; P1=; T3=
+	for pt in "$@"; do
+		t="${pt%%:*}"; p="${pt#*:}"
+		is_uint "$t" && is_uint "$p" || die "bad point '$pt'"
+		[ "$t" -gt "$prev" ] || die "temperatures not ascending at '$pt'"
+		[ "$p" -ge "$prevp" ] || die "PWM not ascending at '$pt'"
+		[ "$p" -le 255 ] || die "PWM above 255 at '$pt'"
+		[ -n "$P1" ] || P1="$p"
+		prev="$t"; prevp="$p"; T3="$t"
+		TS="$TS $t"; PS="$PS $p"
+	done
+	if [ -n "$BOUNDS" ]; then
+		set -- $BOUNDS
+		[ $# = 2 ] && is_uint "$1" && is_uint "$2" || die "bad bounds '$BOUNDS'"
+		[ "$1" -ge "$PWM1_FLOOR" ] || die "DC/PWM1 bound $1 below $PWM1_FLOOR (the fan may stall)"
+		[ "$P1" -ge "$1" ] || die "DC/PWM1 $P1 below $1"
+		[ "$prevp" = 255 ] || die "DC/PWM3 must be 255, not $prevp"
+		[ "$T3" -le "$2" ] || die "T3 $T3 C above $2 C"
+	fi
+	case "$HOLD" in
+	''|1|2|4) ;;
+	*) die "bad source '$HOLD' (1, 2 or 4)" ;;
+	esac
+	if [ "$HOLD" = 2 ]; then
+		[ -n "$KAL" ] || die "source 2 (CPUTIN) needs a calibration (-K)"
+		v="$(cat "${PWM%/*}/temp2_offset" 2>/dev/null)"
+		[ "$v" = 0 ] || die "temp2_offset is '$v', not 0: no calibration on top of it"
+	elif [ -n "$KAL" ]; then
+		die "the calibration (-K) applies to source 2 (CPUTIN) only"
+	fi
+	# Temperatures written to the chip, in millidegrees (whole degrees).
+	set -- $TS
+	TS=; RL=; prev=-1
+	for t in "$@"; do
+		if [ -n "$KAL" ]; then
+			r="$(raw_of_true "$t")" || die "$t C is below the calibration offset"
+			[ "$r" -gt "$prev" ] || die "points too close once calibrated ($t C read as $r C)"
+			t="$r"
+		fi
+		[ "$t" -le 100 ] || die "point above 100 C as read: $t"
+		prev="$t"
+		RL="${RL:+$RL }$t"
+		TS="$TS $(( t * 1000 ))"
+	done
+	for i in 1 2 3; do
+		[ -r "${PWM}_auto_point${i}_temp" ] && [ -r "${PWM}_auto_point${i}_pwm" ] ||
+			die "no hardware table for ${PWM##*/} (driver without SmartFan III+?)"
+	done
+	[ -z "$HOLD" ] || [ -r "${PWM}_auto_channels_temp" ] ||
+		die "no table source for ${PWM##*/}"
+	load_state
+	# shellcheck disable=SC2086
+	write_points temp $TS && write_points pwm $PS || { restore; exit 1; }
+	if [ "$(cat "$ENABLE" 2>/dev/null)" != 5 ]; then
+		echo 5 > "$ENABLE" 2>/dev/null ||
+			{ log err "cannot set ${ENABLE##*/}=5"; restore; exit 1; }
+	fi
+	log info "${PWM##*/}: hardware table '$POINTS'${KAL:+ (read degrees '$RL', calibration '$KAL')}"
+	if [ -n "$HOLD" ] && [ "$(cat "${PWM}_auto_channels_temp" 2>/dev/null)" != "$HOLD" ]; then
+		# The new source is what makes the chip compute the output from
+		# the new table.
+		src_hold "$HOLD" || { restore; exit 1; }
+		log info "${PWM##*/}: table source held at $HOLD"
+		exit 0
+	fi
+	table_apply || exit 1
+	exit 0
+fi
+
+if [ -n "$AUTO" ]; then
+	for v in "$AUTO" $TARGET $TOL; do
+		is_uint "$v" || die "not an unsigned integer: '$v'"
+	done
+	[ "$AUTO" -ge 2 ] || die "cruise mode needs an automatic mode (-a >= 2)"
+	load_state
+	w() {
+		echo "$2" > "$1" 2>/dev/null && return 0
+		log err "cannot write ${1##*/}=$2"
+		restore
+		exit 1
+	}
+	[ -z "$TARGET" ] || w "${PWM}_target" $(( TARGET * 1000 ))
+	[ -z "$TOL" ] || w "${PWM}_tolerance" $(( TOL * 1000 ))
+	w "$ENABLE" "$AUTO"
+	log info "${PWM##*/}: automatic mode $AUTO, target ${TARGET:--} C, tolerance ${TOL:--} C"
+	exit 0
+fi
+
+[ -n "$TEMPS" ] || die "no temperature source (-t)"
+[ -n "$CURVE" ] || die "no curve (-c)"
+
+# Validate the curve once: ascending temperatures, PWM within 0-255.
+prev=-1
+for pt in $CURVE; do
+	t="${pt%%:*}"; p="${pt#*:}"
+	is_uint "$t" && is_uint "$p" || die "bad curve point '$pt'"
+	[ "$t" -gt "$prev" ] || die "curve temperatures not ascending at '$pt'"
+	[ "$p" -le 255 ] || die "curve PWM above 255 at '$pt'"
+	prev="$t"
+done
+
+# Highest temperature of all sources, in millidegrees.
+read_temp() {
+	local src v max=
+	for src in $TEMPS; do
+		v="$(cat "$src" 2>/dev/null)"
+		case "$v" in
+		-*) v=0 ;;
+		esac
+		is_uint "$v" || return 1
+		[ -z "$max" ] || [ "$v" -gt "$max" ] && max="$v"
+	done
+	echo "$max"
+}
+
+# Curve lookup with linear interpolation, millidegrees in, PWM out.
+curve_pwm() {
+	local m="$1" pt t p pt0= p0= out=
+	for pt in $CURVE; do
+		t=$(( ${pt%%:*} * 1000 )); p="${pt#*:}"
+		if [ "$m" -le "$t" ]; then
+			if [ -z "$pt0" ]; then
+				out="$p"
+			else
+				out=$(( p0 + (p - p0) * (m - pt0) / (t - pt0) ))
+			fi
+			break
+		fi
+		pt0="$t"; p0="$p"
+	done
+	[ -n "$out" ] || out="$p0"
+	echo "$out"
+}
+
+CUR=-1          # last PWM written
+TSET=0          # temperature (millidegrees) when CUR was last changed
+STALL=0
+
+step() {
+	local m target
+	m="$(read_temp)" || { log err "temperature unreadable"; return 1; }
+
+	if [ "$CRIT" != off ] && [ "$m" -ge $(( CRIT * 1000 )) ]; then
+		target=255
+	else
+		target="$(curve_pwm "$m")"
+		[ "$target" -ge "$MIN" ] || target="$MIN"
+	fi
+
+	if [ "$target" -lt "$CUR" ] && [ "$m" -gt $(( TSET - HYST * 1000 )) ]; then
+		target="$CUR"
+	fi
+
+	if [ "$REASSERT" = 1 ]; then
+		if [ "$(cat "$ENABLE" 2>/dev/null)" != 1 ]; then
+			log warn "${ENABLE##*/} changed behind us, taking it back"
+			echo 1 > "$ENABLE" 2>/dev/null ||
+				{ log err "cannot set ${ENABLE##*/}=1"; return 1; }
+		fi
+		[ "$(cat "$PWM" 2>/dev/null)" = "$target" ] || CUR=-1
+	fi
+
+	if [ "$target" != "$CUR" ]; then
+		echo "$target" > "$PWM" 2>/dev/null ||
+			{ log err "cannot write ${PWM##*/}"; return 1; }
+		TSET="$m"
+		CUR="$target"
+	fi
+
+	if [ -n "$FAN" ]; then
+		local rpm
+		rpm="$(cat "$FAN" 2>/dev/null)"
+		if is_uint "$rpm" && [ "$rpm" -eq 0 ] && [ "$CUR" -gt 0 ]; then
+			STALL=$(( STALL + 1 ))
+			[ "$STALL" -lt 3 ] ||
+				{ log err "fan stalled (${FAN##*/}=0 at PWM $CUR)"; return 1; }
+		else
+			STALL=0
+		fi
+	fi
+	return 0
+}
+
+load_state
+
+# Take the channel: manual mode.
+echo 1 > "$ENABLE" 2>/dev/null || { log err "cannot set ${ENABLE##*/}=1"; restore; exit 1; }
+
+if [ "$ONCE" = 1 ]; then
+	step || { restore; exit 1; }
+	exit 0
+fi
+
+SLEEPER=
+on_signal() {
+	[ -n "$SLEEPER" ] && kill "$SLEEPER" 2>/dev/null
+	restore
+	exit 0
+}
+trap on_signal TERM INT HUP
+
+log info "controlling ${PWM##*/} (curve '$CURVE', min $MIN, critical: $CRIT)"
+while :; do
+	step || { restore; exit 1; }
+	sleep "$INTERVAL" &
+	SLEEPER=$!
+	wait "$SLEEPER"
+	SLEEPER=
+done

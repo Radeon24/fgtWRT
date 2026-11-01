@@ -1,0 +1,355 @@
+From 67999c886f036a7cd7d7b1750595fc6870642cbd Mon Sep 17 00:00:00 2001
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 18:00:00 +0200
+Subject: [PATCH 102/102] libfstools: fortisoc: describe the range on the
+ command line
+
+A board without a device tree (x86) has no node to describe the disk
+range of its overlay. Let the "fortisoc" volume driver read the same
+description from the kernel command line, built into the image:
+
+	fortinet.rootfs_data=<vendor>,<model>,<disk sectors>,<start>+<count>
+
+for instance:
+
+	fortinet.rootfs_data=ATA,SATA_SSD,31277232,589824+458752
+
+Vendor and model are required and non-empty; '_' stands for a space, as
+the command line carries none. They are compared with the device/vendor
+and device/model sysfs attributes of the disk, trailing blanks dropped,
+as for the device tree. The disk size and the range are decimal 512-byte
+sectors, absolute on the disk, with the same checks as the device tree
+(start and count non-zero, start+count within the disk, both multiples
+of 8 sectors; 64-bit values, the sum checked without overflow).
+
+A missing or empty field, an extra field, a non-decimal number, a
+parameter without a value or given more than once gives no volume and
+is logged: it never reads as an absent one. A command line that does
+not fit in the read buffer is refused the same way, as it could hide a
+second parameter.
+
+The command line is only read when no node of compatible
+"fortinet,disk-rootfs-data" exists, including when there is no device
+tree at all. A node, even an invalid one or one of two, keeps the
+priority: the parameter is then ignored (logged at info level).
+
+Everything else is unchanged: the witness of the guard must show the
+range as its one persistent window, the range is only claimed when it
+holds an ext4 filesystem labelled rootfs_data, an erase marker or a
+configuration backup, it is only formatted with
+fstools_overlay_fstype=ext4 on the command line, and outside preinit
+only while it is mounted.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ libfstools/fortisoc.c | 234 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 216 insertions(+), 18 deletions(-)
+
+diff --git a/libfstools/fortisoc.c b/libfstools/fortisoc.c
+index 951adef..b25219c 100644
+--- a/libfstools/fortisoc.c
++++ b/libfstools/fortisoc.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Overlay volume described by the device tree as a range of a whole disk.
++ * Overlay volume described by the device tree, or by the kernel command
++ * line, as a range of a whole disk.
+  *
+  * The board device tree carries a node, direct child of the root:
+  *
+@@ -12,6 +13,15 @@
+  *		fortinet,rootfs-data = <start count>;
+  *	};
+  *
++ * A board without a device tree (x86) gives the same description on the
++ * kernel command line, read only when no such node exists:
++ *
++ *	fortinet.rootfs_data=<vendor>,<model>,<N>,<start>+<count>
++ *
++ * Vendor and model are required there, non-empty, with '_' standing for a
++ * space (the command line carries none). A malformed or repeated parameter
++ * gives no volume and is logged: it never reads as an absent one.
++ *
+  * All sector values are 512-byte sectors, absolute on the disk. The disk is
+  * the only whole block device whose size is N sectors and whose vendor and
+  * model strings match, when given. The range is exposed through a loop
+@@ -207,7 +217,11 @@ static bool fortisoc_dt_compatible(const char *node)
+ 	return false;
+ }
+ 
+-/* Find the only matching node among the children of the root. */
++/*
++ * Count the matching nodes among the children of the root (0, 1, or 2 for
++ * more than one) and give the path of the first. No device tree at all
++ * (x86) counts as no node.
++ */
+ static int fortisoc_dt_find(char *node, size_t len)
+ {
+ 	char path[FORTISOC_PATHLEN];
+@@ -218,7 +232,7 @@ static int fortisoc_dt_find(char *node, size_t len)
+ 
+ 	dir = opendir(FORTISOC_DT_BASE);
+ 	if (!dir)
+-		return -1;
++		return 0;
+ 
+ 	while ((d = readdir(dir)) != NULL) {
+ 		if (d->d_name[0] == '.')
+@@ -243,9 +257,34 @@ static int fortisoc_dt_find(char *node, size_t len)
+ 
+ 	closedir(dir);
+ 
+-	return found == 1 ? 0 : -1;
++	return found;
+ }
+ 
++/* Range checks common to both descriptions; src names the description. */
++static int fortisoc_range_check(const char *src,
++				const struct fortisoc_desc *desc)
++{
++	if (!desc->start || !desc->count ||
++	    desc->count > desc->disk_sectors ||
++	    desc->start > desc->disk_sectors - desc->count) {
++		ULOG_ERR("%s: invalid range %llu+%llu on a %llu-sector disk\n",
++			 src, (unsigned long long)desc->start,
++			 (unsigned long long)desc->count,
++			 (unsigned long long)desc->disk_sectors);
++		return -1;
++	}
++
++	if (desc->start % FORTISOC_ALIGN || desc->count % FORTISOC_ALIGN) {
++		ULOG_ERR("%s: range %llu+%llu not aligned on %d sectors\n",
++			 src, (unsigned long long)desc->start,
++			 (unsigned long long)desc->count, FORTISOC_ALIGN);
++		return -1;
++	}
++
++	return 0;
++}
++
++/* 0 if read, 1 without a node, -1 if the node is invalid or not unique. */
+ static int fortisoc_dt_read(struct fortisoc_desc *desc)
+ {
+ 	char node[FORTISOC_PATHLEN];
+@@ -255,8 +294,9 @@ static int fortisoc_dt_read(struct fortisoc_desc *desc)
+ 
+ 	memset(desc, 0, sizeof(*desc));
+ 
+-	if (fortisoc_dt_find(node, sizeof(node)))
+-		return -1;
++	ret = fortisoc_dt_find(node, sizeof(node));
++	if (ret != 1)
++		return ret ? -1 : 1;
+ 
+ 	if (fortisoc_dt_check(node, "fortinet,disk-sectors",
+ 			      fortisoc_dt_fixed(node, "fortinet,disk-sectors",
+@@ -282,26 +322,184 @@ static int fortisoc_dt_read(struct fortisoc_desc *desc)
+ 	desc->start = be32_to_cpu(range[0]);
+ 	desc->count = be32_to_cpu(range[1]);
+ 
+-	/* start and count are 32-bit: their sum cannot overflow */
+-	if (!desc->start || !desc->count ||
+-	    desc->start + desc->count > desc->disk_sectors) {
+-		ULOG_ERR("%s: invalid range %llu+%llu on a %llu-sector disk\n",
+-			 node, (unsigned long long)desc->start,
+-			 (unsigned long long)desc->count,
+-			 (unsigned long long)desc->disk_sectors);
++	return fortisoc_range_check(node, desc);
++}
++
++#define FORTISOC_CMDLINE_PARAM	"fortinet.rootfs_data"
++#define FORTISOC_CMDLINE_LEN	4096
++#define FORTISOC_CMDLINE_VALLEN	256
++
++/*
++ * The value of the one fortinet.rootfs_data parameter of the command line
++ * into val: 1 if absent (or no command line), 0 if found once, -1 if
++ * repeated, without a value or too long, or if the command line does not
++ * fit in the buffer (logged unless quiet).
++ */
++static int fortisoc_cmdline_value(char *val, size_t len, bool quiet)
++{
++	const size_t plen = strlen(FORTISOC_CMDLINE_PARAM);
++	char buf[FORTISOC_CMDLINE_LEN], *tok, *save;
++	int found = 0, bad = 0;
++	ssize_t n;
++	int fd;
++
++	fd = open(FORTISOC_PROC_CMDLINE, O_RDONLY);
++	if (fd < 0)
++		return 1;
++	n = read(fd, buf, sizeof(buf) - 1);
++	close(fd);
++	if (n <= 0)
++		return 1;
++	buf[n] = '\0';
++
++	/* a truncated command line could hide a second parameter */
++	if (n == sizeof(buf) - 1) {
++		if (!quiet)
++			ULOG_ERR("command line longer than %d bytes: %s not read, no overlay\n",
++				 FORTISOC_CMDLINE_LEN - 2, FORTISOC_CMDLINE_PARAM);
+ 		return -1;
+ 	}
+ 
+-	if (desc->start % FORTISOC_ALIGN || desc->count % FORTISOC_ALIGN) {
+-		ULOG_ERR("%s: range %llu+%llu not aligned on %d sectors\n",
+-			 node, (unsigned long long)desc->start,
+-			 (unsigned long long)desc->count, FORTISOC_ALIGN);
++	for (tok = strtok_r(buf, " \t\n", &save); tok;
++	     tok = strtok_r(NULL, " \t\n", &save)) {
++		if (strncmp(tok, FORTISOC_CMDLINE_PARAM, plen) ||
++		    (tok[plen] != '\0' && tok[plen] != '='))
++			continue;
++		if (found++)
++			continue;
++		if (tok[plen] != '=' || !tok[plen + 1] ||
++		    snprintf(val, len, "%s", tok + plen + 1) >= (int)len)
++			bad = 1;
++	}
++
++	if (!found)
++		return 1;
++	if (quiet)
++		return found > 1 || bad ? -1 : 0;
++	if (found > 1) {
++		ULOG_ERR("%s given %d times on the command line: no overlay\n",
++			 FORTISOC_CMDLINE_PARAM, found);
++		return -1;
++	}
++	if (bad) {
++		ULOG_ERR("%s without a value, or too long: no overlay\n",
++			 FORTISOC_CMDLINE_PARAM);
+ 		return -1;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++/* Decimal number, digits only, no overflow. */
++static int fortisoc_parse_u64(const char *s, uint64_t *out)
++{
++	unsigned long long v;
++	const char *c;
++	char *end;
++
++	if (!*s)
++		return -1;
++	for (c = s; *c; c++)
++		if (*c < '0' || *c > '9')
++			return -1;
++
++	errno = 0;
++	v = strtoull(s, &end, 10);
++	if (errno || *end)
++		return -1;
++
++	*out = v;
++	return 0;
++}
++
++/* Vendor or model: non-empty, '_' for a space, trailing blanks dropped. */
++static int fortisoc_parse_string(const char *s, char *out)
++{
++	size_t i, l = strlen(s);
++
++	if (!l || l > FORTISOC_STRLEN)
++		return -1;
++
++	for (i = 0; i <= l; i++)
++		out[i] = s[i] == '_' ? ' ' : s[i];
++	fortisoc_trim(out);
++
++	return out[0] ? 0 : -1;
++}
++
++/*
++ * fortinet.rootfs_data=<vendor>,<model>,<disk sectors>,<start>+<count>:
++ * 0 if read, 1 if absent, -1 if malformed (logged).
++ */
++static int fortisoc_cmdline_read(struct fortisoc_desc *desc)
++{
++	char val[FORTISOC_CMDLINE_VALLEN], *field[4], *plus, *p;
++	const char *why = NULL;
++	int ret, i;
++
++	memset(desc, 0, sizeof(*desc));
++
++	ret = fortisoc_cmdline_value(val, sizeof(val), false);
++	if (ret)
++		return ret;
++
++	/* exactly four comma-separated fields */
++	field[0] = val;
++	for (i = 1, p = val; (p = strchr(p, ',')) != NULL; i++) {
++		*p++ = '\0';
++		if (i < 4)
++			field[i] = p;
++	}
++	plus = i == 4 ? strchr(field[3], '+') : NULL;
++
++	if (i != 4)
++		why = "not four fields";
++	else if (fortisoc_parse_string(field[0], desc->vendor))
++		why = "invalid vendor";
++	else if (fortisoc_parse_string(field[1], desc->model))
++		why = "invalid model";
++	else if (fortisoc_parse_u64(field[2], &desc->disk_sectors))
++		why = "invalid disk size";
++	else if (!plus)
++		why = "range not <start>+<count>";
++
++	if (!why) {
++		*plus++ = '\0';
++		if (fortisoc_parse_u64(field[3], &desc->start) ||
++		    fortisoc_parse_u64(plus, &desc->count))
++			why = "invalid range";
++	}
++
++	if (why) {
++		ULOG_ERR("%s on the command line: %s: no overlay\n",
++			 FORTISOC_CMDLINE_PARAM, why);
++		return -1;
++	}
++
++	return fortisoc_range_check(FORTISOC_CMDLINE_PARAM, desc);
++}
++
++/*
++ * The description: the device tree node when there is one, else the
++ * command line. A device tree node, even an invalid one, has priority:
++ * the command line is then ignored.
++ */
++static int fortisoc_desc_read(struct fortisoc_desc *desc)
++{
++	char val[FORTISOC_CMDLINE_VALLEN];
++	int ret;
++
++	ret = fortisoc_dt_read(desc);
++	if (ret <= 0) {
++		if (fortisoc_cmdline_value(val, sizeof(val), true) != 1)
++			ULOG_INFO("%s node present: %s of the command line ignored\n",
++				  FORTISOC_COMPATIBLE, FORTISOC_CMDLINE_PARAM);
++		return ret;
++	}
++
++	return fortisoc_cmdline_read(desc) ? -1 : 0;
++}
++
+ /*
+  * The witness of the write windows of the kernel guard must show the range
+  * as the one persistent window, in a state where that window is open.
+@@ -627,7 +825,7 @@ static struct volume *fortisoc_volume_find(char *name)
+ 	if (strcmp(name, "rootfs_data") != 0)
+ 		return NULL;
+ 
+-	if (fortisoc_dt_read(&desc))
++	if (fortisoc_desc_read(&desc))
+ 		return NULL;
+ 
+ 	p = calloc(1, sizeof(*p));
+-- 
+2.55.0
+

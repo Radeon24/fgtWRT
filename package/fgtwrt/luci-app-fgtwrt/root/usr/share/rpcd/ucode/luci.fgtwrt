@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Read-only status of the FortiGate specific features for LuCI: model,
+// capabilities, live fan readings, USB management port and the offload
+// parameters of the network processor. Nothing is written here; settings
+// go through UCI and /etc/init.d/fgtwrt (the offload parameters are shown
+// only, never set from LuCI).
+
+'use strict';
+
+import { readfile, popen, glob, stat } from 'fs';
+
+function rd(path) {
+	let v = readfile(path);
+	return (v != null) ? trim(v) : null;
+}
+
+function rdint(path) {
+	let v = rd(path);
+	return (v != null && match(v, /^-?[0-9]+$/)) ? +v : null;
+}
+
+function hwmon_dir(name) {
+	for (let d in glob('/sys/class/hwmon/hwmon*'))
+		if (rd(d + '/name') == name)
+			return d;
+	return null;
+}
+
+function caps_file() {
+	let p = popen('. /lib/functions/fgtwrt.sh && fgtwrt_caps_file');
+	if (!p)
+		return null;
+	let out = trim(p.read('all') ?? '');
+	p.close();
+	return length(out) ? out : null;
+}
+
+// Software calibration of a sensor (section of /etc/config/fgtwrt, set
+// from the command line; defaults from the capabilities): true = gain *
+// read + offset, shown next to the read value.
+function calibration(cal) {
+	if (!cal)
+		return null;
+	// uci module resolved at run time (rpcd has it; build hosts may not)
+	let c = require('uci').cursor();
+	c.load('fgtwrt');
+	let gain = +(c.get('fgtwrt', cal.sensor, 'gain') ?? cal.gain);
+	let offset = +(c.get('fgtwrt', cal.sensor, 'offset') ?? cal.offset);
+	return {
+		sensor: cal.sensor,
+		input: cal.input,
+		gain: (type(gain) == 'double' || type(gain) == 'int') ? gain : null,
+		offset: (type(offset) == 'double' || type(offset) == 'int') ? offset : null,
+		calibrated: c.get('fgtwrt', cal.sensor, 'calibrated') == '1'
+	};
+}
+
+function fan_status(fan) {
+	let d = hwmon_dir(fan.hwmon);
+	if (!d)
+		return { present: false };
+	let cal = calibration(fan.calibration);
+
+	let p = d + '/pwm' + fan.pwm;
+	return {
+		present: true,
+		pwm: rdint(p),
+		enable: rdint(p + '_enable'),
+		target: rdint(p + '_target'),
+		tolerance: rdint(p + '_tolerance'),
+		// hardware table (SmartFan III+), when the driver exposes it
+		points: map([ 1, 2, 3 ], (i) => ({
+			mdeg: rdint(p + '_auto_point' + i + '_temp'),
+			pwm: rdint(p + '_auto_point' + i + '_pwm')
+		})),
+		// source of the table: 1 temp1, 2 temp2, 4 temp3
+		source: rdint(p + '_auto_channels_temp'),
+		// diagnostics of the CPU sensor (w83627ehf, W83627DHG-P)
+		cputin_current_mode: rdint(d + '/temp2_current_mode'),
+		temp2_offset: rdint(d + '/temp2_offset'),
+		calibration: cal,
+		// board temperature guard of the custom table on the CPU sensor
+		guard: rd('/var/run/fgtwrt/guard-pwm' + fan.pwm),
+		rpm: fan.fan ? rdint(d + '/fan' + fan.fan + '_input') : null,
+		overridden: stat('/var/run/fgtwrt/fan-pwm' + fan.pwm + '.orig') != null,
+		temps: map(fan.temps ?? [], (t) => {
+			let td = hwmon_dir(t.hwmon);
+			let m = td ? rdint(td + '/temp' + t.input + '_input') : null;
+			let calibrated = cal && cal.input == t.input && t.hwmon == fan.hwmon &&
+				cal.gain != null && cal.offset != null && m != null;
+			return {
+				label: t.label,
+				mdeg: m,
+				true_mdeg: calibrated ? int(m * cal.gain + cal.offset * 1000) : null
+			};
+		})
+	};
+}
+
+function usb_status(gadget) {
+	let udcs = map(glob('/sys/class/udc/*') ?? [], (d) => replace(d, /^.*\//, ''));
+	let udc = gadget.udc ?? ((length(udcs) == 1) ? udcs[0] : null);
+	return {
+		udc: (udc != null && index(udcs, udc) >= 0) ? udc : null,
+		presets: {
+			acm: stat('/usr/share/usbgadget/acm') != null,
+			ncm: stat('/usr/share/usbgadget/ncm') != null
+		},
+		console: stat('/dev/ttyGS0') != null,
+		network: stat('/sys/class/net/usb0') != null
+	};
+}
+
+function np_status(np) {
+	let dir = '/sys/module/' + np.module + '/parameters/';
+	let params = {};
+	for (let p in np.params ?? [])
+		params[p] = rd(dir + p);
+	return {
+		loaded: stat('/sys/module/' + np.module) != null,
+		params: params
+	};
+}
+
+const methods = {
+	status: {
+		call: function() {
+			let res = {
+				board_name: rd('/tmp/sysinfo/board_name') ?? 'generic',
+				model: null,
+				name: null,
+				caps: null,
+				fan: null,
+				usb: null,
+				np: null
+			};
+
+			let f = caps_file();
+			if (!f)
+				return res;
+
+			let caps;
+			try {
+				caps = json(readfile(f));
+			}
+			catch (e) {
+				return { ...res, error: 'bad capability file ' + f };
+			}
+
+			res.model = caps.id;
+			res.name = caps.name;
+			res.caps = caps;
+			if (caps.fan)
+				res.fan = fan_status(caps.fan);
+			if (caps.usb?.gadget)
+				res.usb = usb_status(caps.usb.gadget);
+			if (caps.np)
+				res.np = np_status(caps.np);
+
+			return res;
+		}
+	}
+};
+
+return { 'luci.fgtwrt': methods };

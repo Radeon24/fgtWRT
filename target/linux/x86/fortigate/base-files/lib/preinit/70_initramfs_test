@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2006 OpenWrt.org
+# Copyright (C) 2010 Vertical Communications
+#
+# FortiGate x86: as the generic file, but for an initramfs whose kernel
+# command line describes a rootfs_data (/lib/functions/fortigate.sh),
+# which goes on with the regular preinit, overlay included. A malformed
+# description goes on too: fstools then finds no volume and says why.
+
+. /lib/functions/fortigate.sh
+
+initramfs_test() {
+	if [ -n "$INITRAMFS" ]; then
+		fortigate_rootfs_data_value > /dev/null 2>&1
+		if [ $? = 1 ]; then
+			boot_run_hook initramfs
+			preinit_ip_deconfig
+			break
+		fi
+	fi
+}
+
+boot_hook_add preinit_main initramfs_test

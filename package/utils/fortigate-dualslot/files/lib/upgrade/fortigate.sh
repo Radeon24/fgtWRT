@@ -3,8 +3,8 @@
 # fortigate.sh: install OpenWrt into a firmware slot of the boot disk of
 # a dual-slot FortiGate, through the write windows of the kernel.
 #
-# Layout of the boot disk (an internal USB stick, or the eMMC), as left
-# by the stock firmware:
+# Layout of the boot disk (an internal USB stick, the eMMC or a SATA
+# disk), as left by the stock firmware:
 #
 #   sector 0     boot sector: a Fortinet header (bytes 0x000-0x1bd)
 #                merged with an MBR partition table (0x1be-0x1fd,
@@ -45,9 +45,17 @@
 # read from the device tree, node "fortinet,disk-rootfs-data", a child
 # of the root (properties fortinet,disk-sectors, 64-bit, the size of
 # the disk, and fortinet,rootfs-data, <start count>, in sectors of the
-# whole disk). The kernel keeps that area writable at all times (a
-# persistent write window, see fgt_ww_read); the installer requires it
-# to be exactly that window, inside the slot and after the container.
+# whole disk). On a board without such a node (an x86 board has no
+# device tree), from the kernel command line instead, one parameter:
+#
+#   fortinet.rootfs_data=<vendor>,<model>,<disk sectors>,<start>+<count>
+#
+# (an underscore stands for a space in <vendor> and <model>; e.g.
+# fortinet.rootfs_data=ATA,SATA_SSD,31277232,589824+458752). The same
+# checks apply to both sources. The kernel keeps that area writable at
+# all times (a persistent write window, see fgt_ww_read); the installer
+# requires it to be exactly that window, inside the slot and after the
+# container.
 # fstools reaches it through a loop device backed by the whole disk,
 # whose page cache writes back whole 4 KiB pages aligned on the disk:
 # start and count must be multiples of 8 sectors (a page across its
@@ -58,7 +66,8 @@
 # board_name (the fgt_board() case there):
 #
 #   FGT_BOARD             label of the board, for the messages
-#   FGT_DISK_KIND         usb (an internal stick) or mmc (the eMMC)
+#   FGT_DISK_KIND         usb (an internal stick), mmc (the eMMC) or
+#                         ata (an internal SATA disk)
 #   FGT_SLOT_PART         partition to write: 1 or 2 (its MBR entry)
 #   FGT_SLOT_LBA          expected start of that partition (sectors)
 #   FGT_SLOT_SIZE         expected size of that partition (sectors)
@@ -82,14 +91,19 @@
 #        stick), FGT_DISK_VENDOR, FGT_DISK_MODEL, FGT_DISK_SECTORS (the
 #        stick is never chosen by its sdX name, which depends on the
 #        other disks plugged in)
+#   ata: FGT_ATA_PATH (SATA controller and port, e.g.
+#        "/0000:00:1f.2/ata1/"), FGT_DISK_VENDOR, FGT_DISK_MODEL,
+#        FGT_DISK_SECTORS (same rule: never chosen by its sdX name)
 #   mmc: FGT_MMC_DISK (device of the eMMC), FGT_MMC_SLOT (partition
 #        to write)
 #
 # The kernel guards the boot disk and refuses every write except the
-# windows it declares itself (they come from the device tree): this
-# script reads them from the witness, /sys/module/block/parameters/
-# write_windows (USB guard) or /sys/module/mmc_core/parameters/
-# write_windows (eMMC guard), and refuses unless they are exactly the
+# windows it declares itself (they come from the device tree, or from
+# the kernel command line on a board without one): this script reads
+# them from the witness, /sys/module/block/parameters/write_windows
+# (guard of the USB stick or of the SATA disk) or
+# /sys/module/mmc_core/parameters/write_windows (eMMC guard), and
+# refuses unless they are exactly the
 # expected ones (FGT_WW_EXPECTED), cover sector 0 and the target slot,
 # and allow the bytes of sector 0 it changes (both guards list them,
 # "sector0" in the witness). The target
@@ -98,10 +112,10 @@
 # The windows are disarmed at boot: this script arms them, once per
 # boot and for 10 minutes at most, right before writing, and turns
 # them off when done or on failure (the persistent window of
-# rootfs_data does not depend on it). A USB stick may also be kept
-# read-only by user space (blockdev --setro): the stick alone is made
-# writable while the windows are armed, and read-only again
-# afterwards.
+# rootfs_data does not depend on it). A USB stick or a SATA disk may
+# also be kept read-only by user space (blockdev --setro): that disk
+# alone is made writable while the windows are armed, and read-only
+# again afterwards.
 #
 # Upgrade image: the TFTP image itself (a gzip stream holding a disk
 # image whose partition 0 is the file system of a slot), so that the
@@ -133,8 +147,8 @@
 # The paths of sysfs, /dev, /proc and of the device tree may be
 # overridden from the environment, for a test harness on a PC only:
 # FGT_SYS_BLOCK, FGT_SYS_CLASS_BLOCK, FGT_SYS_MODULE, FGT_DEV,
-# FGT_PROC_MOUNTS, FGT_DT_BASE, FGT_DROP_CACHES, FGT_SECTOR0, and the
-# directory of the temporary files: FGT_TMP.
+# FGT_PROC_MOUNTS, FGT_PROC_CMDLINE, FGT_DT_BASE, FGT_DROP_CACHES,
+# FGT_SECTOR0, and the directory of the temporary files: FGT_TMP.
 
 # Kill switch: set to 0 to refuse every upgrade (not forceable).
 FGT_DUALSLOT_CONFIRMED=1
@@ -146,8 +160,10 @@ FGT_NAME_LEN=32
 FGT_BUILD_LEN=4
 # Direct I/O on sector 0 (never busybox dd: not direct at bs=512)
 FGT_SECTOR0="${FGT_SECTOR0:-fgt-sector0}"
-# Description of rootfs_data in the device tree
+# Description of rootfs_data in the device tree, or on the kernel
+# command line when there is no such node
 FGT_DT_COMPAT=fortinet,disk-rootfs-data
+FGT_CMDLINE_RD=fortinet.rootfs_data
 # Marker that makes fstools format rootfs_data at the next boot
 FGT_DEADCODE=deadc0de
 # Head of the backup archive fstools recognizes (gzip, deflate, no flag)
@@ -159,6 +175,7 @@ FGT_SYS_CLASS_BLOCK="${FGT_SYS_CLASS_BLOCK:-/sys/class/block}"
 FGT_SYS_MODULE="${FGT_SYS_MODULE:-/sys/module}"
 FGT_DEV="${FGT_DEV:-/dev}"
 FGT_PROC_MOUNTS="${FGT_PROC_MOUNTS:-/proc/mounts}"
+FGT_PROC_CMDLINE="${FGT_PROC_CMDLINE:-/proc/cmdline}"
 FGT_DT_BASE="${FGT_DT_BASE:-/sys/firmware/devicetree/base}"
 FGT_DROP_CACHES="${FGT_DROP_CACHES:-/proc/sys/vm/drop_caches}"
 FGT_TMP="${FGT_TMP:-/tmp}"
@@ -235,8 +252,14 @@ fgt_mbr() { # <partition> <0|4|8|12>
 fgt_check_settings() {
 	local o
 
+	# usb and ata: an sdX disk found by its path, vendor, model and
+	# size, guarded by the block layer, kept read-only by user space
+	# outside an installation
 	case "$FGT_DISK_KIND" in
-	usb) FGT_WW="$FGT_SYS_MODULE/block/parameters/write_windows" ;;
+	usb) FGT_WW="$FGT_SYS_MODULE/block/parameters/write_windows"
+		FGT_DISK_LABEL="boot stick" ;;
+	ata) FGT_WW="$FGT_SYS_MODULE/block/parameters/write_windows"
+		FGT_DISK_LABEL="boot disk" ;;
 	mmc) FGT_WW="$FGT_SYS_MODULE/mmc_core/parameters/write_windows" ;;
 	*) return 1 ;;
 	esac
@@ -259,15 +282,23 @@ fgt_check_settings() {
 	esac
 	[ -n "$FGT_SLOT_LBA" ] && [ "$FGT_SLOT_LBA" -ge 1 ] &&
 		[ -n "$FGT_SLOT_SIZE" ] && [ "$FGT_SLOT_SIZE" -ge 1 ] || return 1
-	if [ "$FGT_DISK_KIND" = usb ]; then
-		[ -n "$FGT_USB_PATH" ] && [ -n "$FGT_USB_PORT" ] &&
-			[ -n "$FGT_DISK_VENDOR" ] && [ -n "$FGT_DISK_MODEL" ] &&
-			[ -n "$FGT_DISK_SECTORS" ] || return 1
-	else
+	case "$FGT_DISK_KIND" in
+	usb)
+		[ -n "$FGT_USB_PATH" ] && [ -n "$FGT_USB_PORT" ] || return 1
+		;;
+	ata)
+		[ -n "$FGT_ATA_PATH" ] || return 1
+		;;
+	mmc)
 		[ -n "$FGT_MMC_DISK" ] && [ -n "$FGT_MMC_SLOT" ] || return 1
+		;;
+	esac
+	if fgt_disk_is_sd; then
+		[ -n "$FGT_DISK_VENDOR" ] && [ -n "$FGT_DISK_MODEL" ] &&
+			[ -n "$FGT_DISK_SECTORS" ] || return 1
 	fi
-	# Persistence: the size of the disk is checked against the device
-	# tree, on the eMMC as well
+	# Persistence: the size of the disk is checked against the
+	# description of rootfs_data, on the eMMC as well
 	if [ "$FGT_PERSIST" = 1 ]; then
 		[ -n "$FGT_DISK_SECTORS" ] || return 1
 	fi
@@ -322,17 +353,27 @@ fgt_check_writable_list() {
 	done
 }
 
-# The one disk that is the boot stick: USB port, vendor, model and
-# size. Prints its name (sdX); fails unless exactly one disk matches.
-fgt_disk_usb() {
+# True when the boot disk is an sdX disk (USB stick or SATA disk)
+fgt_disk_is_sd() {
+	case "$FGT_DISK_KIND" in
+	usb|ata) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# The one sdX disk whose sysfs path holds <path> then <port> (<port>
+# may be empty), with the vendor, model and size of the board. Prints
+# its name (sdX); fails unless exactly one disk matches.
+fgt_disk_sd_find() { # <path> <port>
 	local b d real v m n found=""
 
+	[ -n "$1" ] || return 1
 	for b in "$FGT_SYS_BLOCK"/sd*; do
 		[ -e "$b" ] || continue
 		d="${b##*/}"
 		real="$(readlink -f "$b")" || continue
 		case "$real" in
-		*"$FGT_USB_PATH"*"$FGT_USB_PORT"*) ;;
+		*"$1"*"$2"*) ;;
 		*) continue ;;
 		esac
 		read v < "$b/device/vendor" 2>/dev/null || continue
@@ -345,6 +386,26 @@ fgt_disk_usb() {
 		found="$d"
 	done
 	[ -n "$found" ] && echo "$found"
+}
+
+# The boot stick: USB port, vendor, model and size
+fgt_disk_usb() {
+	fgt_disk_sd_find "$FGT_USB_PATH" "$FGT_USB_PORT"
+}
+
+# The SATA disk: controller and port, vendor, model and size (the model
+# as read by read: trailing blanks of the SCSI string dropped)
+fgt_disk_ata() {
+	fgt_disk_sd_find "$FGT_ATA_PATH" ""
+}
+
+# The sdX boot disk of the board (usb or ata)
+fgt_disk_sd() {
+	case "$FGT_DISK_KIND" in
+	usb) fgt_disk_usb ;;
+	ata) fgt_disk_ata ;;
+	*) return 1 ;;
+	esac
 }
 
 # True when <path> is a block device (the one test of the kind of a
@@ -462,8 +523,8 @@ fgt_ww_arm() {
 	echo arm > "$FGT_WW" 2>/dev/null
 }
 
-# Windows off; a USB stick is made read-only again as well (both always
-# attempted)
+# Windows off; an sdX disk (USB stick or SATA disk) is made read-only
+# again as well (both always attempted)
 fgt_ww_off() { # [<disk>]
 	echo off > "$FGT_WW" 2>/dev/null
 	echo "Write windows: $(cat "$FGT_WW" 2>/dev/null)"
@@ -476,7 +537,7 @@ fgt_ww_off() { # [<disk>]
 
 # Windows off at the end of the work, or on failure
 fgt_ww_done() {
-	if [ "$FGT_DISK_KIND" = usb ]; then
+	if fgt_disk_is_sd; then
 		fgt_ww_off "$FGT_DISK"
 	else
 		fgt_ww_off
@@ -490,7 +551,8 @@ fgt_drop_caches() {
 }
 
 # The one node of the device tree, child of the root, compatible with
-# FGT_DT_COMPAT. Prints its path; fails unless exactly one matches.
+# FGT_DT_COMPAT. Prints its path; fails unless exactly one matches:
+# 1 for more than one, 2 for none.
 fgt_dt_node() {
 	local c want found=""
 
@@ -504,7 +566,8 @@ fgt_dt_node() {
 		[ -z "$found" ] || return 1
 		found="${c%/compatible}"
 	done
-	[ -n "$found" ] && echo "$found"
+	[ -n "$found" ] || return 2
+	echo "$found"
 }
 
 # True when the string property <file> of the device tree is absent or
@@ -514,29 +577,28 @@ fgt_dt_string_is() { # <file> <string>
 	[ "$(fgt_hexw "$1")" = "$(printf '%s' "$2" | fgt_hexw) 00" ]
 }
 
-# rootfs_data as described by the device tree (never by platform.sh):
-# the size of the disk must be FGT_DISK_SECTORS and the one of the
-# disk found, the area must lie inside the target slot (a container
-# before it) and be exactly the one persistent window of the witness
-# (fgt_ww_read first). Sets FGT_RD_START and FGT_RD_COUNT (sectors of
-# the whole disk).
-fgt_check_rootfs_data() {
-	local node hi lo size=""
+# True when <value> is a decimal number without leading zeros
+fgt_is_number() { # <value>
+	case "$1" in
+	""|*[!0-9]*|0?*) return 1 ;;
+	esac
+}
 
-	FGT_RD_START=""; FGT_RD_COUNT=""
-	node="$(fgt_dt_node)" ||
-		{ fgt_refuse "no device tree node $FGT_DT_COMPAT (or more than one)"; return 1; }
+# rootfs_data from the device tree node <node>: sets FGT_RD_SECTORS
+# (size of the disk), FGT_RD_START and FGT_RD_COUNT; on a USB stick,
+# the vendor and the model, when given, must be the ones of the board
+fgt_rootfs_data_dt() { # <node>
+	local node="$1" hi lo
+
 	[ "$(wc -c < "$node/fortinet,disk-sectors" 2>/dev/null)" = 8 ] &&
 		[ "$(wc -c < "$node/fortinet,rootfs-data" 2>/dev/null)" = 8 ] ||
 		{ fgt_refuse "malformed device tree node $node"; return 1; }
 	# 64-bit size of the disk: a high cell of 0 (2 TiB at most)
 	hi="$(fgt_be32 0 "$node/fortinet,disk-sectors")" &&
 		lo="$(fgt_be32 4 "$node/fortinet,disk-sectors")" &&
-		[ "$hi" = 0 ] && [ "$lo" = "$FGT_DISK_SECTORS" ] ||
+		[ "$hi" = 0 ] ||
 		{ fgt_refuse "device tree disk size ($hi:$lo) is not $FGT_DISK_SECTORS sectors"; return 1; }
-	read size < "$FGT_SYS_CLASS_BLOCK/${FGT_DISK##*/}/size" 2>/dev/null
-	[ "$size" = "$FGT_DISK_SECTORS" ] ||
-		{ fgt_refuse "$FGT_DISK is not $FGT_DISK_SECTORS sectors ($size)"; return 1; }
+	FGT_RD_SECTORS="$lo"
 	if [ "$FGT_DISK_KIND" = usb ]; then
 		fgt_dt_string_is "$node/fortinet,disk-vendor" "$FGT_DISK_VENDOR" &&
 			fgt_dt_string_is "$node/fortinet,disk-model" "$FGT_DISK_MODEL" ||
@@ -545,6 +607,73 @@ fgt_check_rootfs_data() {
 	FGT_RD_START="$(fgt_be32 0 "$node/fortinet,rootfs-data")" &&
 		FGT_RD_COUNT="$(fgt_be32 4 "$node/fortinet,rootfs-data")" ||
 		{ fgt_refuse "cannot read rootfs_data from $node"; return 1; }
+}
+
+# rootfs_data from the kernel command line (board without a device
+# tree node), one parameter of exactly four fields:
+#
+#   fortinet.rootfs_data=<vendor>,<model>,<disk sectors>,<start>+<count>
+#
+# an underscore standing for a space in <vendor> and <model>, which
+# must be the ones of the board (FGT_DISK_VENDOR, FGT_DISK_MODEL), and
+# decimal numbers. Missing, repeated or malformed: refused. Sets
+# FGT_RD_SECTORS, FGT_RD_START and FGT_RD_COUNT.
+fgt_rootfs_data_cmdline() {
+	local line="" w v="" n=0 vendor model sectors area
+
+	[ -r "$FGT_PROC_CMDLINE" ] && read -r line < "$FGT_PROC_CMDLINE"
+	for w in $line; do
+		case "$w" in
+		"$FGT_CMDLINE_RD"=*) v="${w#*=}"; n=$((n + 1)) ;;
+		"$FGT_CMDLINE_RD") n=$((n + 1)) ;;
+		esac
+	done
+	[ $n -ge 1 ] ||
+		{ fgt_refuse "no device tree node $FGT_DT_COMPAT, no $FGT_CMDLINE_RD= on the kernel command line"; return 1; }
+	[ $n = 1 ] ||
+		{ fgt_refuse "$FGT_CMDLINE_RD given $n times on the kernel command line"; return 1; }
+	case "$v" in
+	*,*,*,*,*|*[!A-Za-z0-9_.,+-]*) v="" ;;
+	*,*,*,*) ;;
+	*) v="" ;;
+	esac
+	vendor="${v%%,*}"; v="${v#*,}"
+	model="${v%%,*}"; v="${v#*,}"
+	sectors="${v%%,*}"; area="${v#*,}"
+	FGT_RD_START="${area%%+*}"; FGT_RD_COUNT="${area#*+}"
+	[ -n "$vendor" ] && [ -n "$model" ] &&
+		fgt_is_number "$sectors" && [ "$area" != "$FGT_RD_START" ] &&
+		fgt_is_number "$FGT_RD_START" && fgt_is_number "$FGT_RD_COUNT" ||
+		{ fgt_refuse "malformed $FGT_CMDLINE_RD on the kernel command line"; return 1; }
+	[ "$vendor" = "${FGT_DISK_VENDOR// /_}" ] &&
+		[ "$model" = "${FGT_DISK_MODEL// /_}" ] ||
+		{ fgt_refuse "kernel command line disk vendor or model ($vendor $model) is not $FGT_DISK_VENDOR $FGT_DISK_MODEL"; return 1; }
+	FGT_RD_SECTORS="$sectors"
+}
+
+# rootfs_data as described by the device tree, or by the kernel command
+# line on a board without the node (never by platform.sh): the size of
+# the disk must be FGT_DISK_SECTORS and the one of the disk found, the
+# area must lie inside the target slot (a container before it) and be
+# exactly the one persistent window of the witness (fgt_ww_read
+# first). Sets FGT_RD_START and FGT_RD_COUNT (sectors of the whole
+# disk).
+fgt_check_rootfs_data() {
+	local node rc size=""
+
+	FGT_RD_SECTORS=""; FGT_RD_START=""; FGT_RD_COUNT=""
+	node="$(fgt_dt_node)"
+	rc=$?
+	case $rc in
+	0) fgt_rootfs_data_dt "$node" || return 1 ;;
+	2) fgt_rootfs_data_cmdline || return 1 ;;
+	*) fgt_refuse "more than one device tree node $FGT_DT_COMPAT"; return 1 ;;
+	esac
+	[ "$FGT_RD_SECTORS" = "$FGT_DISK_SECTORS" ] ||
+		{ fgt_refuse "described disk size ($FGT_RD_SECTORS) is not $FGT_DISK_SECTORS sectors"; return 1; }
+	read size < "$FGT_SYS_CLASS_BLOCK/${FGT_DISK##*/}/size" 2>/dev/null
+	[ "$size" = "$FGT_DISK_SECTORS" ] ||
+		{ fgt_refuse "$FGT_DISK is not $FGT_DISK_SECTORS sectors ($size)"; return 1; }
 	# Aligned on the 4 KiB pages of the disk (see the top of this file)
 	[ $((FGT_RD_START % 8)) = 0 ] && [ $((FGT_RD_COUNT % 8)) = 0 ] ||
 		{ fgt_refuse "rootfs_data ($FGT_RD_START+$FGT_RD_COUNT) is not aligned on 8 sectors (4 KiB)"; return 1; }
@@ -566,11 +695,11 @@ fgt_check_rootfs_data() {
 fgt_check_disk() { # <sector 0 file>
 	local s0="$1" disk part start size flags
 
-	if [ "$FGT_DISK_KIND" = usb ]; then
+	if fgt_disk_is_sd; then
 		command -v blockdev > /dev/null ||
 			{ fgt_refuse "blockdev is missing"; return 1; }
-		disk="$(fgt_disk_usb)" ||
-			{ fgt_refuse "boot stick not found (or more than one)"; return 1; }
+		disk="$(fgt_disk_sd)" ||
+			{ fgt_refuse "$FGT_DISK_LABEL not found (or more than one)"; return 1; }
 		FGT_DISK="$FGT_DEV/$disk"
 		FGT_SLOT="$FGT_DEV/$disk$FGT_SLOT_PART"
 		part="$disk$FGT_SLOT_PART"
@@ -585,7 +714,7 @@ fgt_check_disk() { # <sector 0 file>
 		{ fgt_refuse "$FGT_SECTOR0 is missing"; return 1; }
 	fgt_is_block "$FGT_DISK" && fgt_is_block "$FGT_SLOT" ||
 		{ fgt_refuse "no slot $FGT_SLOT"; return 1; }
-	if [ "$FGT_DISK_KIND" = usb ]; then
+	if fgt_disk_is_sd; then
 		grep -qs "^$FGT_DISK" "$FGT_PROC_MOUNTS" &&
 			{ fgt_refuse "$FGT_DISK is mounted"; return 1; }
 	else
@@ -846,14 +975,14 @@ fgt_write_rootfs_data() { # [<backup>]
 	fi
 }
 
-# Right before each write: the boot disk is still the one checked (an
-# USB stick found again by its port, vendor, model and size), nothing
-# of it is mounted, and the write windows are still the expected armed
-# ones
+# Right before each write: the boot disk is still the one checked (a
+# USB stick or a SATA disk found again by its path, vendor, model and
+# size), nothing of it is mounted, and the write windows are still the
+# expected armed ones
 fgt_recheck_disk() {
-	if [ "$FGT_DISK_KIND" = usb ]; then
-		[ "$FGT_DEV/$(fgt_disk_usb)" = "$FGT_DISK" ] ||
-			{ fgt_refuse "the boot stick changed since the checks"; return 1; }
+	if fgt_disk_is_sd; then
+		[ "$FGT_DEV/$(fgt_disk_sd)" = "$FGT_DISK" ] ||
+			{ fgt_refuse "the $FGT_DISK_LABEL changed since the checks"; return 1; }
 		grep -qs "^$FGT_DISK" "$FGT_PROC_MOUNTS" &&
 			{ fgt_refuse "$FGT_DISK is mounted"; return 1; }
 	else
@@ -941,7 +1070,7 @@ fgt_do_upgrade() { # <image>
 	sum="$(get_image "$img" | tail -c +$((ofs + 1)) | head -c $len |
 		sha256sum | cut -c1-64)"
 
-	# Arm the write windows (once per boot), then the stick alone
+	# Arm the write windows (once per boot), then the sdX disk alone
 	# writable (it may be read-only by user space as well). What is
 	# dirty is written back first: nothing queued before goes out while
 	# the windows are armed.
@@ -950,7 +1079,7 @@ fgt_do_upgrade() { # <image>
 	fgt_ww_is armed ||
 		{ fgt_refuse "the write windows do not arm ($(cat "$FGT_WW" 2>/dev/null))"; fgt_ww_done; return 74; }
 	echo "Write windows armed: $(cat "$FGT_WW")"
-	if [ "$FGT_DISK_KIND" = usb ]; then
+	if fgt_disk_is_sd; then
 		blockdev --setrw "$FGT_DISK" &&
 			[ "$(blockdev --getro "$FGT_DISK")" = 0 ] ||
 			{ fgt_refuse "$FGT_DISK stays read-only"; fgt_ww_done; return 1; }

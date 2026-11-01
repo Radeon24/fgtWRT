@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# No microcode reload at boot on these appliances (the x86 hook of the
+# same name is replaced by this empty one).

@@ -1,0 +1,66 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 14:30:00 +0200
+Subject: [PATCH] x86: add an option to never write the CMOS clock
+
+On x86, GENERIC_CMOS_UPDATE is always selected: once NTP has
+synchronized the system clock, sync_hw_clock() writes the time back to
+the CMOS clock every 11 minutes through x86_platform.set_wallclock,
+even without any RTC driver.
+
+Some appliances share the CMOS clock and memory with a firmware that
+must stay in charge of them (the Fortinet FortiGate 100D keeps its boot
+loader settings in the CMOS). Add X86_CMOS_CLOCK_READ_ONLY: the clock is
+still read at boot, set_wallclock returns -ENODEV, so sync_hw_clock()
+stops at once instead of retrying every two seconds as it would with
+set_rtc_noop() (-EINVAL), and falls back to the RTC class only, through
+RTC_SYSTOHC, which these systems do not enable.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -515,6 +515,17 @@
+ 	  For old smp systems that do not have proper acpi support. Newer systems
+ 	  (esp with 64bit cpus) with acpi support, MADT and DSDT will override it
+ 
++config X86_CMOS_CLOCK_READ_ONLY
++	bool "Never write the CMOS clock"
++	help
++	  The kernel reads the CMOS clock at boot and, with an NTP
++	  synchronized clock, writes the time back to it every 11 minutes.
++	  Say Y on systems whose CMOS clock and CMOS memory belong to the
++	  firmware and must not be written by Linux: the kernel then only
++	  reads the clock. An RTC class driver may still be used to write it.
++
++	  If unsure, say N.
++
+ config X86_CPU_RESCTRL
+ 	bool "x86 CPU resource control support"
+ 	depends on X86 && (CPU_SUP_INTEL || CPU_SUP_AMD)
+--- a/arch/x86/kernel/x86_init.c
++++ b/arch/x86/kernel/x86_init.c
+@@ -38,6 +38,11 @@
+ int set_rtc_noop(const struct timespec64 *now) { return -EINVAL; }
+ void get_rtc_noop(struct timespec64 *now) { }
+ 
++#ifdef CONFIG_X86_CMOS_CLOCK_READ_ONLY
++/* -ENODEV: the NTP code then stops trying to update this clock */
++static int set_rtc_nodev(const struct timespec64 *now) { return -ENODEV; }
++#endif
++
+ static __initconst const struct of_device_id of_cmos_match[] = {
+ 	{ .compatible = "motorola,mc146818" },
+ 	{}
+@@ -147,7 +152,11 @@
+ 	.calibrate_cpu			= native_calibrate_cpu_early,
+ 	.calibrate_tsc			= native_calibrate_tsc,
+ 	.get_wallclock			= mach_get_cmos_time,
++#ifdef CONFIG_X86_CMOS_CLOCK_READ_ONLY
++	.set_wallclock			= set_rtc_nodev,
++#else
+ 	.set_wallclock			= mach_set_cmos_time,
++#endif
+ 	.iommu_shutdown			= iommu_shutdown_noop,
+ 	.is_untracked_pat_range		= is_ISA_range,
+ 	.nmi_init			= default_nmi_init,

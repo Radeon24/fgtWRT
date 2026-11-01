@@ -1,0 +1,244 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 18:00:00 +0200
+Subject: [PATCH] hwmon: w83627ehf: optionally write the SmartFan III+ table
+ of the W83627DHG-P
+
+Add the sf3p_write module parameter (default off, read only at run
+time). With it, on the W83627DHG-P:
+- pwm2_auto_point[1-3]_temp, pwm2_auto_point[1-3]_pwm and
+  pwm2_auto_channels_temp become writable: temperatures strictly
+  ascending and at most 100 C, duty cycles ascending, the top one at
+  least 128, each write checked against the table read back from the
+  chip (a new table is written raising from the top, lowering from the
+  bottom);
+- pwmN_enable = 5 routes the channel to the table; 1-4 set the mode
+  field first, then take the channel off the table.
+
+Every register written is a volatile hardware monitor register, set
+again by the boot firmware at the next reset.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/drivers/hwmon/w83627ehf.c
++++ b/drivers/hwmon/w83627ehf.c
+@@ -65,6 +65,11 @@
+ module_param(force_id, ushort, 0);
+ MODULE_PARM_DESC(force_id, "Override the detected device ID");
+ 
++static bool sf3p_write;
++module_param(sf3p_write, bool, 0444);
++MODULE_PARM_DESC(sf3p_write,
++		 "W83627DHG-P: allow writes to the SmartFan III+ table and routing (default: read only)");
++
+ #define DRVNAME "w83627ehf"
+ 
+ /*
+@@ -234,6 +239,10 @@
+ #define W83627DHG_P_SF3P_FANSEL(ch)	((ch) == 1 ? 0x20 : 0x10)
+ #define W83627DHG_P_SF3P_TEMPSEL	0x0e
+ 
++/* Limits of the writable table (sf3p_write) */
++#define W83627DHG_P_SF3P_TEMP_MAX	100	/* degrees C */
++#define W83627DHG_P_SF3P_PWM3_MIN	128	/* top duty cycle floor */
++
+ static const char *const w83667hg_b_temp_label[] = {
+ 	"SYSTIN",
+ 	"CPUTIN",
+@@ -904,7 +913,18 @@
+ 	if (data->have_sf3p && val == 5) {
+ 		if (w83627ehf_sf3p_routed(data, channel))
+ 			return 0;
+-		return -EINVAL;
++		if (!sf3p_write || channel >= 2)
++			return -EINVAL;
++		/* Route the channel to the SmartFan III+ table */
++		mutex_lock(&data->update_lock);
++		reg = w83627ehf_read_value(data, W83627DHG_P_REG_SF3P_SEL);
++		reg |= W83627DHG_P_SF3P_FANSEL(channel);
++		w83627ehf_write_value(data, W83627DHG_P_REG_SF3P_SEL, reg);
++		data->sf3p_sel = reg;
++		data->pwm_enable[channel] = 5;
++		data->valid = false;
++		mutex_unlock(&data->update_lock);
++		return 0;
+ 	}
+ 
+ 	if (!val || val < 0 ||
+@@ -919,6 +939,17 @@
+ 	reg |= (val - 1) << W83627EHF_PWM_ENABLE_SHIFT[channel];
+ 	w83627ehf_write_value(data, W83627EHF_REG_PWM_ENABLE[channel],
+ 			      reg);
++	/*
++	 * Mode set first, then the channel taken off the SmartFan III+
++	 * table, so that the pin goes straight to the new mode.
++	 */
++	if (sf3p_write && w83627ehf_sf3p_routed(data, channel)) {
++		reg = w83627ehf_read_value(data, W83627DHG_P_REG_SF3P_SEL);
++		reg &= ~W83627DHG_P_SF3P_FANSEL(channel);
++		w83627ehf_write_value(data, W83627DHG_P_REG_SF3P_SEL, reg);
++		data->sf3p_sel = reg;
++		data->valid = false;
++	}
+ 	mutex_unlock(&data->update_lock);
+ 	return 0;
+ }
+@@ -1161,20 +1192,132 @@
+ 	return sprintf(buf, "%d\n", src < 3 ? 1 << src : 0);
+ }
+ 
+-static SENSOR_DEVICE_ATTR(pwm2_auto_point1_temp, 0444, show_sf3p_temp,
+-	    NULL, 0);
+-static SENSOR_DEVICE_ATTR(pwm2_auto_point2_temp, 0444, show_sf3p_temp,
+-	    NULL, 1);
+-static SENSOR_DEVICE_ATTR(pwm2_auto_point3_temp, 0444, show_sf3p_temp,
+-	    NULL, 2);
+-static SENSOR_DEVICE_ATTR(pwm2_auto_point1_pwm, 0444, show_sf3p_pwm,
+-	    NULL, 0);
+-static SENSOR_DEVICE_ATTR(pwm2_auto_point2_pwm, 0444, show_sf3p_pwm,
+-	    NULL, 1);
+-static SENSOR_DEVICE_ATTR(pwm2_auto_point3_pwm, 0444, show_sf3p_pwm,
+-	    NULL, 2);
+-static SENSOR_DEVICE_ATTR(pwm2_auto_channels_temp, 0444, show_sf3p_channels,
+-	    NULL, 1);
++/*
++ * Writes (sf3p_write only): temperatures strictly ascending and at most
++ * W83627DHG_P_SF3P_TEMP_MAX, duty cycles ascending, the top one at least
++ * W83627DHG_P_SF3P_PWM3_MIN; each write is checked against the values
++ * read back from the chip, so a new table is written point by point in an
++ * order that keeps it valid (raise from the top, lower from the bottom).
++ */
++static ssize_t
++store_sf3p_temp(struct device *dev, struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	struct w83627ehf_data *data = dev_get_drvdata(dev);
++	int nr = to_sensor_dev_attr(attr)->index;
++	u8 t[3];
++	long val;
++	int err, i;
++
++	if (!sf3p_write)
++		return -EPERM;
++	err = kstrtol(buf, 10, &val);
++	if (err < 0)
++		return err;
++	if (val < 0 || val > W83627DHG_P_SF3P_TEMP_MAX * 1000)
++		return -EINVAL;
++	val = DIV_ROUND_CLOSEST(val, 1000);
++
++	mutex_lock(&data->update_lock);
++	for (i = 0; i < 3; i++)
++		t[i] = w83627ehf_read_value(data, W83627DHG_P_REG_SF3P_TEMP(i));
++	if ((nr > 0 && val <= t[nr - 1]) || (nr < 2 && val >= t[nr + 1])) {
++		err = -EINVAL;
++		goto out;
++	}
++	w83627ehf_write_value(data, W83627DHG_P_REG_SF3P_TEMP(nr), val);
++	data->sf3p_temp[nr] = val;
++	data->valid = false;
++out:
++	mutex_unlock(&data->update_lock);
++	return err ? err : count;
++}
++
++static ssize_t
++store_sf3p_pwm(struct device *dev, struct device_attribute *attr,
++	       const char *buf, size_t count)
++{
++	struct w83627ehf_data *data = dev_get_drvdata(dev);
++	int nr = to_sensor_dev_attr(attr)->index;
++	u8 p[3];
++	unsigned long val;
++	int err, i;
++
++	if (!sf3p_write)
++		return -EPERM;
++	err = kstrtoul(buf, 10, &val);
++	if (err < 0)
++		return err;
++	if (val > 255 || (nr == 2 && val < W83627DHG_P_SF3P_PWM3_MIN))
++		return -EINVAL;
++
++	mutex_lock(&data->update_lock);
++	for (i = 0; i < 3; i++)
++		p[i] = w83627ehf_read_value(data, W83627DHG_P_REG_SF3P_PWM(i));
++	if ((nr > 0 && val < p[nr - 1]) || (nr < 2 && val > p[nr + 1])) {
++		err = -EINVAL;
++		goto out;
++	}
++	w83627ehf_write_value(data, W83627DHG_P_REG_SF3P_PWM(nr), val);
++	data->sf3p_pwm[nr] = val;
++	data->valid = false;
++out:
++	mutex_unlock(&data->update_lock);
++	return err ? err : count;
++}
++
++static ssize_t
++store_sf3p_channels(struct device *dev, struct device_attribute *attr,
++		    const char *buf, size_t count)
++{
++	struct w83627ehf_data *data = dev_get_drvdata(dev);
++	unsigned long val;
++	u16 reg;
++	int err, src;
++
++	if (!sf3p_write)
++		return -EPERM;
++	err = kstrtoul(buf, 10, &val);
++	if (err < 0)
++		return err;
++	switch (val) {
++	case 1:
++		src = 0;
++		break;
++	case 2:
++		src = 1;
++		break;
++	case 4:
++		src = 2;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	mutex_lock(&data->update_lock);
++	reg = w83627ehf_read_value(data, W83627DHG_P_REG_SF3P_SEL);
++	reg = (reg & ~W83627DHG_P_SF3P_TEMPSEL) | (src << 1);
++	w83627ehf_write_value(data, W83627DHG_P_REG_SF3P_SEL, reg);
++	data->sf3p_sel = reg;
++	data->valid = false;
++	mutex_unlock(&data->update_lock);
++	return count;
++}
++
++static SENSOR_DEVICE_ATTR(pwm2_auto_point1_temp, 0644, show_sf3p_temp,
++	    store_sf3p_temp, 0);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point2_temp, 0644, show_sf3p_temp,
++	    store_sf3p_temp, 1);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point3_temp, 0644, show_sf3p_temp,
++	    store_sf3p_temp, 2);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point1_pwm, 0644, show_sf3p_pwm,
++	    store_sf3p_pwm, 0);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point2_pwm, 0644, show_sf3p_pwm,
++	    store_sf3p_pwm, 1);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point3_pwm, 0644, show_sf3p_pwm,
++	    store_sf3p_pwm, 2);
++static SENSOR_DEVICE_ATTR(pwm2_auto_channels_temp, 0644, show_sf3p_channels,
++	    store_sf3p_channels, 1);
+ 
+ static ssize_t
+ cpu0_vid_show(struct device *dev, struct device_attribute *attr, char *buf)
+@@ -1225,8 +1368,9 @@
+ 	if (devattr->show == show_sf3p_temp ||
+ 	    devattr->show == show_sf3p_pwm ||
+ 	    devattr->show == show_sf3p_channels)
+-		return data->have_sf3p && (data->has_fan & (1 << 1)) &&
+-		       data->pwm_num >= 2 ? a->mode : 0;
++		return !data->have_sf3p || !(data->has_fan & (1 << 1)) ||
++		       data->pwm_num < 2 ? 0 :
++		       sf3p_write ? a->mode : a->mode & 0444;
+ 
+ 	if (sda->index < 2 &&
+ 		(devattr->show == show_fan_stop_time ||

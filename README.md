@@ -52,6 +52,11 @@ It adds a `fortisoc` target[^fortisoc-name] to OpenWrt for the Fortinet **FortiS
 
 The CPU clock depends on the model: the 60D and the 90D share the same SoC2 but run at different clocks.
 
+The **FortiGate 100D** is different: an x86 PC (Intel Atom, no Fortinet SoC, no network processor). It uses
+the `fortigate` subtarget of OpenWrt's `x86` target, and the hardware it puts to work is the **Broadcom
+BCM53314 switch** (bridging, address table, VLANs, link aggregation, QoS and more, see the
+[FortiGate 100D section](#devices)), through a DSA driver, `bcm5331x-dsa`.
+
 [^fortisoc-name]: The target name `fortisoc` and its subtargets (`fsoc1`, `fsoc2`, `fsoc3`) are historical,
     taken from the marking of the Fortinet ASICs; they have no connection with the Fortinet product currently
     sold under the FortiSOC name.
@@ -78,14 +83,16 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 | FortiGate 90D | SoC2 | 900 MHz | NP4Lite | on-chip VPN engine | 2 × BCM53128 | ✅ **Available** |
 | FortiGate 60E | SoC3 | 1008 MHz | NP6Lite | on-chip engine (no driver) | BCM53128 | ✅ **Available** |
 | FortiGate 60C | SoC1 (FS1) | 525 MHz | NPLite | VPN_LITE | Marvell 88E6161 | 📋 **Planned** |
-| FortiGate 100D | x86 PC (no Fortinet SoC) | 1.8 GHz | none | CP8 (no driver) | BCM53314 | 🚧 **Work in progress** |
+| FortiGate 100D | x86 PC (no Fortinet SoC) | 1.8 GHz | none | CP8 (no driver) | BCM53314 | 🧪 **Preview** |
 
 - **Available**: image built from this repository, installable with persistent storage (60D, 90D, 60E).
   The published 60E image is built from revision `r0+37780-0b2480e6ba2` (commit `0b2480e6ba2`); the
   published 60D and 90D images from revision `r37432-59b1585d5e1` (commit `59b1585d5e1`). Read
   [Known limitations](#known-limitations) before building a 60D or 90D image from a later revision.
+- **Preview** (100D): image built from this repository, installable with persistent storage and validated on
+  one unit; no published revision yet, so no pinned revision to build from (see
+  [Getting started](#getting-started)).
 - **Planned**: no OpenWrt profile in the tree yet.
-- **Work in progress**: hardware bring-up in progress, no OpenWrt image yet.
 
 ## Hardware acceleration
 
@@ -135,6 +142,11 @@ NPLite and NP4Lite share one driver, but they are different chips:
 the NP4Lite adds inline IPsec and switch-port offload. The IPsec limitations are listed in
 [Known limitations](#known-limitations).
 
+**FortiGate 100D.** The 100D has no network processor, so none of the columns above applies to it: routing,
+NAT and crypto run on the CPU, and the CP8 crypto engine has no driver in the image. What it offloads is
+**bridging** and the features around it, in its BCM53314 switch chip (see its section in
+[Devices](#devices)).
+
 ### Crypto engines
 
 | Feature (Linux crypto API) | VPN_LITE<br>(SoC1) | VPN engine<br>(SoC2) | SoC3<br>(no driver) | Notes |
@@ -161,8 +173,8 @@ the NP4Lite adds inline IPsec and switch-port offload. The IPsec limitations are
 
 The exact steps depend on the model: the boot loader menus and their keys differ between BIOS versions.
 The procedure below is the common outline; read the **installation notes** of your model in
-[Devices](#devices) before you start. The notes for the 60D, the 90D and the 60E describe the validated
-path; for the other models they are _to be completed_.
+[Devices](#devices) before you start. The notes for the 60D, the 90D, the 60E and the 100D describe the
+validated path; for the 60C they are _to be completed_.
 
 ### Requirements
 
@@ -187,11 +199,11 @@ make menuconfig
 
 In `make menuconfig`, select:
 
-| Option | FortiGate 60D | FortiGate 90D | FortiGate 60E |
-|---|---|---|---|
-| Target System | `Fortinet FortiSOC` | `Fortinet FortiSOC` | `Fortinet FortiSOC` |
-| Subtarget | `FortiSOC2` | `FortiSOC2` | `FortiSOC3` |
-| Target Profile | `FortiGate 60D` | `FortiGate 90D` | `FortiGate 60E` |
+| Option | FortiGate 60D | FortiGate 90D | FortiGate 60E | FortiGate 100D |
+|---|---|---|---|---|
+| Target System | `Fortinet FortiSOC` | `Fortinet FortiSOC` | `Fortinet FortiSOC` | `x86` |
+| Subtarget | `FortiSOC2` | `FortiSOC2` | `FortiSOC3` | `Fortinet FortiGate (x86)` |
+| Target Profile | `FortiGate 60D` | `FortiGate 90D` | `FortiGate 60E` | `FortiGate 100D` |
 
 The device profile brings the drivers, the firewall with hardware flow offload, IPsec (IPv4 and IPv6, with
 the outbound offload of the NP: NP4Lite on the 60D and the 90D, NP6Lite on the 60E) and the installer. It
@@ -221,12 +233,16 @@ On FortiSOC2, the ramdisk compression also defaults to gzip, which the boot load
 [Image layout](#image-layout)) and which the build checks. All the measurements below were made with these
 packages built in.
 
+The 100D profile is described in its own section ([Devices](#devices)): it brings the switch driver, the
+tools of what the switch offloads, LuCI and the fan control, but neither WireGuard nor OpenVPN.
+
 **Which revision builds the published image.**
 
 | Model | Revision to check out before `make menuconfig` | Notes |
 |---|---|---|
 | 60D, 90D | commit `59b1585d5e1` | see [Known limitations](#known-limitations) for later revisions |
 | 60E | commit `0b2480e6ba2` (`r0+37780-0b2480e6ba2`) | exact recipe below |
+| 100D | head of the `fgtwrt` branch | no image published and no revision pinned yet: this README describes the state of the branch |
 
 Then build:
 
@@ -237,10 +253,24 @@ make -j"$(nproc)"
 The image is `bin/targets/fortisoc/<subtarget>/openwrt-fortisoc-<subtarget>-<device>-initramfs-kernel.bin`;
 for the 60D, `bin/targets/fortisoc/fsoc2/openwrt-fortisoc-fsoc2-fortinet_fg-60d-initramfs-kernel.bin`
 (90D: `…-fortinet_fg-90d-initramfs-kernel.bin`; 60E:
-`bin/targets/fortisoc/fsoc3/openwrt-fortisoc-fsoc3-fortinet_fg-60e-initramfs-kernel.bin`).
+`bin/targets/fortisoc/fsoc3/openwrt-fortisoc-fsoc3-fortinet_fg-60e-initramfs-kernel.bin`; 100D:
+`bin/targets/x86/fortigate/openwrt-x86-fortigate-fortinet_fg-100d-initramfs-kernel.bin`).
 
 This **single file** is used for both steps: the TFTP boot to RAM and the installation with `sysupgrade`.
-On the 60D and the 90D, the build refuses a kernel file too large for the boot loader (see the 60D section).
+On the 60D and the 90D, the build refuses a kernel file too large for the boot loader (see the 60D section);
+the 100D build has the same kind of checks (see its section).
+
+On the 100D, `make menuconfig` can be replaced by the three target lines, without any other setting:
+
+```sh
+cat > .config <<'EOF'
+CONFIG_TARGET_x86=y
+CONFIG_TARGET_x86_fortigate=y
+CONFIG_TARGET_x86_fortigate_DEVICE_fortinet_fg-100d=y
+EOF
+make defconfig
+make -j"$(nproc)"
+```
 
 <details>
 <summary><b>Exact recipe of the published 60E image</b></summary>
@@ -298,7 +328,12 @@ Pre-built images may be published later; until then, build from source.
    Log in with `ssh root@192.168.1.1`, or with the web interface at `http://192.168.1.1` (LuCI is in the
    device profiles).
 
+   The 100D has its own layout (`port1`…`port16` bridged as LAN, `wan1` as WAN and `wan2` as a second DHCP
+   WAN; `dmz`, `mgmt`, `ha1` and `ha2` not configured): see its section.
+
 Everything runs in RAM: **nothing is written to the appliance**, and all changes are lost at the next reboot.
+(100D exception: this holds on a unit where OpenWrt was never installed. Once partition 2 holds OpenWrt, the
+image mounts and writes its persistent storage; see the 100D installation notes.)
 This is the recommended way to check that your unit works before installing.
 
 ### 3. Install with `sysupgrade` (persistent)
@@ -353,7 +388,8 @@ Run `sysupgrade` again from the installed OpenWrt, with a newer image built the 
 ### 5. Go back to the stock firmware
 
 - **Stock firmware still in its slot.** In the boot loader menu, choose **[B]** to switch the default
-  boot partition back to it, then restore your configuration backup if needed.
+  boot partition back to it, then restore your configuration backup if needed. On the 100D the stock
+  firmware is in partition 1 and OpenWrt in partition 2; **[B]** again brings OpenWrt back.
 - **Otherwise.** Reinstall the official `.out` image with the Fortinet procedure for your model, then
   restore your configuration backup.
 
@@ -949,9 +985,10 @@ _To be completed._
 </details>
 
 <details>
-<summary><b>FortiGate 100D</b> — x86 PC · no network processor — 🚧 Work in progress</summary>
+<summary><b>FortiGate 100D</b> — x86 PC · no network processor · BCM53314 switch — 🧪 Preview</summary>
 
-An x86 PC rather than a Fortinet SoC appliance.
+An x86 PC rather than a Fortinet SoC appliance. The image is built from the `fortigate` subtarget of the `x86`
+target; the boot loader runs a kernel file from a firmware container, as on the other models.
 
 ### Specifications
 
@@ -961,27 +998,195 @@ An x86 PC rather than a Fortinet SoC appliance.
 | CPU | Intel Atom D525 (x86-64, 2 cores / 4 threads) @ 1.8 GHz |
 | RAM | 4 GiB |
 | Network processor | none |
-| Crypto | Fortinet CP8 (PCI); no driver |
-| Switch | Broadcom BCM53314 (PCI), 20 ports; needs a custom driver, not supported yet |
-| Direct NICs | 4 × Intel 82574L (`e1000e`): `wan1`, `dmz`, and two that are probably the links to the switch |
+| Crypto | Fortinet CP8 (PCI); no driver in the image |
+| Switch | Broadcom BCM53314 (PCI), 20 ports, driven by the DSA driver `bcm5331x-dsa` |
+| Direct NICs | 4 × Intel 82574L (`e1000e`): `wan1`, `dmz`, and two that are the links to the switch (the second one is used only by option `lag`) |
 | Ethernet ports | 22 × 1 GbE: `wan1`, `dmz` (Intel NICs); `wan2`, `mgmt`, `ha1`, `ha2`, `port1`…`port16` (switch) |
 | Boot disk | internal SATA SSD, 16 GB |
-| Boot flash | SPI flash, 512 KiB, holds the BIOS (read-only) |
-| USB | chipset USB host controllers (driver loaded; no device tested) |
+| Boot flash | SPI flash, 512 KiB, holds the boot loader (read-only) |
+| USB | host controllers (EHCI, UHCI); USB management port on a NetChip NET2282 (device side) |
 | Console | serial (COM1), 9600 8N1 |
-| Hardware monitoring | Winbond W83627DHG-P super-IO: fan speed readable; the fan is regulated by the chip itself |
-| LEDs / buttons | not identified yet |
-| RTC | CMOS; not used by our kernels yet |
+| Hardware monitoring | Winbond W83627DHG-P super-I/O: fan speed and temperatures; the fan is regulated by the chip itself: from the table of the boot firmware by default, from a table written by the `fgtwrt-base` package with a profile |
+| LEDs | STATUS; link speed and activity LEDs of `port1`…`port16` set up through their PHYs |
+| RTC | CMOS; never written by our kernels |
 | Power | about 28–30 W under the stock firmware (smart plug reading) |
 
-### Status
+### Hardware topology
 
-- **Mainline Linux boots in RAM** through the stock boot loader; nothing is written to the appliance.
-- **Switch bring-up in progress**: no switch port carries traffic under our kernels yet.
-- **No OpenWrt image yet**, and no code in this repository: the porting work is tracked separately.
-- Routing, NAT and crypto would be software only, bounded by the CPU.
+```mermaid
+flowchart LR
+  CPU["CPU<br/>Atom D525 · ICH8M"]
+  CP8["CP8<br/>no driver"]
+  SW["BCM53314 switch"]
+  CPU --- CP8
+  CPU -- "82574L" --- WAN1(["wan1"])
+  CPU -- "82574L" --- DMZ(["dmz"])
+  CPU -- "82574L · CPU link (ge2)" --- SW
+  CPU -. "82574L · second CPU link (ge3, option lag)" .- SW
+  SW --- WAN2(["wan2"])
+  SW --- MGMT(["mgmt"])
+  SW --- HA(["ha1, ha2"])
+  SW --- LAN(["port1 … port16"])
+```
 
-Benchmarks and installation notes: _to be completed_.
+**Default layout.** `wan1` is the WAN (DHCP client) and `wan2` a second WAN (DHCP client, metric 10, in no
+firewall zone: add it to the `wan` zone to use it). `port1`…`port16` are bridged in `br-lan`, with no VLAN
+filtering by default. `dmz`, `mgmt`, `ha1` and `ha2` are **independent interfaces, left unconfigured**: no
+address is given to a port nobody asked for (the stock address of MGMT would overlap the LAN). On an image built
+without the switch package (`kmod-bcm5331x-dsa`), `dmz` becomes the LAN port; with the package, nothing replaces
+`br-lan` if the driver does not load (see [Switch driver and options](#switch-driver-and-options)).
+
+### Image layout
+
+Same principle as the other models: the boot loader reads two files from the firmware container, the **kernel
+file** (the kernel alone, behind a small entry stub) and the **ramdisk file** (`rootfs.gz`, loaded unchanged at
+16 MiB), which holds OpenWrt's root file system. The container fills the first 32 MiB of the firmware slot;
+the rest of the 256 MiB slot is the persistent storage. The build refuses a gzip-less ramdisk, a
+`rootfs.gz` above **25 404 233 bytes** (the largest one that was relayed and unpacked) and a kernel payload
+ending beyond the highest address known to boot.
+
+### Switch driver and options
+
+The BCM53314 is set up at boot by `/etc/init.d/fg100d-switch` (before the network), then driven by the DSA driver
+`bcm5331x-dsa`: **one 802.1Q VLAN per front port**, a VLAN-based tagger that carries the port in the VID, and
+**bridges, address tables, link aggregation and more left to the switch** wherever the driver can offload them.
+What the driver does not offload is forwarded by the CPU (software bridge). Every write to the switch is volatile
+(lost at the next reset of the switch) and read back; if a step fails, the later ones are not tried and the
+driver is not loaded.
+
+The options live in `/etc/config/fg100d-switch`, are read **at the next boot**, and a combination the
+driver refuses loads nothing (and is logged; **see the warning below the table**). Defaults:
+
+| Option | Default | What it does |
+|---|---|---|
+| `enabled` | 1 | 0 = nothing is loaded; the switch is left as found and the front ports have no network device |
+| `phyled` | 1 | LED set-up of the PHYs of `port1`…`port16` |
+| `qinq` | 1 | double tagging (802.1ad outer tag on the CPU link): user VLANs on the front ports and VLAN-aware bridges; 0 refuses VLAN filtering |
+| `hwbridge` | 1 | VLAN-unaware bridges of front ports are forwarded by the switch |
+| `fdb` | 1 | address table of the offloaded bridges (needs `hwbridge`) |
+| `vlanbr` | 1 | the first VLAN-aware bridge of front ports is offloaded too (needs `hwbridge` and `qinq`; at most 16 user VIDs) |
+| `lagf` | 2 | hardware link aggregation of front ports in an offloaded bridge: 1 = trunk group, 2 = + LACP frames; 0 = software LAG (needs `hwbridge`) |
+| `mgmt` | 1 | MGMT as a DSA user port (`mgmt`, an interface of its own) |
+| `ledram` | 0 | hands the LEDs of `wan2`, MGMT, `ha1` and `ha2` to the LED processor of the switch (start from the disk only; they then stay lit) |
+| `lag` | **0** | `ge3` as a second CPU link and LAG of the CPU links; **not with `mgmt`**; the bond of the two NICs is left to the network configuration (bonding driver) |
+| `llproto` | **0** | link-local protocols of the members of offloaded bridges, mask: 1 = STP, 2 = LLDP, 4 = EAPOL; 0 = dropped in the bridge VLAN (needs `hwbridge`) |
+| `mdb` | **0** | multicast groups of offloaded bridges forwarded by the switch (needs `fdb`); IGMP/MLD frames are always flooded to the host |
+| `mirror` | **0** | offload of `tc matchall` mirred between front ports |
+| `stats`, `stats_ms` | 0 | hardware statistics of the front ports from the MIB (reads only); 0 = software counters of DSA; period 1000–30000 ms |
+| `link` | 0 | 1 = the link of the front ports follows the port state; 2 = + real port PHYs for `ethtool -s` and the MAC speed, duplex and pause |
+| `vid_base` | 100 | first VID of the block used for the front ports (21–3976) |
+| `qos` | **0** | QoS offloaded to the switch: DCB, `tc ets`, `tc tbf`, flower storm control of the front ports |
+| `fp` | **0** | `tc flower`, matchall police and `ethtool ntuple` rules of the front ports, on the field processor |
+| `ptp` | **0** | time stamping: 1 = read only, 2 = + PTP clock on the CMIC timer, 3 = + ingress stamping armed on the CPU link; `ptp_tick_ps` sets the tick |
+| `cmic` | **0** | packet DMA of the CMIC, **a test-only option** (0 or 2; `cmic_stage` and the `cmic_tx_*`, `cmic_rx_*` and `cmic_cpu_vlan` values apply to 2); see [Known limitations](#known-limitations) |
+
+> [!WARNING]
+> **A refused value leaves no network access.** If the driver is not loaded (a value out of range, a refused
+> combination, `enabled` set to 0, a failed step), the front ports have no network device: `br-lan` is empty, `dmz`
+> is not configured and `wan1` rejects incoming connections. Only the serial console is left. To recover, log in
+> there, remove the option (`uci delete fg100d-switch.switch.<option>`, `uci commit fg100d-switch`) and reboot;
+> the kernel log names the refused value. The `cmic_*` values are checked only when `cmic` is 2.
+
+The options in bold are **off by default** and available in the shipped image. `qos`, `fp` and `mirror` can also be
+changed at run time (`/sys/module/bcm5331x_dsa/parameters/`). Example:
+
+```sh
+uci set fg100d-switch.switch.qos=1
+uci commit fg100d-switch
+reboot
+```
+
+(`lag`, `llproto`, `mdb`, `mirror`, `ptp` and `cmic` are set the same way; the file lists every option with its
+limits.) Read [Known limitations](#known-limitations) before turning on `llproto=4`, `lag` or `cmic`.
+
+### Packages of the profile
+
+The profile brings the drivers, the switch driver, `luci` and the fan control, and the tools of what the switch
+offloads:
+
+| Package (100D profile) | For |
+|---|---|
+| `kmod-bcm5331x-dsa` | the switch driver and its boot script |
+| `kmod-leds-fg100d`, `kmod-hwmon-w83627ehf`, `kmod-i2c-i801` | LEDs, super-I/O (fan, temperatures), SMBus |
+| `fgtwrt-base`, `luci`, `luci-app-fgtwrt` | fan profiles, web interface |
+| `fortigate-dualslot`, `e2fsprogs`, `blockdev`, `kmod-fs-vfat` | installer, persistent storage, FAT32 USB sticks |
+| `kmod-usb-net2280`, `usbgadget-acm`, `usbgadget-ncm` | USB management port (device side) |
+| `ip-full`, `ip-bridge`, `tc-full`, `ethtool-full`, `dcb`, `kmod-sched-core`, `kmod-sched-ets`, `kmod-sched-flower`, `kmod-sched-act-police`, `kmod-sched-act-pedit` | tools and `tc` modules of what the switch offloads |
+| `kmod-bonding` | bonding (hardware LAG) |
+| `lldpd`, `hostapd-mbedtls` | LLDP and 802.1X (full `hostapd`); **installed but disabled at the first boot** and again after a `sysupgrade` that keeps the configuration: enable them yourself |
+
+### Benchmarks
+
+Only one figure is published: **941 Mbit/s between two front ports forwarded by the switch** (hardware bridge,
+measured on three boots of earlier test images of this driver, not on the current one; the CPU link carries no such
+traffic). No routing, NAT or crypto benchmark yet.
+
+### OpenWrt features
+
+Most features were validated on test images built from the same sources. Those images carry a test overlay: static
+addresses, no DHCP client or server, no router advertisement, MGMT down, STP frames filtered on the front ports, fan
+profile `quiet`. The default network configuration above was then booted as such: an image built from the three target lines, from RAM on a unit with an empty partition 2, installed with `sysupgrade -n`, then from the disk (3 boots, one from cold). For that run the image was copied in by `wan1`, not from the LAN. The test
+image of the current driver was checked on the disk (3 boots, one from cold), and with `qos`, `fp`, `llproto=4`,
+`ptp=2` and `cmic=2` switched on alone, once each, before the driver took its present name (`qos` again after). That
+is a loading check only: see [Known limitations](#known-limitations).
+
+| Feature | Status |
+|---|---|
+| Boot from RAM of a test image without the description of the persistent area, installation with `sysupgrade`, boot from the disk, back to the stock firmware with [B] | ✅ Validated |
+| First installation from the image built here: boot from RAM, `sysupgrade -n`, default network | ✅ Validated |
+| Persistent storage (overlay, ext4) | ✅ Validated |
+| Switch set-up at boot, front ports as DSA ports (`port1`…`port16`, `wan2`, `ha1`, `ha2`) | ✅ Validated |
+| Hardware bridge `br-lan`, address table, VLAN-aware bridge (`hwbridge`, `fdb`, `vlanbr`) | ✅ Validated |
+| Double tagging (`qinq`) | ✅ Validated |
+| Hardware LAG of front ports with LACP (`lagf`) | ✅ Validated |
+| Multicast groups (`mdb`), port mirroring (`mirror`) | ✅ Validated on test images; off in the shipped image |
+| LLDP frames through offloaded bridges (`llproto`, mask 2) | ✅ Validated on test images; off in the shipped image |
+| EAPOL / 802.1X (`llproto` mask 4) | ❌ Not demonstrated (see [Known limitations](#known-limitations)) |
+| QoS and field processor rules (`qos`, `fp`) | 🧪 Partial: validated on test images; the shipped image was only loaded with them |
+| LAG of the CPU links (`lag`) | 🧪 Partial: validated on test images; off in the shipped image, excludes `mgmt` |
+| PTP clock (`ptp`) | 🧪 Partial: clock and time stamping hardware read and armed; no PTP frame reaches the host |
+| Packet DMA of the CMIC (`cmic`) | 🧪 Test-only option: frames received by the DMA, nothing reaches the network stack |
+| MGMT as a DSA port (`mgmt`) | ✅ Validated from the disk |
+| Link LEDs of `port1`…`port16`, STATUS LED | ✅ Validated by a visual check |
+| LEDs of `wan2` and `ha1` | ❌ Speed LED off; link/activity LED off, flashing on activity only |
+| Fan control (`fgtwrt-base`, profile `default`: table of the boot firmware) | 🧪 Partial: CPU temperature calibration provisional |
+| USB management port (device side, serial console) | ✅ Validated |
+| USB host ports | 🧪 Partial: read-only tests of a USB stick |
+| Crypto engine (CP8) | ❌ No driver in the image |
+
+### Installation notes
+
+> [!WARNING]
+> On the 100D, OpenWrt is always installed into **partition 2** of the internal SATA SSD, which then becomes the
+> default boot partition. **Before installing, make sure the stock firmware runs from partition 1**: if needed, use
+> **[B]** in the boot loader menu to switch to it, and check that it boots. Anything in partition 2 is overwritten.
+> The installer checks that the disk is the expected one (model, size and AHCI port).
+
+- The boot loader menu is the one of the 60C family. **[G]** fetches the image by TFTP and boots it from RAM; **[B]**
+  switches the default boot partition. **TFTP goes through MGMT only** (the boot loader says
+  `Valid link is not established!` otherwise). `mgmt` stays unconfigured under OpenWrt: after the boot from RAM,
+  move your cable to one of `port1`…`port16` to reach `192.168.1.1`. **Do not press Enter at the menu** (it would
+  choose **[G]**).
+  **Never touch the other entries**: **[F]** formats the disk, and the **[I]** sub-menu is persistent boot loader
+  configuration, in which **[S]** (console speed) is stored and can leave the console silent for good.
+- Give the image a short name on the TFTP server (such as `image.out`): only names of that form were tried with
+  this boot loader, not the long name of the build.
+- Boot from RAM first, then install from that RAM system with `sysupgrade -n` (see
+  [Getting started](#getting-started)). The installer refuses to write if partition 2 is the default boot and does
+  not hold OpenWrt, or if partition 1 holds no firmware.
+- Once partition 2 holds OpenWrt, **do not boot an OpenWrt image from RAM any more**: the image carries the
+  description of the persistent area in its command line, so it mounts and writes the persistent storage of
+  partition 2 (this happened on our test setup with a test image). Update from the installed OpenWrt with
+  `sysupgrade`. Booting the image built here from RAM on a unit never installed, and installing from that system,
+  was exercised once, on a unit whose partition 2 had been erased.
+- The first boot after `sysupgrade -n` formats the persistent area (ext4, 224 MiB) and generates new SSH host keys.
+- Boot time: on the image built here, the console prompt came about 67 s after a `reboot`. The kernel part took
+  about 40 s on each of the 3 boots from the disk, cold start included. The network was not timed.
+- The console is very verbose during and after the boot: the kernel messages stay on at 9600 baud. On the first boot
+  after `sysupgrade -n`, `dmesg -n 1` sent to the console had not returned after 120 s; on the next two boots it
+  returned 42 s and 55 s after the end of the boot messages. Wait for it, or use the network.
+- The stock firmware stays in partition 1. To go back, choose **[B]** in the boot loader menu: OpenWrt and its overlay
+  stay in partition 2, and **[B]** again brings them back.
 
 </details>
 
@@ -1079,7 +1284,51 @@ Benchmarks and installation notes: _to be completed_.
   and the 90D, has not been measured on the 60E yet.
 - **Boot time**: about 33 s from power-on to the web interface.
 
-**Other models.** The 60C and the 100D have no OpenWrt image.
+**100D.**
+
+- **Preview, one unit.** No image is published and no revision is pinned. Everything below was observed on one
+  unit, behind one test switch. Routing, NAT and crypto run on the CPU (no network processor; the CP8 has no
+  driver in the image). No routing or NAT benchmark is published for this model yet.
+- **Options are off by default, and most of them are test-grade.** `qos`, `fp`, `ptp`, `llproto`, `mdb`, `mirror`,
+  `lag` and `cmic` are in the image so that they can be switched on later with UCI; the shipped image was checked
+  once with each of `qos`, `fp`, `llproto=4`, `ptp=2` and `cmic=2` switched on alone (the driver loads, the
+  bridge answers ping, the default comes back when the option is removed). That is a loading check, not a
+  functional validation of the feature on that image.
+- **The CMIC is a test-only option, not a network path.** `cmic=2` exercises the packet DMA of the switch's CMIC:
+  test frames are sent and received, but **nothing it receives reaches the network stack**, and no feature
+  depends on it. A broadcast reaches it only if the CPU port is a member of the VLAN of the frame: a test entry
+  that catches an unicast or multicast address does not catch a broadcast, whatever the VLAN of the entry. Stages 3
+  and 4 (`cmic_stage`) require `hwbridge` set to 0 and `link` 0, and are for test sessions only: `cmic_stage` 4 has no time
+  limit, the option replays it at each boot, and with the default `cmic_rx_act` it drops the broadcasts of `port1`.
+  After `not stopped` or `memory left` in the kernel log, cut the power: a channel that did not stop can still
+  write to RAM.
+- **802.1X / EAPOL (`llproto=4`) is not demonstrated.** The test switch we have does not relay frames to
+  `01:80:c2:00:00:03`, so no EAPOL frame reached the unit and the option was not judged; `hostapd` is in the image
+  without any integration into netifd, and there is **no port authorization**: the bridge port flag
+  `BR_PORT_LOCKED` cannot be used on these ports, so a port that has not authenticated keeps switching.
+  `lldpd` and `hostapd` are installed but disabled at the first boot; enable them yourself
+  (`/etc/init.d/lldpd enable`, `/etc/init.d/wpad enable`) if you want them. A `sysupgrade` that keeps the
+  configuration disables them again. If you enable `radius`, change its clients first: the package default is
+  `0.0.0.0/0` with the public secret of the package.
+- **`lag` excludes `mgmt`.** The CPU-link aggregation (`lag`, ge3 as a second CPU link) is not available with
+  MGMT as a DSA port (`mgmt` is on by default: set it to 0 to use `lag`). The hardware LAG of front ports in an
+  offloaded bridge (`lagf`, on by default) is a different option and does not have this restriction.
+- **LEDs of `wan2` and `ha1`.** The speed LED stays off and the link/activity LED is off and only flashes on
+  activity, instead of the stock behaviour; the cause is being investigated. The LEDs of `port1`…`port16` and the
+  STATUS LED were found conforming in a visual check on the front panel. Option `ledram` (off by default) hands the LEDs of `wan2`, MGMT, `ha1` and `ha2`
+  to the LED processor of the switch, which does not run after a start from the disk: they stay lit.
+- **Fan control.** The `default` profile writes nothing: the chip keeps the table of the boot firmware. Our tests
+  ran with `uci set fgtwrt.fan.profile=quiet`, then `uci commit fgtwrt` and `/etc/init.d/fgtwrt restart`, which writes
+  the table of that profile. The CPU temperature input of the super-I/O is
+  corrected by a provisional offset (+22.5 degrees C, gain 1) that was not checked against a reference
+  thermometer; calibration is per appliance, in UCI (`fgtwrt.cputin`).
+- **Clock.** The kernels never write the CMOS clock, which the boot loader and the stock firmware share:
+  keep NTP (the OpenWrt default) enabled.
+- **TFTP boot is by MGMT only** (the boot loader offers no other port).
+- **No PTP frame reaches the host**, even with `ptp` on: the option reads and arms the timestamp hardware
+  (`ptp` 1-3) and exposes a PTP clock on the CMIC timer (`ptp` 2-3) only.
+
+**Other models.** The 60C has no OpenWrt image.
 
 ## Benchmark methodology
 

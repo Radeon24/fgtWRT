@@ -1,0 +1,218 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 18:00:00 +0200
+Subject: [PATCH] hwmon: w83627ehf: report the SmartFan III+ table of the
+ W83627DHG-P
+
+pwmN_mode returned pwmN_enable instead of the DC/PWM output mode read
+from the chip.
+
+The W83627DHG-P has a SmartFan III+ table (bank 1, 0x58-0x5e): three
+temperatures, three duty cycles, a temperature source and a selector
+that routes the table to CPUFANOUT0 (bit 5) or SYSFANOUT (bit 4). The
+selector sits downstream of the mode field of bank 0 0x04: a firmware
+may route CPUFANOUT0 to the table, and the pin then ignores pwm2,
+pwm2_enable and the cruise settings, while pwm2_enable still shows the
+mode field. The table is not visible at all.
+
+On the W83627DHG-P:
+- read the table with the other PWM registers and expose it read only
+  as pwm2_auto_point[1-3]_temp, pwm2_auto_point[1-3]_pwm and
+  pwm2_auto_channels_temp (1 SYSTIN, 2 CPUTIN, 4 AUXTIN);
+- report pwmN_enable = 5 for a channel routed to the table; writing 5
+  to such a channel is accepted and writes nothing (5 is not a value of
+  the 2-bit mode field, which would otherwise get bit 6 of 0x04 set).
+
+No new register write.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/drivers/hwmon/w83627ehf.c
++++ b/drivers/hwmon/w83627ehf.c
+@@ -220,6 +220,20 @@
+ 
+ static const u16 W83627EHF_REG_TEMP_OFFSET[] = { 0x454, 0x455, 0x456 };
+ 
++/*
++ * SmartFan III+ (W83627DHG-P only): one three-point table, temperatures
++ * T1-T3 (bank 1, 0x58-0x5a, degrees C) and duty cycles DC/PWM1-3 (bank 1,
++ * 0x5b-0x5d), routed by bank 1 0x5e: bit 5 to CPUFANOUT0 (pwm2), bit 4
++ * to SYSFANOUT (pwm1), downstream of the mode of bank 0 0x04 (which then
++ * no longer drives the pin); bits 3:1 select the temperature source
++ * (000 SYSTIN, 001 CPUTIN, 010 AUXTIN).
++ */
++#define W83627DHG_P_REG_SF3P_TEMP(n)	(0x158 + (n))
++#define W83627DHG_P_REG_SF3P_PWM(n)	(0x15b + (n))
++#define W83627DHG_P_REG_SF3P_SEL	0x15e
++#define W83627DHG_P_SF3P_FANSEL(ch)	((ch) == 1 ? 0x20 : 0x10)
++#define W83627DHG_P_SF3P_TEMPSEL	0x0e
++
+ static const char *const w83667hg_b_temp_label[] = {
+ 	"SYSTIN",
+ 	"CPUTIN",
+@@ -363,6 +377,11 @@
+ 	u8 fan_max_output[4]; /* maximum fan speed */
+ 	u8 fan_step_output[4]; /* rate of change output value */
+ 
++	/* SmartFan III+ table (W83627DHG-P) */
++	u8 sf3p_temp[3];	/* T1-T3, degrees C */
++	u8 sf3p_pwm[3];		/* DC/PWM1-3 */
++	u8 sf3p_sel;		/* bank 1 0x5e */
++
+ 	u8 vid;
+ 	u8 vrm;
+ 
+@@ -371,6 +390,7 @@
+ 	u8 in6_skip:1;
+ 	u8 temp3_val_only:1;
+ 	u8 have_vid:1;
++	u8 have_sf3p:1;
+ 
+ 	/* Remember extra register values over suspend/resume */
+ 	u8 vbat;
+@@ -558,6 +578,31 @@
+ 
+ 		data->tolerance[i] = (tolerance >> (i == 1 ? 4 : 0)) & 0x0f;
+ 	}
++
++	if (!data->have_sf3p)
++		return;
++
++	for (i = 0; i < 3; i++) {
++		data->sf3p_temp[i] = w83627ehf_read_value(data,
++					W83627DHG_P_REG_SF3P_TEMP(i));
++		data->sf3p_pwm[i] = w83627ehf_read_value(data,
++					W83627DHG_P_REG_SF3P_PWM(i));
++	}
++	data->sf3p_sel = w83627ehf_read_value(data, W83627DHG_P_REG_SF3P_SEL);
++
++	/*
++	 * A channel routed to SmartFan III+ follows the table whatever its
++	 * mode in bank 0 0x04: report it as mode 5.
++	 */
++	for (i = 0; i < 2 && i < data->pwm_num; i++)
++		if (data->sf3p_sel & W83627DHG_P_SF3P_FANSEL(i))
++			data->pwm_enable[i] = 5;
++}
++
++static bool w83627ehf_sf3p_routed(struct w83627ehf_data *data, int channel)
++{
++	return data->have_sf3p && channel < 2 &&
++	       (data->sf3p_sel & W83627DHG_P_SF3P_FANSEL(channel));
+ }
+ 
+ static struct w83627ehf_data *w83627ehf_update_device(struct device *dev)
+@@ -851,6 +896,17 @@
+ {
+ 	u16 reg;
+ 
++	/*
++	 * Mode 5 of the W83627DHG-P is the SmartFan III+ routing, not a
++	 * value of the 2-bit mode field: nothing to write while the channel
++	 * is still routed to the table.
++	 */
++	if (data->have_sf3p && val == 5) {
++		if (w83627ehf_sf3p_routed(data, channel))
++			return 0;
++		return -EINVAL;
++	}
++
+ 	if (!val || val < 0 ||
+ 	    (val > 4 && val != data->pwm_enable_orig[channel]))
+ 		return -EINVAL;
+@@ -1075,6 +1131,51 @@
+ static SENSOR_DEVICE_ATTR(pwm3_step_output, 0644, show_fan_step_output,
+ 	    store_fan_step_output, 2);
+ 
++/* SmartFan III+ table of the W83627DHG-P, read only */
++static ssize_t
++show_sf3p_temp(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct w83627ehf_data *data = w83627ehf_update_device(dev->parent);
++	int nr = to_sensor_dev_attr(attr)->index;
++
++	return sprintf(buf, "%d\n", data->sf3p_temp[nr] * 1000);
++}
++
++static ssize_t
++show_sf3p_pwm(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct w83627ehf_data *data = w83627ehf_update_device(dev->parent);
++	int nr = to_sensor_dev_attr(attr)->index;
++
++	return sprintf(buf, "%d\n", data->sf3p_pwm[nr]);
++}
++
++/* Temperature source as a bitmap of temp channels: 1 temp1, 2 temp2, 4 temp3 */
++static ssize_t
++show_sf3p_channels(struct device *dev, struct device_attribute *attr,
++		   char *buf)
++{
++	struct w83627ehf_data *data = w83627ehf_update_device(dev->parent);
++	int src = (data->sf3p_sel & W83627DHG_P_SF3P_TEMPSEL) >> 1;
++
++	return sprintf(buf, "%d\n", src < 3 ? 1 << src : 0);
++}
++
++static SENSOR_DEVICE_ATTR(pwm2_auto_point1_temp, 0444, show_sf3p_temp,
++	    NULL, 0);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point2_temp, 0444, show_sf3p_temp,
++	    NULL, 1);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point3_temp, 0444, show_sf3p_temp,
++	    NULL, 2);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point1_pwm, 0444, show_sf3p_pwm,
++	    NULL, 0);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point2_pwm, 0444, show_sf3p_pwm,
++	    NULL, 1);
++static SENSOR_DEVICE_ATTR(pwm2_auto_point3_pwm, 0444, show_sf3p_pwm,
++	    NULL, 2);
++static SENSOR_DEVICE_ATTR(pwm2_auto_channels_temp, 0444, show_sf3p_channels,
++	    NULL, 1);
++
+ static ssize_t
+ cpu0_vid_show(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+@@ -1121,6 +1222,12 @@
+ 
+ 	sda = (struct sensor_device_attribute *)devattr;
+ 
++	if (devattr->show == show_sf3p_temp ||
++	    devattr->show == show_sf3p_pwm ||
++	    devattr->show == show_sf3p_channels)
++		return data->have_sf3p && (data->has_fan & (1 << 1)) &&
++		       data->pwm_num >= 2 ? a->mode : 0;
++
+ 	if (sda->index < 2 &&
+ 		(devattr->show == show_fan_stop_time ||
+ 		 devattr->show == show_fan_start_output ||
+@@ -1178,6 +1285,13 @@
+ 	&sensor_dev_attr_pwm2_step_output.dev_attr.attr,
+ 	&sensor_dev_attr_pwm2_target.dev_attr.attr,
+ 	&sensor_dev_attr_pwm2_tolerance.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point1_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point2_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point3_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point1_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point2_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point3_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_channels_temp.dev_attr.attr,
+ 
+ 	&sensor_dev_attr_pwm3_stop_time.dev_attr.attr,
+ 	&sensor_dev_attr_pwm3_start_output.dev_attr.attr,
+@@ -1533,7 +1647,7 @@
+ 		*val = data->pwm_enable[channel];
+ 		return 0;
+ 	case hwmon_pwm_mode:
+-		*val = data->pwm_enable[channel];
++		*val = data->pwm_mode[channel];
+ 		return 0;
+ 	default:
+ 		break;
+@@ -1718,6 +1832,7 @@
+ 	mutex_init(&data->update_lock);
+ 	data->name = w83627ehf_device_names[sio_data->kind];
+ 	data->bank = 0xff;		/* Force initial bank selection */
++	data->have_sf3p = sio_data->kind == w83627dhg_p;
+ 	platform_set_drvdata(pdev, data);
+ 
+ 	/* 627EHG and 627EHF have 10 voltage inputs; 627DHG and 667HG have 9 */

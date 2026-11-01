@@ -1,0 +1,476 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 16:12:08 +0200
+Subject: [PATCH] block: write windows: a SATA disk described on the command
+ line
+
+Boards without a device tree cannot carry the
+fortinet,usb-disk-write-windows node. With BLK_WRITE_WINDOWS_CMDLINE
+(default n), when no such node exists, the guard reads the same
+description from the kernel command line, for one SATA disk behind
+libata:
+
+  block.write_windows_disk=ata,<pci device>,<ataN>,<vendor>,<model>,<sectors>
+  block.write_windows_ranges=<start>+<count>,...
+  block.write_windows_sector0=<offset>+<length>,...
+  block.write_windows_persistent=<start>+<count>,...
+
+sd matches that disk by the ataN port device holding its SCSI host
+and the PCI device of the host controller above it, its vendor and
+model (an underscore stands for a space) and its exact size; the
+windows, the bytes of sector 0, the states and the refusals are those
+of the device tree description. A missing or bad disk description
+guards no disk; bad windows turn them off. The parameters are read
+only at boot (mode 0444): the description is fixed when the image is
+built.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+ block/Kconfig                     |  20 ++-
+ block/blk-write-windows.c         | 264 ++++++++++++++++++++++++++----
+ drivers/scsi/sd.c                 |  10 +-
+ include/linux/blk-write-windows.h |  14 +-
+ 4 files changed, 273 insertions(+), 35 deletions(-)
+
+diff --git a/block/Kconfig b/block/Kconfig
+index 8857b6e..0e66731 100644
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@ -228,8 +228,8 @@ config BLK_MQ_STACKING
+ 	bool
+ 
+ config BLK_WRITE_WINDOWS
+-	bool "Write windows for one USB disk (dual-slot boot disk installer)"
+-	depends on BLK_DEV_SD=y && USB_STORAGE
++	bool "Write windows for one USB or SATA disk (dual-slot boot disk installer)"
++	depends on BLK_DEV_SD=y && (USB_STORAGE || ATA)
+ 	default n
+ 	help
+ 	  Guard the one disk matched by sd (usb-storage transport, SCSI
+@@ -248,6 +248,22 @@ config BLK_WRITE_WINDOWS
+ 	  For an installer writing the second firmware slot of the internal
+ 	  USB boot disk of an appliance. Say N.
+ 
++config BLK_WRITE_WINDOWS_CMDLINE
++	bool "Describe a SATA disk to guard on the kernel command line"
++	depends on BLK_WRITE_WINDOWS && ATA=y
++	default n
++	help
++	  For boards without a device tree: when no
++	  "fortinet,usb-disk-write-windows" node exists, the disk to guard
++	  may be described on the kernel command line instead, a SATA disk
++	  behind libata matched by its PCI host controller, its ATA port,
++	  its vendor, model and exact size
++	  (block.write_windows_disk=ata,<pci device>,<ataN>,<vendor>,
++	  <model>,<sectors>), with its windows in
++	  block.write_windows_ranges, block.write_windows_sector0 and
++	  block.write_windows_persistent. Read at boot only; the guard
++	  then works as with the device tree. Say N.
++
+ source "block/Kconfig.iosched"
+ 
+ endif # BLOCK
+diff --git a/block/blk-write-windows.c b/block/blk-write-windows.c
+index d887117..e4c5596 100644
+--- a/block/blk-write-windows.c
++++ b/block/blk-write-windows.c
+@@ -1,12 +1,13 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Write windows for the installer of a dual-slot USB boot disk
++ * Write windows for the installer of a dual-slot USB or SATA boot disk
+  *
+- * Some appliances boot from an internal USB disk holding two firmware slots
+- * and a data partition. To let an installer write one slot from Linux, this
+- * option (default n) guards the one disk matched by sd (usb-storage
+- * transport, SCSI vendor and model given by the device tree, optionally its
+- * exact size): every bio that may change its medium is refused, except
++ * Some appliances boot from an internal USB or SATA disk holding two
++ * firmware slots and a data partition. To let an installer write one slot
++ * from Linux, this option (default n) guards the one disk matched by sd
++ * (usb-storage transport, SCSI vendor and model given by the device tree,
++ * optionally its exact size; or a SATA disk described on the command line,
++ * see below): every bio that may change its medium is refused, except
+  * plain REQ_OP_WRITE bios lying entirely inside one of the windows given by
+  * the device tree, while the windows are armed, or entirely inside one of
+  * its persistent windows (a data area written at any time, see below).
+@@ -59,6 +60,30 @@
+  *    Absent: no persistent window, the behaviour and the parameter are those
+  *    described above.
+  *
++ * Boards without a device tree (BLK_WRITE_WINDOWS_CMDLINE): the same
++ * description may come from the kernel command line instead, for one SATA
++ * disk behind libata. It is only read when no such node exists:
++ *
++ *	block.write_windows_disk=ata,0000:00:1f.2,ata1,ATA,SATA_SSD,31277232
++ *	block.write_windows_ranges=0+1,524289+524288
++ *	block.write_windows_sector0=0x30+32,0x12c+4,0x1be+1,0x1ce+1
++ *	block.write_windows_persistent=589824+458752
++ *
++ *  - write_windows_disk: transport (ata only), the PCI device of the host
++ *    controller, its port (the ataN device holding the SCSI host), the
++ *    vendor and model of the disk (SCSI translation of libata, an
++ *    underscore standing for a space: the command line carries none) and
++ *    its exact size in 512-byte sectors, all required. A missing or bad
++ *    value: no disk is guarded (inactive), as without the node.
++ *  - write_windows_ranges, write_windows_sector0 and
++ *    write_windows_persistent: as fortinet,write-windows,
++ *    fortinet,sector0-bytes and fortinet,persistent-windows, <start>+<count>
++ *    pairs separated by commas (decimal, or hexadecimal with 0x). A bad
++ *    value turns the windows off.
++ *
++ *  These parameters are read only at boot (mode 0444), and the description
++ *  is fixed when the image is built, as a device tree would be.
++ *
+  * Refused whatever the state: discard, secure erase, write zeroes, zone
+  * operations on the guarded disk (bios), and SCSI pass-through through its
+  * block device (SG_IO and friends, see sd_ioctl()). Only the sd block
+@@ -69,7 +94,10 @@
+  *
+  * PERSISTENT RESERVE OUT (IOC_PR_* ioctls) is refused as well.
+  * Not covered (no medium data): MODE SELECT issued by the sd sysfs
+- * attributes (cache_type...), SYNCHRONIZE CACHE, START STOP UNIT. A buffered
++ * attributes (cache_type...), SYNCHRONIZE CACHE, START STOP UNIT, and on a
++ * SATA disk the commands libata issues by itself or through its sysfs
++ * attributes (power management, head unload). The HDIO ioctls of libata
++ * go through sd_ioctl() and are refused like SG_IO. A buffered
+  * write to sector 0 reaches the disk as a whole page (sectors 0-7): with a
+  * one-sector window it is refused, and the page cache may then hold data
+  * that is not on the disk; sector 0 is written by real 512-byte direct I/O
+@@ -89,6 +117,7 @@
+ #include <linux/moduleparam.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
++#include <linux/pci.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+@@ -127,6 +156,43 @@ static const char *wrwin_model;
+ static u64 wrwin_sectors;			/* 0: size not checked */
+ static bool wrwin_bad;				/* bad node: windows off */
+ 
++#ifdef CONFIG_BLK_WRITE_WINDOWS_CMDLINE
++/*
++ * Description on the command line (no device tree node): a SATA disk,
++ * matched by its port instead of the usb-storage transport.
++ */
++#define WRWIN_CMDLINE_LEN	128
++#define WRWIN_DEVNAME_LEN	32
++static char wrwin_cl_disk[WRWIN_CMDLINE_LEN];
++static char wrwin_cl_ranges[WRWIN_CMDLINE_LEN];
++static char wrwin_cl_sector0[WRWIN_CMDLINE_LEN];
++static char wrwin_cl_persistent[WRWIN_CMDLINE_LEN];
++module_param_string(write_windows_disk, wrwin_cl_disk,
++		    sizeof(wrwin_cl_disk), 0444);
++MODULE_PARM_DESC(write_windows_disk,
++		 "Disk to guard without a device tree: ata,<pci device>,<ataN>,<vendor>,<model>,<sectors>");
++module_param_string(write_windows_ranges, wrwin_cl_ranges,
++		    sizeof(wrwin_cl_ranges), 0444);
++MODULE_PARM_DESC(write_windows_ranges,
++		 "Windows armed by user space: <start>+<count>,... (sectors)");
++module_param_string(write_windows_sector0, wrwin_cl_sector0,
++		    sizeof(wrwin_cl_sector0), 0444);
++MODULE_PARM_DESC(write_windows_sector0,
++		 "Bytes of sector 0 that may change: <offset>+<length>,...");
++module_param_string(write_windows_persistent, wrwin_cl_persistent,
++		    sizeof(wrwin_cl_persistent), 0444);
++MODULE_PARM_DESC(write_windows_persistent,
++		 "Windows open without arming: <start>+<count>,... (sectors)");
++
++static bool wrwin_ata;				/* described on the command line */
++static char wrwin_ata_host[WRWIN_DEVNAME_LEN];	/* PCI device of the controller */
++static char wrwin_ata_port[WRWIN_DEVNAME_LEN];	/* ataN */
++static char wrwin_cl_vendor[WRWIN_VENDOR_LEN + 1];
++static char wrwin_cl_model[WRWIN_MODEL_LEN + 1];
++#else
++#define wrwin_ata		false
++#endif
++
+ /*
+  * State, one way only within a boot (never back to a more permissive one):
+  *  INACTIVE  no matching disk registered yet;
+@@ -242,6 +308,136 @@ static const char * __init wrwin_read_id(struct device_node *np,
+ 	return str;
+ }
+ 
++/* Checks shared by both descriptions (wrwin_bad on error) */
++static void __init wrwin_check_config(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < wrwin_nr_persistent; i++)
++		if (!wrwin_persistent[i].start) {
++			pr_err("persistent window over sector 0\n");
++			wrwin_bad = true;
++		}
++	for (i = 0; i < wrwin_nr_bytes; i++)
++		if (wrwin_bytes[i].start + wrwin_bytes[i].count > WRWIN_SECTOR) {
++			pr_err("sector 0 bytes beyond 512\n");
++			wrwin_bad = true;
++		}
++	if (wrwin_nr_bytes) {
++		for (i = 0; i < wrwin_nr_windows; i++)
++			if (!wrwin_windows[i].start)
++				break;
++		if (i == wrwin_nr_windows)
++			pr_warn("sector 0 bytes given, but no window starts at sector 0\n");
++	}
++}
++
++#ifdef CONFIG_BLK_WRITE_WINDOWS_CMDLINE
++/*
++ * "<a>+<b>,<c>+<d>...": at most max pairs, b > 0; empty: none. The string
++ * is consumed.
++ */
++static int __init wrwin_parse_pairs(char *s, struct wrwin_range *r,
++				    unsigned int max, unsigned int *nr)
++{
++	char *pair, *count;
++
++	*nr = 0;
++	if (!*s)
++		return 0;
++	while ((pair = strsep(&s, ","))) {
++		count = strchr(pair, '+');
++		if (!count || *nr == max)
++			return -EINVAL;
++		*count++ = '\0';
++		if (kstrtou64(pair, 0, &r[*nr].start) ||
++		    kstrtou64(count, 0, &r[*nr].count) || !r[*nr].count ||
++		    r[*nr].start + r[*nr].count < r[*nr].start)
++			return -EINVAL;
++		(*nr)++;
++	}
++	return 0;
++}
++
++/* Identity string of 1 to len characters, '_' standing for a space */
++static int __init wrwin_parse_id(char *dst, const char *src, size_t len)
++{
++	size_t i, n = strlen(src);
++
++	if (!n || n > len)
++		return -EINVAL;
++	for (i = 0; i < n; i++)
++		dst[i] = src[i] == '_' ? ' ' : src[i];
++	dst[n] = '\0';
++	return 0;
++}
++
++/* "ata,<pci device>,<ataN>,<vendor>,<model>,<sectors>", all required */
++static int __init wrwin_parse_disk(char *s)
++{
++	char *f[6];
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(f); i++) {
++		f[i] = strsep(&s, ",");
++		if (!f[i] || !*f[i])
++			return -EINVAL;
++	}
++	if (s || strcmp(f[0], "ata") ||
++	    strlen(f[1]) >= WRWIN_DEVNAME_LEN ||
++	    strlen(f[2]) >= WRWIN_DEVNAME_LEN ||
++	    strncmp(f[2], "ata", 3) ||
++	    wrwin_parse_id(wrwin_cl_vendor, f[3], WRWIN_VENDOR_LEN) ||
++	    wrwin_parse_id(wrwin_cl_model, f[4], WRWIN_MODEL_LEN) ||
++	    kstrtou64(f[5], 10, &wrwin_sectors) || !wrwin_sectors)
++		return -EINVAL;
++	strscpy(wrwin_ata_host, f[1]);
++	strscpy(wrwin_ata_port, f[2]);
++	return 0;
++}
++
++/* Description on the command line, when the device tree has none */
++static void __init wrwin_init_cmdline(void)
++{
++	if (!wrwin_cl_disk[0]) {
++		if (wrwin_cl_ranges[0] || wrwin_cl_sector0[0] ||
++		    wrwin_cl_persistent[0])
++			pr_err("windows given without write_windows_disk, no disk guarded\n");
++		return;
++	}
++	if (wrwin_parse_disk(wrwin_cl_disk)) {
++		pr_err("bad write_windows_disk, no disk guarded\n");
++		wrwin_sectors = 0;
++		return;
++	}
++	wrwin_ata = true;
++	wrwin_vendor = wrwin_cl_vendor;
++	wrwin_model = wrwin_cl_model;
++	if (wrwin_parse_pairs(wrwin_cl_ranges, wrwin_windows,
++			      WRWIN_MAX_WINDOWS, &wrwin_nr_windows)) {
++		pr_err("bad write_windows_ranges\n");
++		wrwin_bad = true;
++	}
++	if (wrwin_parse_pairs(wrwin_cl_persistent, wrwin_persistent,
++			      WRWIN_MAX_WINDOWS, &wrwin_nr_persistent)) {
++		pr_err("bad write_windows_persistent\n");
++		wrwin_bad = true;
++	}
++	if (wrwin_parse_pairs(wrwin_cl_sector0, wrwin_bytes,
++			      WRWIN_MAX_BYTES, &wrwin_nr_bytes)) {
++		pr_err("bad write_windows_sector0\n");
++		wrwin_bad = true;
++	}
++	wrwin_check_config();
++	pr_info("SATA disk to guard: %s port %s, \"%s\" \"%s\", %llu sectors%s\n",
++		wrwin_ata_host, wrwin_ata_port, wrwin_vendor, wrwin_model,
++		wrwin_sectors,
++		wrwin_bad ? ", windows off (bad configuration)" : "");
++}
++#else
++static inline void wrwin_init_cmdline(void) { }
++#endif
++
+ /*
+  * Configuration of the board, read once before any disk is probed. Without
+  * an identity no disk is matched (inactive); a matched disk with any other
+@@ -250,11 +446,16 @@ static const char * __init wrwin_read_id(struct device_node *np,
+ static int __init wrwin_init(void)
+ {
+ 	struct device_node *np;
+-	unsigned int i;
+ 
+ 	np = of_find_compatible_node(NULL, NULL, WRWIN_COMPATIBLE);
+-	if (!np)
++	if (!np) {
++		wrwin_init_cmdline();
+ 		return 0;
++	}
++#ifdef CONFIG_BLK_WRITE_WINDOWS_CMDLINE
++	if (wrwin_cl_disk[0])
++		pr_warn("%pOF found, write_windows_disk ignored\n", np);
++#endif
+ 	if (!of_device_is_available(np))
+ 		goto out;
+ 	wrwin_vendor = wrwin_read_id(np, "fortinet,disk-vendor",
+@@ -285,28 +486,12 @@ static int __init wrwin_init(void)
+ 		pr_err("%pOF: bad fortinet,persistent-windows\n", np);
+ 		wrwin_bad = true;
+ 	}
+-	for (i = 0; i < wrwin_nr_persistent; i++)
+-		if (!wrwin_persistent[i].start) {
+-			pr_err("persistent window over sector 0\n");
+-			wrwin_bad = true;
+-		}
+ 	if (wrwin_read_pairs(np, "fortinet,sector0-bytes", wrwin_bytes,
+ 			     WRWIN_MAX_BYTES, &wrwin_nr_bytes)) {
+ 		pr_err("%pOF: bad fortinet,sector0-bytes\n", np);
+ 		wrwin_bad = true;
+ 	}
+-	for (i = 0; i < wrwin_nr_bytes; i++)
+-		if (wrwin_bytes[i].start + wrwin_bytes[i].count > WRWIN_SECTOR) {
+-			pr_err("sector 0 bytes beyond 512\n");
+-			wrwin_bad = true;
+-		}
+-	if (wrwin_nr_bytes) {
+-		for (i = 0; i < wrwin_nr_windows; i++)
+-			if (!wrwin_windows[i].start)
+-				break;
+-		if (i == wrwin_nr_windows)
+-			pr_warn("sector 0 bytes given, but no window starts at sector 0\n");
+-	}
++	wrwin_check_config();
+ 	pr_info("USB disk to guard: \"%s\" \"%s\"%s\n", wrwin_vendor,
+ 		wrwin_model, wrwin_bad ? ", windows off (bad configuration)" : "");
+ out:
+@@ -332,9 +517,32 @@ static bool wrwin_field_eq(const char *field, size_t size, const char *want)
+ bool blk_wrwin_match(const char *vendor, size_t vendor_len,
+ 		     const char *model, size_t model_len)
+ {
+-	return wrwin_vendor && wrwin_model &&
++	return !wrwin_ata && wrwin_vendor && wrwin_model &&
++	       wrwin_field_eq(vendor, vendor_len, wrwin_vendor) &&
++	       wrwin_field_eq(model, model_len, wrwin_model);
++}
++
++/*
++ * Called by sd for any other disk, with the parent of its SCSI host (the
++ * ataN port device for libata): is it the SATA disk described on the
++ * command line? The port and its PCI host controller must be the ones
++ * given, and so must the vendor and model.
++ */
++bool blk_wrwin_match_ata(struct device *port, const char *vendor,
++			 size_t vendor_len, const char *model,
++			 size_t model_len)
++{
++#ifdef CONFIG_BLK_WRITE_WINDOWS_CMDLINE
++	struct device *host = port ? port->parent : NULL;
++
++	return wrwin_ata && host && dev_is_pci(host) &&
++	       !strcmp(dev_name(port), wrwin_ata_port) &&
++	       !strcmp(dev_name(host), wrwin_ata_host) &&
+ 	       wrwin_field_eq(vendor, vendor_len, wrwin_vendor) &&
+ 	       wrwin_field_eq(model, model_len, wrwin_model);
++#else
++	return false;
++#endif
+ }
+ 
+ /* Configuration checked against the disk; false = refuse all */
+@@ -618,4 +826,4 @@ static const struct kernel_param_ops wrwin_ops = {
+ };
+ module_param_cb(write_windows, &wrwin_ops, NULL, 0644);
+ MODULE_PARM_DESC(write_windows,
+-		 "Write windows of the guarded USB disk (\"arm\" once per boot, \"off\")");
++		 "Write windows of the guarded disk (\"arm\" once per boot, \"off\")");
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index e46ea9f..c99446f 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -1638,9 +1638,13 @@ static bool sd_wrwin_match(struct scsi_device *sdp)
+ {
+ 	const char *t = sdp->host->hostt->proc_name;
+ 
+-	return t && !strcmp(t, "usb-storage") &&
+-	       blk_wrwin_match(sdp->vendor, INQUIRY_VENDOR_LEN,
+-			       sdp->model, INQUIRY_MODEL_LEN);
++	if (t && !strcmp(t, "usb-storage"))
++		return blk_wrwin_match(sdp->vendor, INQUIRY_VENDOR_LEN,
++				       sdp->model, INQUIRY_MODEL_LEN);
++	/* libata: the SCSI host hangs off its ATA port device (ataN) */
++	return blk_wrwin_match_ata(sdp->host->shost_gendev.parent,
++				   sdp->vendor, INQUIRY_VENDOR_LEN,
++				   sdp->model, INQUIRY_MODEL_LEN);
+ }
+ 
+ /* Guarded disk: only the ioctls that send no command to the medium */
+diff --git a/include/linux/blk-write-windows.h b/include/linux/blk-write-windows.h
+index f04feb2..07eb950 100644
+--- a/include/linux/blk-write-windows.h
++++ b/include/linux/blk-write-windows.h
+@@ -1,7 +1,8 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ /*
+- * Write windows for the installer of a dual-slot USB boot disk, described
+- * by the device tree, see block/blk-write-windows.c.
++ * Write windows for the installer of a dual-slot USB or SATA boot disk,
++ * described by the device tree (or by the command line), see
++ * block/blk-write-windows.c.
+  */
+ #ifndef _LINUX_BLK_WRITE_WINDOWS_H
+ #define _LINUX_BLK_WRITE_WINDOWS_H
+@@ -11,6 +12,9 @@
+ #ifdef CONFIG_BLK_WRITE_WINDOWS
+ bool blk_wrwin_match(const char *vendor, size_t vendor_len,
+ 		     const char *model, size_t model_len);
++bool blk_wrwin_match_ata(struct device *port, const char *vendor,
++			 size_t vendor_len, const char *model,
++			 size_t model_len);
+ void blk_wrwin_register(struct gendisk *disk);
+ void blk_wrwin_unregister(struct gendisk *disk);
+ bool blk_wrwin_refuse(struct bio *bio);
+@@ -25,6 +29,12 @@ static inline bool blk_wrwin_match(const char *vendor, size_t vendor_len,
+ {
+ 	return false;
+ }
++static inline bool blk_wrwin_match_ata(struct device *port,
++				       const char *vendor, size_t vendor_len,
++				       const char *model, size_t model_len)
++{
++	return false;
++}
+ static inline void blk_wrwin_register(struct gendisk *disk) { }
+ static inline void blk_wrwin_unregister(struct gendisk *disk) { }
+ static inline bool blk_wrwin_refuse(struct bio *bio) { return false; }

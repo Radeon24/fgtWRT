@@ -1,0 +1,359 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# BCM53314 switch of the FortiGate 100D, at boot, before the network:
+#
+# 1. bcm53314-fg100d access=0: the block reset register is read (MMIO
+#    reads only, nothing written), then the module is removed;
+# 2. 0x00000000 (start from the disk, the boot firmware did not set the
+#    switch up): bcm53314-fg100d steps=init, alone in its load, removed,
+#    then judged on the result line it adds to the kernel log, which must
+#    be "init: done" (a halted replay leaves the module loaded too, for
+#    its plan and log, so the load alone does not tell it);
+#    with option ledram 0 (default), line R17 of the step is left out
+#    (init_ledram=0): the LEDs of wan2, MGMT, ha1 and ha2 stay driven
+#    by the internal PHYs, since the LED processor that R17 would hand
+#    them to does not run when started from the disk;
+#    0x0001e3c1 (start from the network, set up by the boot firmware):
+#    step init skipped; any other value: stop, nothing written;
+# 3. option phyled: bcm53314-fg100d phyled=1 (LED set-up of the PHYs of
+#    port1-16), alone in its load, removed;
+# 4. option lag: bcm53314-fg100d steps=...,ge3 (ge3 brought up as the
+#    second CPU link), alone in its load, removed;
+# 5. the DSA stack, then bcm5331x-dsa (its own steps, with option mgmt
+#    also step mgmt, with option lag also steps ge3,trunk2; then, with
+#    option qinq, double tagging), which keeps the switch.
+#
+# Every write is volatile (lost at the next reset of the switch); none
+# is undone at removal. The first failure stops the sequence: the later
+# steps are not tried and the DSA driver is not loaded. A second start
+# in the same boot does nothing once the DSA driver is loaded.
+#
+# /etc/config/fg100d-switch: enabled (0: nothing loaded, the switch is
+# left as found), phyled, qinq, ledram; driver options hwbridge, fdb,
+# vlanbr, mgmt (absent: 1) and lagf (absent: 2) on by default as far
+# as what they need allows (fdb, vlanbr and lagf follow
+# hwbridge, vlanbr also qinq, mgmt is off with lag), lag off by default
+# (it excludes mgmt), llproto, mdb, mirror, qos, fp, ptp (ptp_tick_ps is
+# passed with ptp 2-3) and cmic (cmic_stage, cmic_tx_*, cmic_rx_* and
+# cmic_cpu_vlan are passed with cmic 2),
+# link off by default (0: not passed, the module default, which is off);
+# vid_base (absent: 100, not passed; else passed to the base module of
+# the ge3 step and to the DSA driver: block of the front-port VIDs); stats
+# (0 or absent: stats_ms=0 passed, no hardware statistics; 1: the module
+# default, or option stats_ms). A combination the driver refuses (fdb,
+# vlanbr, lagf or llproto without hwbridge, mdb without fdb, vlanbr
+# without qinq, lag with mgmt, lagf or link outside 0-2, llproto outside
+# 0-7, ptp outside 0-3, cmic neither 0 nor 2, a ptp value outside the
+# limits of the module, with cmic 2 a cmic_* value outside them or
+# cmic_stage 3-4 with hwbridge or link) stops before any load, nothing
+# written. The front ports then have no network device: on the default
+# layout that leaves no LAN, reach the unit by the serial console.
+
+START=19
+
+BASE=bcm53314-fg100d
+BASE_SYS=/sys/module/bcm53314_fg100d
+DSA_SYS=/sys/module/bcm5331x_dsa
+# test parameters of the packet DMA of the CMIC, passed as set
+CMIC_OPTS="cmic_stage cmic_tx_port cmic_tx_count cmic_rx_ms cmic_rx_da cmic_rx_vid cmic_rx_act cmic_cpu_vlan"
+
+log() {
+	echo "fg100d-switch: $*" > /dev/kmsg
+}
+
+# option $1 of value $2: absent, or decimal within $3-$4 (a leading zero
+# would be octal for the module); else logged, 1
+opt_range() {
+	case "$2" in
+	'') return 0 ;;
+	0?*|*[!0-9]*) ;;
+	*)
+		[ "${#2}" -le 6 ] && [ "$2" -ge "$3" ] && [ "$2" -le "$4" ] && return 0
+		;;
+	esac
+	log "$1=$2: $3-$4: stop, nothing loaded"
+	return 1
+}
+
+# one load of the base module; 0 if it stayed loaded (then removed)
+base_run() {
+	insmod "$BASE" "$@" 2>/dev/null
+	# the return code of insmod is not reliable (EEXIST): judge on sysfs
+	[ -d "$BASE_SYS" ] || return 1
+	rmmod "$BASE" || {
+		log "$BASE could not be removed: stop"
+		return 2
+	}
+	return 0
+}
+
+block_reset() {
+	dmesg | sed -n 's/.* access level 0, block reset 0x\([0-9a-f]\{8\}\), .*/\1/p' | tail -n 1
+}
+
+# result lines of the step init: "init: done" or "init: halted at <line> (<cause>)"
+init_results() {
+	dmesg | grep -E ': init: (done$|halted at )'
+}
+
+start() {
+	local d enabled phyled qinq ledram hwbridge fdb vlanbr lag lagf llproto mdb mgmt mirror stats stats_ms link vid_base
+	local qos fp ptp ptp_tick_ps cmic cmic_stage cmic_tx_port cmic_tx_count cmic_rx_ms cmic_rx_da cmic_rx_vid cmic_rx_act cmic_cpu_vlan
+	local steps extra vb rst t0 m n r o v
+
+	. /lib/functions.sh
+	[ "$(board_name)" = "fortinet,fg100d" ] || return 0
+
+	config_load fg100d-switch
+	config_get_bool enabled switch enabled 1
+	config_get_bool phyled switch phyled 1
+	config_get_bool qinq switch qinq 1
+	config_get_bool ledram switch ledram 0
+	config_get_bool hwbridge switch hwbridge 1
+	# defaults that follow what they need: absent options never make a
+	# refused combination of their own (vlanbr needs qinq, mgmt excludes lag)
+	config_get_bool fdb switch fdb "$hwbridge"
+	d=0
+	[ "$hwbridge" = 1 ] && [ "$qinq" = 1 ] && d=1
+	config_get_bool vlanbr switch vlanbr "$d"
+	config_get_bool lag switch lag 0
+	d=0
+	[ "$hwbridge" = 1 ] && d=2
+	config_get lagf switch lagf "$d"
+	config_get llproto switch llproto 0
+	config_get_bool mdb switch mdb 0
+	d=1
+	[ "$lag" = 1 ] && d=0
+	config_get_bool mgmt switch mgmt "$d"
+	config_get_bool mirror switch mirror 0
+	config_get_bool stats switch stats 0
+	config_get stats_ms switch stats_ms
+	config_get link switch link 0
+	config_get vid_base switch vid_base 100
+	config_get_bool qos switch qos 0
+	config_get_bool fp switch fp 0
+	config_get ptp switch ptp 0
+	config_get ptp_tick_ps switch ptp_tick_ps
+	config_get cmic switch cmic 0
+	for o in $CMIC_OPTS; do
+		config_get "$o" switch "$o"
+	done
+	case "$lagf" in
+	0|1|2) ;;
+	*)
+		log "lagf=$lagf: 0, 1 or 2: stop, nothing loaded"
+		return 1
+		;;
+	esac
+	case "$llproto" in
+	[0-7]) ;;
+	*)
+		log "llproto=$llproto: 0-7: stop, nothing loaded"
+		return 1
+		;;
+	esac
+	case "$link" in
+	0|1|2) ;;
+	*)
+		log "link=$link: 0, 1 or 2: stop, nothing loaded"
+		return 1
+		;;
+	esac
+	case "$vid_base" in
+	2[1-9]|[3-9][0-9]|[1-9][0-9][0-9]|[1-2][0-9][0-9][0-9]|3[0-8][0-9][0-9]|39[0-6][0-9]|397[0-6]) ;;
+	*)
+		log "vid_base=$vid_base: 21-3976: stop, nothing loaded"
+		return 1
+		;;
+	esac
+	case "$stats_ms" in
+	''|0|[1-9][0-9][0-9][0-9]|[12][0-9][0-9][0-9][0-9]|30000) ;;
+	*)
+		log "stats_ms=$stats_ms: 0 or 1000-30000: stop, nothing loaded"
+		return 1
+		;;
+	esac
+	case "$ptp" in
+	[0-3]) ;;
+	*)
+		log "ptp=$ptp: 0-3: stop, nothing loaded"
+		return 1
+		;;
+	esac
+	opt_range ptp_tick_ps "$ptp_tick_ps" 500 100000 || return 1
+	case "$cmic" in
+	0|2) ;;
+	*)
+		log "cmic=$cmic: 0 or 2: stop, nothing loaded"
+		return 1
+		;;
+	esac
+	# the other cmic_* values are passed with cmic 2 only: not judged otherwise
+	if [ "$cmic" = 2 ]; then
+		opt_range cmic_stage "$cmic_stage" 1 4 || return 1
+		case "$cmic_tx_port" in
+		''|5|7|8|9|1[0-9]|2[0-4]) ;;
+		*)
+			log "cmic_tx_port=$cmic_tx_port: 5 or 7-24: stop, nothing loaded"
+			return 1
+			;;
+		esac
+		opt_range cmic_tx_count "$cmic_tx_count" 1 8 || return 1
+		opt_range cmic_rx_ms "$cmic_rx_ms" 1000 120000 || return 1
+		# 48 bits, not zero
+		v=${cmic_rx_da#0x}
+		case "$cmic_rx_da" in
+		'') v=1 ;;
+		0x*) ;;
+		*) v=0 ;;
+		esac
+		case "$v" in
+		*[!0-9a-fA-F]*|?????????????*) v=0 ;;
+		esac
+		case "$v" in
+		*[!0]*) ;;
+		*)
+			log "cmic_rx_da=$cmic_rx_da: 0x1-0xffffffffffff: stop, nothing loaded"
+			return 1
+			;;
+		esac
+		[ "$cmic_rx_vid" = -1 ] || opt_range cmic_rx_vid "$cmic_rx_vid" 0 4094 || return 1
+		opt_range cmic_rx_act "$cmic_rx_act" 0 7 || return 1
+		opt_range cmic_cpu_vlan "$cmic_cpu_vlan" 0 1 || return 1
+	fi
+	if [ "$hwbridge" != 1 ] && { [ "$fdb" = 1 ] || [ "$vlanbr" = 1 ] || [ "$lagf" != 0 ] || [ "$llproto" != 0 ]; }; then
+		log "fdb, vlanbr, lagf and llproto need hwbridge: stop, nothing loaded"
+		return 1
+	fi
+	if [ "$mdb" = 1 ] && [ "$fdb" != 1 ]; then
+		log "mdb needs fdb: stop, nothing loaded"
+		return 1
+	fi
+	if [ "$vlanbr" = 1 ] && [ "$qinq" != 1 ]; then
+		log "vlanbr needs qinq: stop, nothing loaded"
+		return 1
+	fi
+	if [ "$lag" = 1 ] && [ "$mgmt" = 1 ]; then
+		log "lag and mgmt exclude each other: stop, nothing loaded"
+		return 1
+	fi
+	if [ "$cmic" = 2 ] && [ "${cmic_stage:-1}" -ge 3 ] && { [ "$hwbridge" = 1 ] || [ "$link" != 0 ]; }; then
+		log "cmic_stage=$cmic_stage needs hwbridge=0 and link=0: stop, nothing loaded"
+		return 1
+	fi
+	steps=counters,learning,trunk,ports,ifilter
+	vb=
+	[ "$vid_base" != 100 ] && vb=" vid_base=$vid_base"
+	extra="$vb"
+	[ "$lag" = 1 ] && extra="$extra steps=$steps,ge3,trunk2"
+	[ "$hwbridge" = 1 ] && extra="$extra hwbridge=1"
+	[ "$fdb" = 1 ] && extra="$extra fdb=1"
+	[ "$vlanbr" = 1 ] && extra="$extra vlanbr=1"
+	[ "$lag" = 1 ] && extra="$extra lag=1"
+	[ "$lagf" != 0 ] && extra="$extra lagf=$lagf"
+	[ "$llproto" != 0 ] && extra="$extra llproto=$llproto"
+	[ "$mdb" = 1 ] && extra="$extra mdb=1"
+	[ "$mgmt" = 1 ] && extra="$extra mgmt=1"
+	[ "$mirror" = 1 ] && extra="$extra mirror=1"
+	[ "$link" != 0 ] && extra="$extra link=$link"
+	if [ "$stats" != 1 ]; then
+		extra="$extra stats_ms=0"
+	elif [ -n "$stats_ms" ]; then
+		extra="$extra stats_ms=$stats_ms"
+	fi
+	[ "$qos" = 1 ] && extra="$extra qos=1"
+	[ "$fp" = 1 ] && extra="$extra fp=1"
+	[ "$ptp" != 0 ] && extra="$extra ptp=$ptp"
+	[ "$ptp" -ge 2 ] && [ -n "$ptp_tick_ps" ] && extra="$extra ptp_tick_ps=$ptp_tick_ps"
+	if [ "$cmic" = 2 ]; then
+		extra="$extra cmic=2"
+		for o in $CMIC_OPTS; do
+			eval "v=\$$o"
+			[ -n "$v" ] && extra="$extra $o=$v"
+		done
+	fi
+
+	if [ "$enabled" != 1 ]; then
+		log "disabled: nothing loaded, switch left as found"
+		return 0
+	fi
+	if [ -d "$DSA_SYS" ]; then
+		log "DSA driver already loaded: nothing done"
+		return 0
+	fi
+	if [ -d "$BASE_SYS" ]; then
+		log "$BASE already loaded: nothing done"
+		return 1
+	fi
+	t0=$(cut -d ' ' -f 1 /proc/uptime)
+
+	if ! base_run access=0; then
+		log "$BASE access=0 failed: stop, no DSA"
+		return 1
+	fi
+	rst=$(block_reset)
+	case "$rst" in
+	00000000)
+		log "block reset 0x00000000 (start from the disk): step init (ledram=$ledram)"
+		n=$(init_results | wc -l)
+		if ! base_run access=2 steps=init dry_run=0 init_ledram="$ledram"; then
+			log "step init failed: stop, no DSA"
+			return 1
+		fi
+		# the module stays loaded after a halted replay: one new result line, "done"
+		r=$(init_results | tail -n 1)
+		if [ "$(init_results | wc -l)" -le "$n" ]; then
+			log "step init: no result in the kernel log: stop, no DSA"
+			return 1
+		fi
+		case "$r" in
+		*": init: done") ;;
+		*)
+			log "step init ${r#*: init: }: stop, no DSA"
+			return 1
+			;;
+		esac
+		;;
+	0001e3c1)
+		log "block reset 0x0001e3c1 (set up by the boot firmware): step init skipped"
+		;;
+	*)
+		log "block reset 0x${rst:-unknown}: unknown state, stop, nothing written"
+		return 1
+		;;
+	esac
+
+	if [ "$phyled" = 1 ]; then
+		if ! base_run access=2 phyled=1 dry_run=0; then
+			log "phyled failed: stop, no DSA"
+			return 1
+		fi
+	fi
+
+	if [ "$lag" = 1 ]; then
+		# a halted plan leaves the module loaded too: judged on the kernel log
+		n=$(dmesg | grep -cE 'write\(s\) done and read back$|, halting$')
+		if ! base_run access=2 dry_run=0 steps="$steps,ge3"$vb; then
+			log "steps $steps,ge3 (lag) failed: stop, no DSA"
+			return 1
+		fi
+		r=$(dmesg | grep -E 'write\(s\) done and read back$|, halting$' | tail -n 1)
+		if [ "$(dmesg | grep -cE 'write\(s\) done and read back$|, halting$')" -le "$n" ] ||
+		   [ "${r%, halting}" != "$r" ]; then
+			log "steps $steps,ge3 (lag): not done: stop, no DSA"
+			return 1
+		fi
+	fi
+
+	for m in mdio_devres selftests dsa_core tag_bcm5331x_8021q; do
+		[ -d "/sys/module/$m" ] || insmod "$m" 2>/dev/null
+	done
+	insmod bcm5331x-dsa qinq="$qinq"$extra 2>/dev/null
+	if [ ! -d "$DSA_SYS" ]; then
+		log "bcm5331x-dsa qinq=$qinq$extra failed: no DSA"
+		return 1
+	fi
+	log "DSA driver loaded (qinq=$qinq$extra, phyled=$phyled) in $(awk -v a="$t0" \
+		'{ printf "%.2f", $1 - a }' /proc/uptime) s"
+}

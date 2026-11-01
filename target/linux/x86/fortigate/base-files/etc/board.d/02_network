@@ -1,0 +1,44 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+fortinet,fg100d)
+	# wan1 and dmz are the two ports outside the switch (named in
+	# preinit). With the DSA driver of the switch (kmod-bcm5331x-dsa,
+	# loaded by /etc/init.d/fg100d-switch before the network), the front
+	# ports of the switch are DSA user ports named as their labels, laid
+	# out as on the stock firmware: port1-16 in br-lan (no VLAN
+	# filtering, no bridge-vlan), wan1 the WAN, wan2 a second WAN (DHCP
+	# client, default route behind the one of wan1: metric 10; not in a
+	# zone of the firewall, add it to the wan zone to use it), dmz, ha1
+	# and ha2 interfaces of their own, left unconfigured (as dmz and wan2
+	# on the other FortiGate boards). mgmt, the DSA user port of MGMT
+	# when the driver is loaded with it (option mgmt of
+	# /etc/config/fg100d-switch), is an interface of its own as well,
+	# left unconfigured: the stock firmware's 192.168.1.99/24 would
+	# overlap the LAN (192.168.1.1/24), and no address is given to a port
+	# nobody asked for (as dmz). Without the device it stays down.
+	# Without the driver, dmz is the LAN port.
+	if [ -x /etc/init.d/fg100d-switch ]; then
+		ucidef_set_interfaces_lan_wan "port1 port2 port3 port4 port5 port6 \
+			port7 port8 port9 port10 port11 port12 port13 port14 port15 \
+			port16" "wan1"
+		ucidef_set_interface "wan2" device "wan2" protocol "dhcp" \
+			metric "10"
+		ucidef_set_interface "dmz" device "dmz" protocol "none"
+		ucidef_set_interface "ha1" device "ha1" protocol "none"
+		ucidef_set_interface "ha2" device "ha2" protocol "none"
+		ucidef_set_interface "mgmt" device "mgmt" protocol "none"
+	else
+		ucidef_set_interfaces_lan_wan "dmz" "wan1"
+	fi
+	;;
+esac
+
+board_config_flush
+
+exit 0

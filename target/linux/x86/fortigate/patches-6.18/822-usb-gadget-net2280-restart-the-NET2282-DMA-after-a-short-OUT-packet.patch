@@ -1,0 +1,117 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 22:00:00 +0200
+Subject: [PATCH] usb: gadget: net2280: restart the NET2282 DMA after a short
+ OUT packet
+
+The NET2282 does not chain DMA descriptors: fill_dma_desc() and
+start_queue() set END_OF_CHAIN on every descriptor unless PLX_2280,
+and each OUT request is started by the "transaction done" interrupt of
+the previous one (handle_stat1_irqs() -> restart_dma()).
+
+A short OUT packet raises SHORT_PACKET_TRANSFERRED as soon as it enters
+the FIFO, behind the last packets of the request being moved by DMA.
+When that interrupt is handled before the "transaction done" of that
+request shows in irqstat1 (read first, once per interrupt), the loop of
+handle_ep_small() retires the request through scan_dma_completions(),
+then waits for the FIFO to empty: nothing moves it, since the engine
+stopped at the end of its chain. The loop leaves through the "stuck"
+escape, writes DMA_ABORT to an idle engine and waits 50 us for
+DMA_ENABLE to drop, which it does not; restart_dma() then hits the
+WARN_ON() of start_dma(). On a FortiGate 100D (NET2282, CDC NCM gadget)
+a sustained host-to-device transfer ends there, with the OUT endpoint
+NAKing for good and the host timing out its transmit queue.
+
+On the NET2282 only, once a request has retired in that loop, stop the
+idle engine and start the new head of the queue as the dma interrupt
+would have: start_dma() moves the short transfer found in the FIFO in
+single mode and clears the stale dma status. With an empty queue, the
+FIFO waits (NAKing) for the next request. Also report the DMA registers
+when DMA_ENABLE does not drop after an abort, instead of the bare
+WARN_ON() of start_dma().
+
+NET2280 (chaining) and USB338x paths are unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/drivers/usb/gadget/udc/net2280.c
++++ b/drivers/usb/gadget/udc/net2280.c
+@@ -851,6 +851,22 @@
+ 	handshake(&dma->dmactl, BIT(DMA_ENABLE), 0, 50);
+ }
+ 
++/* like spin_stop_dma(), but say which state the engine was left in when
++ * DMA_ENABLE did not drop: start_dma() would warn without any detail
++ */
++static void spin_stop_dma_report(struct net2280_ep *ep, const char *why)
++{
++	struct net2280_dma_regs	__iomem *dma = ep->dma;
++
++	if (!handshake(&dma->dmactl, BIT(DMA_ENABLE), 0, 50))
++		return;
++	dev_warn_ratelimited(&ep->dev->pdev->dev,
++		"%s %s: dma still enabled, dmactl %08x dmastat %08x dmacount %08x dmadesc %08x ep_stat %08x ep_avail %u\n",
++		ep->ep.name, why, readl(&dma->dmactl), readl(&dma->dmastat),
++		readl(&dma->dmacount), readl(&dma->dmadesc),
++		readl(&ep->regs->ep_stat), readl(&ep->regs->ep_avail));
++}
++
+ static inline void stop_dma(struct net2280_dma_regs __iomem *dma)
+ {
+ 	writel(readl(&dma->dmactl) & ~BIT(DMA_ENABLE), &dma->dmactl);
+@@ -2615,6 +2631,7 @@
+ 			struct net2280_request *stuck_req = NULL;
+ 			int	stopped = ep->stopped;
+ 			int	num_completed;
++			int	retired = 0;
+ 			int	stuck = 0;
+ 			u32	count;
+ 
+@@ -2629,6 +2646,38 @@
+ 				 * dma handles (M >= N), may empty the queue
+ 				 */
+ 				num_completed = scan_dma_completions(ep);
++				retired += num_completed;
++
++				/* NET2282: without chaining (END_OF_CHAIN on
++				 * every descriptor, see fill_dma_desc()), the
++				 * engine stopped when the request(s) above
++				 * retired: no DMA moves the data now in the
++				 * fifo, which belongs to the next request
++				 * (the short packet raised this irq before
++				 * the "transaction done" of the previous one
++				 * was seen in irqstat1). Waiting for the fifo
++				 * would only end through the "stuck" escape,
++				 * then DMA_ABORT on an idle engine whose
++				 * DMA_ENABLE does not drop. Stop the idle
++				 * engine and start the new head as the dma irq
++				 * would have: start_dma() moves the short
++				 * transfer in single mode and clears the stale
++				 * dma status. With an empty queue, the fifo
++				 * waits (NAKing) for the next net2280_queue().
++				 */
++				if (retired && !ep->out_overflow &&
++				    (ep->dev->quirks & (PLX_LEGACY | PLX_2280))
++						== PLX_LEGACY) {
++					writel(readl(&ep->dma->dmactl) &
++						~BIT(DMA_ENABLE),
++						&ep->dma->dmactl);
++					spin_stop_dma_report(ep, "short out");
++					ep->stopped = stopped;
++					if (!list_empty(&ep->queue))
++						restart_dma(ep);
++					return;
++				}
++
+ 				if (unlikely(list_empty(&ep->queue) ||
+ 						ep->out_overflow)) {
+ 					req = NULL;
+@@ -2678,7 +2727,7 @@
+ 
+ 			/* stop DMA, leave ep NAKing */
+ 			writel(BIT(DMA_ABORT), &ep->dma->dmastat);
+-			spin_stop_dma(ep->dma);
++			spin_stop_dma_report(ep, "abort");
+ 
+ 			if (likely(req)) {
+ 				req->td->dmacount = 0;

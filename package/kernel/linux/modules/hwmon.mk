@@ -746,6 +746,11 @@ define KernelPackage/hwmon-w83627ehf
   KCONFIG:=CONFIG_SENSORS_W83627EHF
   FILES:=$(LINUX_DIR)/drivers/hwmon/w83627ehf.ko
   AUTOLOAD:=$(call AutoProbe,w83627ehf)
+  # FortiGate 100D (x86/fortigate): the fan profiles of fgtwrt-base other
+  # than "default" write the SmartFan III+ table of the W83627DHG-P, which
+  # the driver refuses without sf3p_write (added by the x86 patch 122;
+  # nothing is written when the module loads).
+  MODPARAMS.w83627ehf:=$(if $(CONFIG_TARGET_x86_fortigate),sf3p_write=1)
   $(call AddDepends/hwmon,@TARGET_x86 +kmod-hwmon-vid)
 endef
 

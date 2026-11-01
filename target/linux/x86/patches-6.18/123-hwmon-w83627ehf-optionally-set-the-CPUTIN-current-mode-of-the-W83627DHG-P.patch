@@ -1,0 +1,142 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:00:00 +0200
+Subject: [PATCH] hwmon: w83627ehf: optionally set the CPUTIN current mode of
+ the W83627DHG-P
+
+Add temp2_current_mode on the W83627DHG-P: bank 0 register 0x5e bit 2,
+CPUTIN sensed in current mode (1) or as set by register 0x5d (0). The
+attribute is read from the chip on each access and is read only unless
+the new cputin_mode_write module parameter (default off, read only at
+run time) is set. A write changes bit 2 alone by a read-modify-write,
+refuses current mode when CPUTIN is not set as a diode (0x5d bit 2),
+and reads the register back. Nothing is written at probe.
+
+This is a diagnostic aid, to compare the readings of a thermal diode in
+both modes. The register is a volatile hardware monitor register, set
+again by the boot firmware at the next reset.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/drivers/hwmon/w83627ehf.c
++++ b/drivers/hwmon/w83627ehf.c
+@@ -70,6 +70,11 @@
+ MODULE_PARM_DESC(sf3p_write,
+ 		 "W83627DHG-P: allow writes to the SmartFan III+ table and routing (default: read only)");
+ 
++static bool cputin_mode_write;
++module_param(cputin_mode_write, bool, 0444);
++MODULE_PARM_DESC(cputin_mode_write,
++		 "W83627DHG-P: allow writes to the CPUTIN current mode bit, for diagnostics (default: read only)");
++
+ #define DRVNAME "w83627ehf"
+ 
+ /*
+@@ -243,6 +248,17 @@
+ #define W83627DHG_P_SF3P_TEMP_MAX	100	/* degrees C */
+ #define W83627DHG_P_SF3P_PWM3_MIN	128	/* top duty cycle floor */
+ 
++/*
++ * W83627DHG-P bank 0 0x5e: bit 2 senses CPUTIN in current mode (1) or as
++ * set by 0x5d (0); current mode also needs 0x5d bit 2 (CPUTIN as a diode).
++ * Bits 7:4 (critical temperature protections), 3 and 1 are kept as read;
++ * bit 0 is reserved.
++ */
++#define W83627DHG_P_REG_CPUTIN_MODE	0x5e
++#define W83627DHG_P_CPUTIN_CURRENT	0x04
++#define W83627DHG_P_CPUTIN_MODE_MASK	0xfe	/* bits checked on read back */
++#define W83627DHG_P_VBAT_CPUTIN_DIODE	0x04
++
+ static const char *const w83667hg_b_temp_label[] = {
+ 	"SYSTIN",
+ 	"CPUTIN",
+@@ -1319,6 +1335,70 @@
+ static SENSOR_DEVICE_ATTR(pwm2_auto_channels_temp, 0644, show_sf3p_channels,
+ 	    store_sf3p_channels, 1);
+ 
++/*
++ * CPUTIN sensing mode of the W83627DHG-P (temp2_current_mode): 1 current
++ * mode, 0 as set by 0x5d. Read from the chip on each access, never cached
++ * nor written at probe; written (cputin_mode_write only) by a
++ * read-modify-write of bit 2 alone, then read back. The boot firmware sets
++ * the bit again at the next reset.
++ */
++static ssize_t
++show_cputin_mode(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct w83627ehf_data *data = dev_get_drvdata(dev);
++	u16 reg;
++
++	mutex_lock(&data->update_lock);
++	reg = w83627ehf_read_value(data, W83627DHG_P_REG_CPUTIN_MODE);
++	mutex_unlock(&data->update_lock);
++
++	return sprintf(buf, "%d\n", !!(reg & W83627DHG_P_CPUTIN_CURRENT));
++}
++
++static ssize_t
++store_cputin_mode(struct device *dev, struct device_attribute *attr,
++		  const char *buf, size_t count)
++{
++	struct w83627ehf_data *data = dev_get_drvdata(dev);
++	unsigned long val;
++	u16 reg, set, back;
++	int err;
++
++	if (!cputin_mode_write)
++		return -EPERM;
++	err = kstrtoul(buf, 10, &val);
++	if (err < 0)
++		return err;
++	if (val > 1)
++		return -EINVAL;
++
++	mutex_lock(&data->update_lock);
++	if (val && !(w83627ehf_read_value(data, W83627EHF_REG_VBAT) &
++		     W83627DHG_P_VBAT_CPUTIN_DIODE)) {
++		err = -EINVAL;
++		goto out;
++	}
++	reg = w83627ehf_read_value(data, W83627DHG_P_REG_CPUTIN_MODE);
++	set = val ? reg | W83627DHG_P_CPUTIN_CURRENT :
++		    reg & ~W83627DHG_P_CPUTIN_CURRENT;
++	if (set == reg)
++		goto out;
++	w83627ehf_write_value(data, W83627DHG_P_REG_CPUTIN_MODE, set);
++	back = w83627ehf_read_value(data, W83627DHG_P_REG_CPUTIN_MODE);
++	if ((back ^ set) & W83627DHG_P_CPUTIN_MODE_MASK) {
++		dev_warn(dev, "CPUTIN mode register reads 0x%02x, 0x%02x written\n",
++			 back, set);
++		err = -EIO;
++	}
++	data->valid = false;
++out:
++	mutex_unlock(&data->update_lock);
++	return err ? err : count;
++}
++
++static SENSOR_DEVICE_ATTR(temp2_current_mode, 0644, show_cputin_mode,
++	    store_cputin_mode, 1);
++
+ static ssize_t
+ cpu0_vid_show(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+@@ -1372,6 +1452,10 @@
+ 		       data->pwm_num < 2 ? 0 :
+ 		       sf3p_write ? a->mode : a->mode & 0444;
+ 
++	if (devattr->show == show_cputin_mode)
++		return !data->have_sf3p ? 0 :
++		       cputin_mode_write ? a->mode : a->mode & 0444;
++
+ 	if (sda->index < 2 &&
+ 		(devattr->show == show_fan_stop_time ||
+ 		 devattr->show == show_fan_start_output ||
+@@ -1436,6 +1520,7 @@
+ 	&sensor_dev_attr_pwm2_auto_point2_pwm.dev_attr.attr,
+ 	&sensor_dev_attr_pwm2_auto_point3_pwm.dev_attr.attr,
+ 	&sensor_dev_attr_pwm2_auto_channels_temp.dev_attr.attr,
++	&sensor_dev_attr_temp2_current_mode.dev_attr.attr,
+ 
+ 	&sensor_dev_attr_pwm3_stop_time.dev_attr.attr,
+ 	&sensor_dev_attr_pwm3_start_output.dev_attr.attr,

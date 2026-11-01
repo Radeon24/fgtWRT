@@ -1,0 +1,88 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 18:30:00 +0100
+Subject: [PATCH] usb: gadget: net2280: NET2282: give back a torn down DMA
+ queue with -ESHUTDOWN
+
+nuke() and usb_reset_228x() stop the DMA of an endpoint through
+abort_dma(), whose scan_dma_completions() gives back, with status 0,
+every request whose descriptor reads as done. From within
+usb_ep_disable() this can be a transfer done by the engine but not yet
+seen by the irq handler; on a NET2282 it seemingly also is the OUT
+transfer that the abort itself stopped: every unbind of a CDC NCM
+gadget with the OUT endpoint on DMA is followed by
+"net2280_queue: error=-108", i.e. a request that rx_complete() got back
+with status 0 and resubmitted after the reset.
+
+u_ether does not expect such a completion inside usb_ep_disable(). In
+gether_disconnect(), port_usb is already NULL: rx_submit() returns
+-ENOTCONN without putting the request back on rx_reqs, so it is never
+freed ("dma_pool_destroy requests busy" when net2280 is removed after
+a gadget with OUT DMA, never after one with OUT PIO). In eth_stop(),
+which holds dev->lock across usb_ep_disable(), rx_complete() takes
+dev->lock again to unwrap an NCM transfer.
+
+On the NET2282 only, retire nothing as completed when a queue is torn
+down: abort or stop the engine as before, and let nuke() give every
+request back with -ESHUTDOWN, as the PIO paths do. Data that the
+engine moved for a request not yet given back is dropped, as data
+still in the fifo is with PIO. The register writes are unchanged.
+NET2280 and USB338x paths, and abort_dma() everywhere else (dequeue,
+halt), are unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/drivers/usb/gadget/udc/net2280.c
++++ b/drivers/usb/gadget/udc/net2280.c
+@@ -1240,6 +1240,33 @@
+ 	scan_dma_completions(ep);
+ }
+ 
++/* abort_dma() for a queue being torn down (endpoint disabled, controller
++ * reset): on the NET2282, retire nothing as completed, so that nuke()
++ * gives every request back with -ESHUTDOWN, as the PIO paths do.  The
++ * scan of abort_dma() may give back an OUT request with status 0 from
++ * within usb_ep_disable(): a transfer done by the engine but not seen
++ * by the irq handler yet, and on the NET2282 seemingly also the transfer
++ * that the abort itself stopped (a "net2280_queue: error=-108" follows
++ * every unbind with OUT DMA).  u_ether then resubmits that request
++ * where it does not expect any completion but -ESHUTDOWN: from
++ * gether_disconnect(), once port_usb is NULL, rx_submit() drops it (the
++ * request and its dma descriptor leak: "dma_pool_destroy requests busy"
++ * at rmmod), and from eth_stop(), which holds dev->lock, rx_complete()
++ * takes dev->lock again to unwrap an NCM transfer.
++ */
++static void abort_dma_teardown(struct net2280_ep *ep)
++{
++	if ((ep->dev->quirks & (PLX_LEGACY | PLX_2280)) != PLX_LEGACY) {
++		abort_dma(ep);
++		return;
++	}
++	if (likely(!list_empty(&ep->queue))) {
++		writel(BIT(DMA_ABORT), &ep->dma->dmastat);
++		spin_stop_dma(ep->dma);
++	} else
++		stop_dma(ep->dma);
++}
++
+ /* dequeue ALL requests */
+ static void nuke(struct net2280_ep *ep)
+ {
+@@ -1248,7 +1275,7 @@
+ 	/* called with spinlock held */
+ 	ep->stopped = 1;
+ 	if (ep->dma)
+-		abort_dma(ep);
++		abort_dma_teardown(ep);
+ 	while (!list_empty(&ep->queue)) {
+ 		req = list_entry(ep->queue.next,
+ 				struct net2280_request,
+@@ -2101,7 +2128,7 @@
+ 	for (tmp = 0; tmp < 4; tmp++) {
+ 		struct net2280_ep       *ep = &dev->ep[tmp + 1];
+ 		if (ep->dma)
+-			abort_dma(ep);
++			abort_dma_teardown(ep);
+ 	}
+ 
+ 	writel(~0, &dev->regs->irqstat0),

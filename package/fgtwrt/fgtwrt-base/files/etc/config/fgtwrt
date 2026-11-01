@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Settings of the FortiGate specific features (fgtwrt-base). Sections are
+# added at first boot for the features this board has; see
+# /usr/share/fgtwrt/models/ for the capabilities of each model.
+#
+# FortiGate 100D, user defined fan table (profile "custom"):
+#	config fan 'fan'
+#		option profile 'custom'
+#		option source 'cputin'		# systin | cputin
+#		list point '50:48'		# T:PWM, true degrees C, ascending, PWM1 >= 16
+#		list point '65:128'
+#		list point '80:255'		# last PWM always 255
+#		option guard_systin '55'	# cputin only: full speed at 55 C board
+#	config sensor 'cputin'			# calibration, command line only
+#		option gain '1.000'
+#		option offset '22.5'
+#		option calibrated '0'		# 1 once measured

@@ -5,9 +5,19 @@
 board_config_update
 
 case "$(board_name)" in
+fortinet,fg60c)
+	# The second bicolour LED of the front panel (ALARM or HA, not
+	# established): listed for the LED configuration, off and
+	# without a trigger.
+	ucidef_set_led_default "alarm_green" "ALARM green" "alarm:green" "0"
+	ucidef_set_led_default "alarm_red" "ALARM red" "alarm:red" "0"
+	;;
 fortinet,fg60d)
 	# STATUS is driven by diag.sh through the led-* aliases of the device
-	# tree; HA is left off.
+	# tree. HA is listed for the LED configuration, off and without a
+	# trigger; the ALARM LED has no known GPIO line.
+	ucidef_set_led_default "ha_green" "HA green" "green:ha" "0"
+	ucidef_set_led_default "ha_orange" "HA orange" "orange:ha" "0"
 	# The speed LED of each WAN port is one bicolour LED between two pins
 	# of its BCM54612E PHY: green is offloaded to the PHY at 1000 Mbit/s,
 	# orange is driven in software at 100 Mbit/s (off at 1000, which leaves
@@ -30,7 +40,10 @@ fortinet,fg60d)
 fortinet,fg60e)
 	# STATUS is driven by diag.sh through the led-* aliases of the device
 	# tree (green blinking while booting, green once running, orange
-	# blinking in failsafe and during an upgrade); HA is left off.
+	# blinking in failsafe and during an upgrade). HA is listed for the
+	# LED configuration, off and without a trigger; no ALARM LED.
+	ucidef_set_led_default "ha_green" "HA green" "green:ha" "0"
+	ucidef_set_led_default "ha_orange" "HA orange" "orange:ha" "0"
 	# The speed LED of each WAN port is one bicolour LED between the
 	# LED[0] pin of its 88E1514 PHY and an output line of the system
 	# manager: green is offloaded to the PHY at 1000 Mbit/s, orange is

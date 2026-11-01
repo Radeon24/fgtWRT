@@ -34,7 +34,7 @@ define Device/fortinet_fg-60d
 	kmod-ipsec kmod-ipsec4 kmod-ipsec6 kmod-crypto-seqiv \
 	kmod-crypto-chacha20poly1305 kmod-fortinet-np4lite-ipsec fortigate-dualslot \
 	e2fsprogs luci kmod-wireguard wireguard-tools openvpn-openssl \
-	kmod-ovpn-backports openssl-util
+	kmod-ovpn-backports openssl-util fgtwrt-base luci-app-fgtwrt
   SUPPORTED_DEVICES := fortinet,fg60d
 endef
 TARGET_DEVICES += fortinet_fg-60d
@@ -71,7 +71,7 @@ define Device/fortinet_fg-90d
 	kmod-ipsec kmod-ipsec4 kmod-ipsec6 kmod-crypto-seqiv \
 	kmod-crypto-chacha20poly1305 kmod-fortinet-np4lite-ipsec fortigate-dualslot \
 	e2fsprogs luci kmod-wireguard wireguard-tools openvpn-openssl \
-	kmod-ovpn-backports openssl-util
+	kmod-ovpn-backports openssl-util fgtwrt-base luci-app-fgtwrt
   SUPPORTED_DEVICES := fortinet,fg90d
 endef
 TARGET_DEVICES += fortinet_fg-90d

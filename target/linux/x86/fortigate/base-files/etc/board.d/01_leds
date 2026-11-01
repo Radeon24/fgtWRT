@@ -1,0 +1,27 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The STATUS, HA and ALARM LEDs of the FortiGate 100D (kmod-leds-fg100d)
+# are listed for the LED configuration, without a trigger: STATUS green
+# on once the LED service has run ("system ready", as the stock firmware
+# does at the end of its start-up), the other five off. Each default is
+# one write of the latch, by the LED service (START=96).
+
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+fortinet,fg100d)
+	ucidef_set_led_default "status_green" "STATUS green" "green:status" "1"
+	ucidef_set_led_default "status_red" "STATUS red" "red:status" "0"
+	ucidef_set_led_default "ha_green" "HA green" "green:ha" "0"
+	ucidef_set_led_default "ha_red" "HA red" "red:ha" "0"
+	ucidef_set_led_default "alarm_red" "ALARM red" "red:alarm" "0"
+	ucidef_set_led_default "alarm_amber" "ALARM amber" "amber:alarm" "0"
+	;;
+esac
+
+board_config_flush
+
+exit 0

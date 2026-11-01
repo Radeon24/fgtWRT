@@ -35,7 +35,7 @@ define Device/fortinet_fg-60e
 	kmod-ipsec kmod-ipsec4 kmod-ipsec6 kmod-crypto-seqiv \
 	kmod-crypto-chacha20poly1305 kmod-crypto-sha256 \
 	e2fsprogs luci kmod-wireguard wireguard-tools openvpn-openssl \
-	kmod-ovpn-backports openssl-util conntrack ip-bridge \
+	kmod-ovpn-backports openssl-util fgtwrt-base luci-app-fgtwrt conntrack ip-bridge \
 	kmod-gpio-button-hotplug r8a779x-usb3-firmware \
 	kmod-usb-storage kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1
   SUPPORTED_DEVICES := fortinet,fg60e

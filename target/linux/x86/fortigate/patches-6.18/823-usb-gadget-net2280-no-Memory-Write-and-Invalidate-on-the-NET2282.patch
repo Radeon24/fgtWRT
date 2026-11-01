@@ -1,0 +1,61 @@
+From: Radeon24 <Radeon24@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 18:00:00 +0100
+Subject: [PATCH] usb: gadget: net2280: no Memory Write and Invalidate on the
+ NET2282
+
+On a FortiGate 100D (NET2282 on a conventional PCI bus, 64 byte cache
+line), a sustained host-to-device transfer on a CDC NCM gadget with
+the DMA engines ends with the OUT endpoint never completing a request
+again: the DMA_ABORT that handle_ep_small() writes at the end of a
+short OUT transfer stays pending (DMA_ENABLE does not drop, and the
+abort bit still reads 1 once the channel paused), and the channel then
+ignores the next DMA_START. The four slow aborts recorded all stopped
+14016 bytes into their transfer, 219 cache lines.
+
+The NET2280 databook (8.6, 8.7) ends an aborted or paused Memory Write
+and Invalidate burst at the next cache line boundary. With the probe
+writing PCIMSTCTL without DMA Memory Write and Invalidate Enable on
+the NET2282 (0x300 instead of 0x700, PCI_COMMAND unchanged), the same
+traffic ran on three boots, one of them cold, with no slow abort at
+all, every transfer checksummed, at four to five times the PIO rate
+host to device and twice device to host.
+
+NET2282 only; the NET2280 and the USB338x are unchanged. Also report
+the value written at probe time.
+
+Assisted-by: LLM
+Signed-off-by: Radeon24 <Radeon24@users.noreply.github.com>
+---
+--- a/drivers/usb/gadget/udc/net2280.c
++++ b/drivers/usb/gadget/udc/net2280.c
+@@ -3818,9 +3818,18 @@
+ 		dev->ep[i].dummy = td;
+ 	}
+ 
+-	/* enable lower-overhead pci memory bursts during DMA */
++	/* enable lower-overhead pci memory bursts during DMA.
++	 * NET2282: Memory Write only, no Memory Write and Invalidate.  The
++	 * NET2280 databook (8.6, 8.7) ends an aborted or paused MWI burst
++	 * at the next cache line boundary.  On a NET2282 the DMA_ABORT of a
++	 * short OUT transfer was seen to stay pending, each time a multiple
++	 * of the 64 byte cache line into the transfer, and the OUT endpoint
++	 * then stopped completing requests; without MWI the same CDC NCM
++	 * traffic ran with no slow abort at all.
++	 */
+ 	if (dev->quirks & PLX_LEGACY)
+-		writel(BIT(DMA_MEMORY_WRITE_AND_INVALIDATE_ENABLE) |
++		writel(((dev->quirks & PLX_2280) ?
++			BIT(DMA_MEMORY_WRITE_AND_INVALIDATE_ENABLE) : 0) |
+ 			/*
+ 			 * 256 write retries may not be enough...
+ 			   BIT(PCI_RETRY_ABORT_ENABLE) |
+@@ -3841,6 +3850,9 @@
+ 			pdev->irq, base, dev->chiprev);
+ 	ep_info(dev, "version: " DRIVER_VERSION "; %s\n",
+ 		dev->enhanced_mode ? "enhanced mode" : "legacy mode");
++	if ((dev->quirks & (PLX_LEGACY | PLX_2280)) == PLX_LEGACY)
++		ep_info(dev, "net2282: dma %s, no memory write and invalidate, pcimstctl %08x\n",
++			use_dma ? "on" : "off", readl(&dev->pci->pcimstctl));
+ 	retval = device_create_file(&pdev->dev, &dev_attr_registers);
+ 	if (retval)
+ 		goto done;
