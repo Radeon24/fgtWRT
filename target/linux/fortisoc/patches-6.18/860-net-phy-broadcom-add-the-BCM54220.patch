@@ -1,0 +1,137 @@
+From: Evil.2000 <evil.2000@web.de>
+Subject: [PATCH] net: phy: broadcom: add the BCM54220
+
+The BCM54220 (PHY ID 0x600d8589 on the FortiGate 100E, where it is sold
+as B50220) is a dual port GPHY with an RGMII or SGMII MAC interface.
+Both ports of the 100E are strapped to SGMII to copper but wired as
+RGMII: apply the RGMII set-up of the board boot loader (Miscellaneous
+Control bit 5 cleared and bit 7 set, Mode Control interface select 00)
+in config_init, and do not soft-reset the PHY. Also apply the LED
+set-up of the board (spare control link speed LED mode, LED control),
+without which the link LEDs stay dark.
+
+---
+diff -ruN a/drivers/net/phy/broadcom.c b/drivers/net/phy/broadcom.c
+--- a/drivers/net/phy/broadcom.c
++++ b/drivers/net/phy/broadcom.c
+@@ -1547,6 +1547,86 @@
+ 	return genphy_read_status(phydev);
+ }
+ 
++/*
++ * BCM54220 (dual port, RGMII or SGMII to copper or fiber, register access
++ * through RDB). Mode Control (RDB 0x021) bits 2:1 select the interface,
++ * 00 = RGMII to copper; Miscellaneous Control (RDB 0x02f, the shadow 7
++ * value of the auxiliary control register) bit 7 enables the RGMII
++ * interface. On the FortiGate 100E both ports are strapped to SGMII to
++ * copper but wired as RGMII to the network processor: no frame passes
++ * until the boot loader set-up below is applied (bit 5 of Miscellaneous
++ * Control must be cleared too, meaning unknown; with it set, nothing
++ * reaches the wire). The RGMII delays are left as strapped (both on).
++ */
++#define BCM54220_BASE_ADDR		31
++#define BCM54220_RDB_MODE_CTRL		0x021
++#define  BCM54220_MODE_SEL_MASK		GENMASK(2, 1)
++#define  BCM54220_MODE_SEL_RGMII	0
++#define BCM54220_RDB_MISC_CTRL		0x02f
++#define  BCM54220_MISC_RGMII_EN		BIT(7)
++#define  BCM54220_MISC_BIT5		BIT(5)
++/*
++ * LED set-up of the board: spare control (shadow 0x02) link speed LED mode
++ * on, link LED mode off; LED control (shadow 0x09) 0x08 under mask 0x11b.
++ * Without it the link LEDs of the 100E stay dark.
++ */
++#define BCM54220_RDB_SPARE_CTRL		0x012
++#define  BCM54220_SPARE_LINK_LED	BIT(0)
++#define  BCM54220_SPARE_LINK_SPEED_LED	BIT(2)
++#define BCM54220_RDB_LED_CTRL		0x019
++#define  BCM54220_LED_CTRL_MASK		0x011b
++#define  BCM54220_LED_CTRL_VAL		0x0008
++
++static int bcm54220_rgmii(struct phy_device *phydev)
++{
++	int err;
++
++	err = bcm_phy_modify_rdb(phydev, BCM54220_RDB_MISC_CTRL,
++				 BCM54220_MISC_BIT5, BCM54220_MISC_RGMII_EN);
++	if (err < 0)
++		return err;
++
++	return bcm_phy_modify_rdb(phydev, BCM54220_RDB_MODE_CTRL,
++				  BCM54220_MODE_SEL_MASK,
++				  BCM54220_MODE_SEL_RGMII);
++}
++
++static int bcm54220_config_init(struct phy_device *phydev)
++{
++	struct phy_device *base;
++	int err;
++
++	err = bcm_phy_modify_rdb(phydev, BCM54220_RDB_SPARE_CTRL,
++				 BCM54220_SPARE_LINK_LED |
++				 BCM54220_SPARE_LINK_SPEED_LED,
++				 BCM54220_SPARE_LINK_SPEED_LED);
++	if (err < 0)
++		return err;
++
++	err = bcm_phy_modify_rdb(phydev, BCM54220_RDB_LED_CTRL,
++				 BCM54220_LED_CTRL_MASK, BCM54220_LED_CTRL_VAL);
++	if (err < 0)
++		return err;
++
++	if (!phy_interface_is_rgmii(phydev))
++		return 0;
++
++	err = bcm54220_rgmii(phydev);
++	if (err < 0)
++		return err;
++
++	/*
++	 * Each port needs the mode, and the other port of the chip needs it on
++	 * the base address as well: opened alone, it links up and passes no
++	 * frame until that port is set too.
++	 */
++	base = mdiobus_get_phy(phydev->mdio.bus, BCM54220_BASE_ADDR);
++	if (!base || base == phydev)
++		return 0;
++
++	return bcm54220_rgmii(base);
++}
++
+ static struct phy_driver broadcom_drivers[] = {
+ {
+ 	PHY_ID_MATCH_MODEL(PHY_ID_BCM5411),
+@@ -1573,6 +1653,14 @@
+ 	.handle_interrupt = bcm_phy_handle_interrupt,
+ 	.link_change_notify	= bcm54xx_link_change_notify,
+ }, {
++	PHY_ID_MATCH_MODEL(PHY_ID_BCM54220),
++	.name		= "Broadcom BCM54220",
++	/* PHY_GBIT_FEATURES */
++	/* no soft reset: it would bring back the strapped interface mode */
++	.config_init	= bcm54220_config_init,
++	.suspend	= genphy_suspend,
++	.resume		= genphy_resume,
++}, {
+ 	PHY_ID_MATCH_MODEL(PHY_ID_BCM54210E),
+ 	.name		= "Broadcom BCM54210E",
+ 	/* PHY_GBIT_FEATURES */
+@@ -1843,6 +1931,7 @@
+ 	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM5411) },
+ 	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM5421) },
+ 	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM54210E) },
++	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM54220) },
+ 	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM5461) },
+ 	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM54612E) },
+ 	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM54616S) },
+diff -ruN a/include/linux/brcmphy.h b/include/linux/brcmphy.h
+--- a/include/linux/brcmphy.h
++++ b/include/linux/brcmphy.h
+@@ -24,6 +24,7 @@
+ #define PHY_ID_BCM5411			0x00206070
+ #define PHY_ID_BCM5421			0x002060e0
+ #define PHY_ID_BCM54210E		0x600d84a0
++#define PHY_ID_BCM54220			0x600d8580
+ #define PHY_ID_BCM5464			0x002060b0
+ #define PHY_ID_BCM5461			0x002060c0
+ #define PHY_ID_BCM54612E		0x03625e60
