@@ -6,7 +6,9 @@
 through the `fgtwrt` service. `luci-app-fgtwrt` adds System → fgtWRT to
 LuCI: an overview, and the fan and USB management port pages on the
 models that have them. Both are in the image of every published FortiGate
-profile (60D, 90D, 60E; the 100D profile when its subtarget is merged).
+profile (60D, 90D, 60E; the 100D profile when its subtarget is merged)
+and of the 100E profile (no fan entry: its fans follow the curve set by
+`fan-profile`).
 
 ## Fan (FortiGate 100D)
 
