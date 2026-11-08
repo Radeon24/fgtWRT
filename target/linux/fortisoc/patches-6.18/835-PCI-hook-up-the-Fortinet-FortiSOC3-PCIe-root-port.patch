@@ -1,0 +1,36 @@
+From: Evil.2000 <evil.2000@web.de>
+Subject: [PATCH] PCI: hook up the Fortinet FortiSOC3 PCIe root port driver
+
+Build pcie-fsoc3 (PCIE_FSOC3).
+---
+diff -ruN a/drivers/pci/controller/Kconfig b/drivers/pci/controller/Kconfig
+--- a/drivers/pci/controller/Kconfig
++++ b/drivers/pci/controller/Kconfig
+@@ -128,6 +128,16 @@
+ 	depends on OF
+ 	default ARCH_GEMINI
+ 
++config PCIE_FSOC3
++	bool "Fortinet FortiSOC3 PCIe root port"
++	depends on ARCH_FSOC3 || COMPILE_TEST
++	depends on OF
++	help
++	  Say Y here to enable the PCIe root port of the Fortinet FortiSOC3
++	  (FortiGate 100E: link to the BCM53344 switch).
++
++	  If unsure, say N.
++
+ config PCI_HOST_GENERIC
+ 	tristate "Generic PCI host controller"
+ 	depends on OF
+diff -ruN a/drivers/pci/controller/Makefile b/drivers/pci/controller/Makefile
+--- a/drivers/pci/controller/Makefile
++++ b/drivers/pci/controller/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_PCIE_CADENCE) += cadence/
+ obj-$(CONFIG_PCI_FTPCI100) += pci-ftpci100.o
++obj-$(CONFIG_PCIE_FSOC3) += pcie-fsoc3.o
+ obj-$(CONFIG_PCI_IXP4XX) += pci-ixp4xx.o
+ obj-$(CONFIG_PCI_HYPERV) += pci-hyperv.o
+ obj-$(CONFIG_PCI_HYPERV_INTERFACE) += pci-hyperv-intf.o
