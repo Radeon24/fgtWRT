@@ -1,0 +1,17 @@
+{
+	"id": "fg100e",
+	"name": "FortiGate 100E",
+	"fan": null,
+	"usb": {
+		"host": true,
+		"gadget": null
+	},
+	"np": {
+		"module": "fortinet_np6lite",
+		"params": [ "ft_nat66", "ft_udp", "ft_cnt_ms", "bridge_offload" ]
+	},
+	"leds": [],
+	"leds_missing": [],
+	"button": null,
+	"watchdog": "fsoc3-wdt"
+}

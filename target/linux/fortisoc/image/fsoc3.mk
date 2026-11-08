@@ -62,11 +62,15 @@ define Device/fortinet_fg-100e
 	fstools_overlay_fstype=ext4 fstools_overlay_nodiscard=1 \
 	fstools_ignore_partname=1
   DEVICE_DTS := fortinet-fg100e
-  DEVICE_PACKAGES := ethtool ip-full ip-bridge kmod-fortinet-np6lite \
+  DEVICE_PACKAGES := firewall4 kmod-nft-offload kmod-bonding proto-bonding \
+	ethtool ip-full ip-bridge kmod-fortinet-np6lite \
+	kmod-fortinet-fsoc3-trng kmod-fortinet-fsoc3-pkce kmod-fortinet-fsoc3-cp \
+	kmod-ipsec kmod-ipsec4 kmod-ipsec6 kmod-crypto-seqiv \
+	kmod-crypto-chacha20poly1305 kmod-crypto-sha256 \
+	luci kmod-wireguard wireguard-tools openvpn-openssl \
+	kmod-ovpn-backports openssl-util fgtwrt-base luci-app-fgtwrt conntrack \
 	r8a779x-usb3-firmware i2c-tools kmod-hwmon-nct7802 \
-	kmod-usb-storage kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1 \
-	kmod-bonding proto-bonding \
-	kmod-fortinet-fsoc3-trng kmod-fortinet-fsoc3-pkce kmod-fortinet-fsoc3-cp
+	kmod-usb-storage kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1
   SUPPORTED_DEVICES := fortinet,fg100e
 endef
 TARGET_DEVICES += fortinet_fg-100e

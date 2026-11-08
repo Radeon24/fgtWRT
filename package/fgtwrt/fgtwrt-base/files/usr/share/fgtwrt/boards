@@ -4,6 +4,7 @@ fortinet,fg60c fg60c
 fortinet,fg60d fg60d
 fortinet,fg90d fg90d
 fortinet,fg60e fg60e
+fortinet,fg100e fg100e
 fortinet,fg100d fg100d
 # x86 boards without DMI tables are "generic": PCI fingerprint instead.
 # FortiGate 100D: ICH8M LPC bridge (8086:2815) and BCM53314 switch
