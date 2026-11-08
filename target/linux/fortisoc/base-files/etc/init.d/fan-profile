@@ -1,0 +1,9 @@
+#!/bin/sh /etc/rc.common
+# Fan profile of the FortiGate 100E (/etc/config/fan)
+
+START=15
+
+boot() {
+	/usr/sbin/fan-profile --boot
+	return 0
+}

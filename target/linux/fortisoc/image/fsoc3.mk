@@ -41,3 +41,31 @@ define Device/fortinet_fg-60e
   SUPPORTED_DEVICES := fortinet,fg60e
 endef
 TARGET_DEVICES += fortinet_fg-60e
+
+# RAM boot only: the device tree describes no write
+# window and platform.sh knows no slot for it, so sysupgrade refuses to
+# install. The boot loader checks the model name of the container: FG100E
+# (FGT60E and FGT100E are refused as "Wrong image type").
+define Device/fortinet_fg-100e
+  DEVICE_VENDOR := Fortinet
+  DEVICE_MODEL := FortiGate 100E
+  SOC := fsoc3
+  FORTIGATE_MODEL := FG100E
+  FORTIGATE_CONTAINER_DTB := 1
+  FORTIGATE_PART_SECTORS := 524288
+  FORTIGATE_CONTAINER_SECTORS := 32760
+  FORTIGATE_INITRD_ADDR := 0x1A000000
+  # Kernel command line of the flatkc header: the one of the kernel
+  # (CONFIG_CMDLINE, forced)
+  FORTIGATE_CMDLINE := earlycon=em_uart,mmio32,0xfb000000 \
+	console=ttyS0,9600n8 loglevel=6 panic=10 bonding.max_bonds=0 \
+	fstools_overlay_fstype=ext4 fstools_overlay_nodiscard=1 \
+	fstools_ignore_partname=1
+  DEVICE_DTS := fortinet-fg100e
+  DEVICE_PACKAGES := ethtool ip-full ip-bridge kmod-fortinet-np6lite \
+	r8a779x-usb3-firmware i2c-tools kmod-hwmon-nct7802 \
+	kmod-usb-storage kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1 \
+	kmod-bonding proto-bonding
+  SUPPORTED_DEVICES := fortinet,fg100e
+endef
+TARGET_DEVICES += fortinet_fg-100e

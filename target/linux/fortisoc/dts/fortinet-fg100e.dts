@@ -1,0 +1,602 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/dts-v1/;
+
+/*
+ * FortiGate 100E (board P20124-09, "PCB FG-100E/101E MB 6L"): FortiSOC3,
+ * like the 60E. RAM boot only: nothing here writes to the eMMC or the boot
+ * flash. mgmt and dmz are BCM54220 PHYs on the MDIO of the network
+ * processor; wan1, wan2 and the 18 front ports sit behind the BCM53344
+ * switch on PCIe, which the bcm53344 driver sets up as pass-through
+ * fabric with one uplink per zone (wan1, wan2, lan, ha). Still unknown on
+ * this board, hence left out: the wiring of the NP6Lite GPIO lines (LEDs,
+ * button, hogs of the 60E).
+ */
+
+#include "fsoc3.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "Fortinet FortiGate 100E";
+	compatible = "fortinet,fg100e", "fortinet,fsoc3";
+
+	aliases {
+		serial0 = &uart0;
+		i2c0 = &i2c0;
+	};
+
+	chosen {
+		bootargs = "earlycon=em_uart,mmio32,0xfb000000 console=ttyS0,9600n8 loglevel=8 panic=10";
+		stdout-path = "serial0:9600n8";
+	};
+
+	/*
+	 * Four MT41K1G8SN chips: 4 GiB, of which the Cortex-A9 (no LPAE) sees
+	 * 0x00000000-0xbfffffff (as FortiOS does); a memory test passed in
+	 * both windows. The 160 MiB from 0x76000000 stay with the network
+	 * processor (fortinet,tce-base and its flow tables). The window above
+	 * 0xb0000000 needs HIGHMEM.
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x76000000>,
+		      <0x80000000 0x40000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Host queue 0 of the network processor, left running by the
+		 * boot loader after its TFTP transfer: rings and buffers from
+		 * 0x10000000 (seen on this board: receive ring at 0x10000000,
+		 * transmit ring at 0x10020620). The whole MiB, as on the 60E.
+		 */
+		np_loader: np-loader@10000000 {
+			reg = <0x10000000 0x100000>;
+			no-map;
+		};
+
+		/*
+		 * Traffic counter engine of the network processor, left with
+		 * its counter base at 0 by the boot loader until the driver
+		 * moves it to fortinet,tce-base (see the 60E device tree).
+		 */
+		np_tce_low: np-tce-low@0 {
+			reg = <0x00000000 0x4000>;
+		};
+	};
+
+	/* Input clock of the eMMC controller: 1 GHz / 11 */
+	sdhi_clk: clock-sdhi {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <90909090>;
+	};
+};
+
+&{/soc} {
+	/*
+	 * eMMC (Micron, 7471104 sectors as on the 60E: FortiOS in partitions
+	 * 1 and 2). Strictly read-only: fortinet,force-ro without write
+	 * windows refuses every data write, and no rootfs_data is described.
+	 */
+	mmc@f3010000 {
+		compatible = "fortinet,fsoc3-sdhi";
+		reg = <0xf3010000 0x2000>;
+		interrupts = <GIC_SPI 22 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&sdhi_clk>;
+		bus-width = <4>;
+		max-frequency = <25000000>;
+		non-removable;
+		no-sdio;
+		no-sd;
+		fortinet,force-ro;
+	};
+
+	/*
+	 * NP6Lite msc GPIO block, without consumers until the wiring of this
+	 * board is known. Reserved as on the 60E: 6 (USB port power, xHCI
+	 * glue), 17-18 (MDC lines) and 20-25 (resets, NP6Lite driver).
+	 */
+	gpio@f500fc00 {
+		compatible = "fortinet,fsoc3-gpio";
+		reg = <0xf500fc00 0x80>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		ngpios = <32>;
+		gpio-reserved-ranges = <10 1>, <17 2>, <20 6>;
+	};
+
+	/*
+	 * PCIe root port (1a29:5333) with the BCM53344 switch on its link
+	 * (01:00.0, 01:00.1, 14e4:8344, read on this board). Memory window
+	 * and interrupt as the board firmware describes them (16 MiB at
+	 * 0xf0000000, SPI 112).
+	 */
+	pcie@f3000000 {
+		compatible = "fortinet,fsoc3-pcie";
+		reg = <0xf3000000 0x100>;
+		device_type = "pci";
+		#address-cells = <3>;
+		#size-cells = <2>;
+		#interrupt-cells = <1>;
+		bus-range = <0x00 0x01>;
+		ranges = <0x02000000 0 0xf0000000 0xf0000000 0 0x01000000>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &gic GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>,
+				<0 0 0 2 &gic GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>,
+				<0 0 0 3 &gic GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>,
+				<0 0 0 4 &gic GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>;
+
+		/* root port 00:00.0, the switch behind it on bus 1 */
+		pcie@0,0 {
+			device_type = "pci";
+			reg = <0x0000 0 0 0 0>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+
+			/*
+			 * BCM53344, function 0 (14e4:8344). wan1/wan2 are zones of
+			 * the driver; the other front ports are DSA user ports of
+			 * two instances with tag_8021q (16 user ports at most
+			 * each): port1-16 over uplink 20 (conduit sw0), ha1/ha2
+			 * over uplink 21 (conduit sw1).
+			 */
+			switch@0,0 {
+				compatible = "pci14e4,8344";
+				reg = <0x10000 0 0 0 0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/* internal MDIO bus 0: QGPHYs of ports 2-17 */
+				mdio-int {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					qgphy_1: ethernet-phy@1 {
+						reg = <1>;
+					};
+					qgphy_2: ethernet-phy@2 {
+						reg = <2>;
+					};
+					qgphy_3: ethernet-phy@3 {
+						reg = <3>;
+					};
+					qgphy_4: ethernet-phy@4 {
+						reg = <4>;
+					};
+					qgphy_6: ethernet-phy@6 {
+						reg = <6>;
+					};
+					qgphy_7: ethernet-phy@7 {
+						reg = <7>;
+					};
+					qgphy_11: ethernet-phy@b {
+						reg = <11>;
+					};
+					qgphy_12: ethernet-phy@c {
+						reg = <12>;
+					};
+					qgphy_13: ethernet-phy@d {
+						reg = <13>;
+					};
+					qgphy_14: ethernet-phy@e {
+						reg = <14>;
+					};
+					qgphy_16: ethernet-phy@10 {
+						reg = <16>;
+					};
+					qgphy_17: ethernet-phy@11 {
+						reg = <17>;
+					};
+					qgphy_18: ethernet-phy@12 {
+						reg = <18>;
+					};
+					qgphy_19: ethernet-phy@13 {
+						reg = <19>;
+					};
+				};
+
+				/* external MDIO bus 1: B50220 of ports 26-29 */
+				mdio-ext {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					b50220_0: ethernet-phy@0 {
+						reg = <0>;
+					};
+					b50220_15: ethernet-phy@f {
+						reg = <15>;
+					};
+					b50220_16: ethernet-phy@10 {
+						reg = <16>;
+					};
+					b50220_31: ethernet-phy@1f {
+						reg = <31>;
+					};
+				};
+
+				switch-0 {
+					compatible = "brcm,bcm53344-dsa";
+					dsa,member = <0 0>;
+
+					ports {
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						port@0 {
+							reg = <0>;
+							label = "port1";
+							phy-handle = <&qgphy_3>;
+							phy-mode = "internal";
+						};
+						port@1 {
+							reg = <1>;
+							label = "port2";
+							phy-handle = <&qgphy_4>;
+							phy-mode = "internal";
+						};
+						port@2 {
+							reg = <2>;
+							label = "port3";
+							phy-handle = <&qgphy_1>;
+							phy-mode = "internal";
+						};
+						port@3 {
+							reg = <3>;
+							label = "port4";
+							phy-handle = <&qgphy_2>;
+							phy-mode = "internal";
+						};
+						port@4 {
+							reg = <4>;
+							label = "port5";
+							phy-handle = <&qgphy_12>;
+							phy-mode = "internal";
+						};
+						port@5 {
+							reg = <5>;
+							label = "port6";
+							phy-handle = <&qgphy_11>;
+							phy-mode = "internal";
+						};
+						port@6 {
+							reg = <6>;
+							label = "port7";
+							phy-handle = <&qgphy_14>;
+							phy-mode = "internal";
+						};
+						port@7 {
+							reg = <7>;
+							label = "port8";
+							phy-handle = <&qgphy_13>;
+							phy-mode = "internal";
+						};
+						port@8 {
+							reg = <8>;
+							label = "port9";
+							phy-handle = <&qgphy_17>;
+							phy-mode = "internal";
+						};
+						port@9 {
+							reg = <9>;
+							label = "port10";
+							phy-handle = <&qgphy_16>;
+							phy-mode = "internal";
+						};
+						port@10 {
+							reg = <10>;
+							label = "port11";
+							phy-handle = <&qgphy_19>;
+							phy-mode = "internal";
+						};
+						port@11 {
+							reg = <11>;
+							label = "port12";
+							phy-handle = <&qgphy_18>;
+							phy-mode = "internal";
+						};
+						port@12 {
+							reg = <12>;
+							label = "port13";
+							phy-handle = <&b50220_0>;
+							phy-mode = "sgmii";
+						};
+						port@13 {
+							reg = <13>;
+							label = "port14";
+							phy-handle = <&b50220_31>;
+							phy-mode = "sgmii";
+						};
+						port@14 {
+							reg = <14>;
+							label = "port15";
+							phy-handle = <&b50220_16>;
+							phy-mode = "sgmii";
+						};
+						port@15 {
+							reg = <15>;
+							label = "port16";
+							phy-handle = <&b50220_15>;
+							phy-mode = "sgmii";
+						};
+						port@16 {
+							reg = <16>;
+							ethernet = <&np_sw0>;
+							phy-mode = "internal";
+
+							fixed-link {
+								speed = <1000>;
+								full-duplex;
+							};
+						};
+					};
+				};
+
+				switch-1 {
+					compatible = "brcm,bcm53344-dsa";
+					dsa,member = <1 1>;
+
+					ports {
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						port@0 {
+							reg = <0>;
+							label = "ha1";
+							phy-handle = <&qgphy_6>;
+							phy-mode = "internal";
+						};
+						port@1 {
+							reg = <1>;
+							label = "ha2";
+							phy-handle = <&qgphy_7>;
+							phy-mode = "internal";
+						};
+						port@2 {
+							reg = <2>;
+							ethernet = <&np_sw1>;
+							phy-mode = "internal";
+
+							fixed-link {
+								speed = <1000>;
+								full-duplex;
+							};
+						};
+					};
+				};
+			};
+		};
+	};
+
+	/* xHCI, as on the 60E: one USB-A port, USB 2 only; port power on line 10 */
+	usb@f3008000 {
+		compatible = "fortinet,fsoc3-xhci";
+		reg = <0xf3008000 0x8000>,
+		      <0xf500fc00 0x80>;
+		interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
+		firmware-name = "r8a779x_usb3_v2-98d922b9.dlmem";
+		fortinet,vbus-line = <10>;
+		fortinet,skip-fresh-ep-reset;
+		fortinet,trust-internal-ep-state;
+	};
+
+	/* Internal RTC, read only: never written. */
+	rtc@fc700000 {
+		compatible = "fortinet,fsoc3-rtc";
+		reg = <0xfc700000 0x100>;
+	};
+
+	/* First I2C controller (IICA), read-only driver */
+	i2c0: i2c@fb004000 {
+		compatible = "fortinet,fsoc3-i2c";
+		reg = <0xfb004000 0x1000>;
+		interrupts = <GIC_SPI 13 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 12 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "transfer", "stop";
+		clocks = <&periph_clk>;
+		fortinet,writable-address = <0x28>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/*
+		 * Hardware monitor (U72): bank 0, vendor 0x50, chip 0xc3,
+		 * version 0x21 read at this address on this board. It drives
+		 * the fans by itself, with curves the fan profiles of
+		 * userspace set: the only device of the bus that may be
+		 * written.
+		 */
+		hwmon@28 {
+			compatible = "nuvoton,nct7802";
+			reg = <0x28>;
+		};
+	};
+
+	/*
+	 * NP6Lite network processor. On the MDC line of NP GPIO 17, PHY ID
+	 * 600d:8589 at addresses 0 (dmz) and 31 (mgmt), found by moving a
+	 * cable between the front ports; nothing else answers on it, nothing
+	 * on the MDC line of GPIO 18. The boot loader leaves the mgmt PHY
+	 * powered down after its TFTP transfer (phylib powers it up). wan1
+	 * and wan2 have no PHY here: they are switch ports.
+	 */
+	np: ethernet@f5000000 {
+		compatible = "fortinet,fsoc3-np6lite";
+		/* 0x0c, as on the 60E, stops the NP at the first UDP session hit */
+		fortinet,sse-udp-tail = <0x0b>;
+		reg = <0xf5000000 0x20000>;
+		interrupts = <GIC_SPI 48 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 49 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 50 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 51 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 52 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "hif0", "hif1", "hif2", "hif3", "err";
+		dma-coherent;
+		/*
+		 * No fortinet,reset-pins: lines 20-25 are inputs pulled high
+		 * under the boot loader of this board (resets of the 60E), and
+		 * driving them could fight a device; the loader leaves lines
+		 * 7, 11, 12 low and 13 high as outputs (PHY resets? not known).
+		 */
+		fortinet,init-logical-interfaces;
+		fortinet,tce-base = <0x76000000>;
+
+		mdio {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			/* no fortinet,mdc-pin: the pin mux stays as the loader set it */
+
+			phy_dmz: ethernet-phy@0 {
+				reg = <0>;
+			};
+
+			phy_mgmt: ethernet-phy@1f {
+				reg = <31>;
+			};
+		};
+
+		ethernet-ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/*
+			 * reg = LIF; fortinet,np-link = NP link (MAC port + 1).
+			 * mgmt and dmz are the RGMII MAC ports 0 and 1: the boot
+			 * loader leaves MAC port 0 enabled after its TFTP
+			 * transfer on mgmt; the FortiOS port numbers (mgmt 1,
+			 * dmz 2, wan1 3, wan2 4) read as NP links. MAC
+			 * addresses: the base is the one the boot loader uses on
+			 * mgmt; FortiOS gives dmz the base - 1, which a mac-base
+			 * cell cannot express, hence dmz = base + 1 for now.
+			 */
+			/*
+			 * wan1 on MAC port 2 (NP link 3; LIF 0 is tied to MAC
+			 * port 2 by the driver), uplink to BCM53344 port 18
+			 * (front port 8 = wan1 jack): fixed 1000BASE-X link.
+			 */
+			port@0 {
+				reg = <0>;
+				label = "wan1";
+				nvmem-cells = <&mac_base 2>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
+				fortinet,np-link = <3>;
+				phy-mode = "1000base-x";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+
+			/*
+			 * wan2 on MAC port 3 (NP link 4), uplink to BCM53344
+			 * port 19 (front port 9 = wan2 jack). LIF 7: LIFs 4-6
+			 * are the host trunk LIFs of the flow offload.
+			 */
+			port@7 {
+				reg = <7>;
+				label = "wan2";
+				nvmem-cells = <&mac_base 3>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
+				fortinet,np-link = <4>;
+				phy-mode = "1000base-x";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+
+			/*
+			 * DSA conduits: sw0 = uplink port 20 (port1-16), sw1 =
+			 * uplink port 21 (ha1, ha2)
+			 */
+			np_sw0: port@8 {
+				reg = <8>;
+				label = "sw0";
+				nvmem-cells = <&mac_base 4>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
+				fortinet,np-link = <5>;
+				phy-mode = "1000base-x";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+
+			np_sw1: port@9 {
+				reg = <9>;
+				label = "sw1";
+				nvmem-cells = <&mac_base 5>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
+				fortinet,np-link = <6>;
+				phy-mode = "1000base-x";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+				label = "mgmt";
+				nvmem-cells = <&mac_base 0>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
+				fortinet,np-link = <1>;
+				phy-handle = <&phy_mgmt>;
+				phy-mode = "rgmii";
+			};
+
+			port@3 {
+				reg = <3>;
+				label = "dmz";
+				nvmem-cells = <&mac_base 1>;
+				nvmem-cell-names = "mac-address";
+				post-init-providers = <&mac_base>;
+				fortinet,np-link = <2>;
+				phy-handle = <&phy_dmz>;
+				phy-mode = "rgmii";
+			};
+		};
+	};
+
+	watchdog@fbe01600 {
+		compatible = "fortinet,fsoc3-wdt";
+		reg = <0xfbe01600 0x100>;
+		interrupts = <GIC_SPI 11 IRQ_TYPE_EDGE_RISING>;
+		clock-frequency = <48000000>;
+		timeout-sec = <30>;
+		fortinet,sysmgr = <&sysmgr>;
+	};
+};
+
+/*
+ * Factory block of the boot flash (Macronix MX25L, 2 MiB), read only: the
+ * base MAC address at 0x5880, as on the 60E (seen on this board: the same
+ * address as the boot loader shows).
+ */
+&boot_flash {
+	status = "okay";
+
+	nvmem-layout {
+		compatible = "fixed-layout";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		mac_base: mac-address@5880 {
+			compatible = "mac-base";
+			reg = <0x5880 0x6>;
+			#nvmem-cell-cells = <1>;
+		};
+	};
+};

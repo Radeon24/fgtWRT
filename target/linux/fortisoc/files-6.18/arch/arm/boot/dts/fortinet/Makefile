@@ -5,4 +5,5 @@ dtb-$(CONFIG_ARCH_FSOC2) += \
 	fortinet-fg60d.dtb \
 	fortinet-fg90d.dtb
 dtb-$(CONFIG_ARCH_FSOC3) += \
-	fortinet-fg60e.dtb
+	fortinet-fg60e.dtb \
+	fortinet-fg100e.dtb

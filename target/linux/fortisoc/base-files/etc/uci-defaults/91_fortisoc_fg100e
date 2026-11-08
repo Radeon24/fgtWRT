@@ -1,0 +1,34 @@
+#!/bin/sh
+# FortiGate 100E: drop packets whose source address the route back does not
+# reach through the interface they came in on (conntrack matches a flow
+# whatever the interface), and restore the fan profile at each boot.
+
+. /lib/functions.sh
+
+case "$(board_name)" in
+fortinet,fg100e)
+	cat > /etc/sysctl.d/90-rp-filter.conf <<-EOT
+		net.ipv4.conf.default.rp_filter=1
+		net.ipv4.conf.all.rp_filter=1
+	EOT
+	[ -f /etc/config/fan ] || cat > /etc/config/fan <<-EOT
+		config fan 'main'
+		option profile 'silent'
+
+		# fan 1 on the curve of the board, fan 2 fixed
+		config profile 'performance'
+		option curve '29:1 30:16 37:64 45:144 50'
+		option fan2 'fixed:48'
+		option hysteresis '4'
+
+		# both at minimum speed up to 40 degrees
+		config profile 'silent'
+		option curve '40:0 45:80 50:128 55:200 60'
+		option fan2 'follow'
+		option hysteresis '4'
+	EOT
+	/etc/init.d/fan-profile enable
+	;;
+esac
+
+exit 0

@@ -35,6 +35,19 @@ fortinet,fg90d)
 		"wan1"
 	ucidef_set_interface "wan2" device "wan2" protocol "none"
 	;;
+fortinet,fg100e)
+	# As on the 60E: the sixteen switch ports port1-16 are bridged to the
+	# LAN (in the BCM53344: a VLAN-unaware bridge offloaded by DSA), with
+	# the usual defaults of OpenWrt, wan1 is the WAN. dmz, wan2, mgmt and
+	# ha1/ha2 are left unconfigured. Before cabling several LAN ports to
+	# the same switch, take them out of br-lan, or a loop may form (no
+	# STP).
+	ucidef_set_interfaces_lan_wan \
+		"port1 port2 port3 port4 port5 port6 port7 port8 port9 port10 port11 port12 port13 port14 port15 port16" \
+		"wan1"
+	ucidef_set_interface "dmz" device "dmz" protocol "none"
+	ucidef_set_interface "wan2" device "wan2" protocol "none"
+	;;
 esac
 
 board_config_flush
