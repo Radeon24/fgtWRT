@@ -1,0 +1,47 @@
+From: Evil.2000 <evil.2000@web.de>
+Subject: [PATCH] net: dsa: add the bcm53344-8021q tag protocol
+
+---
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -57,6 +57,7 @@
+ #define DSA_TAG_PROTO_BRCM_LEGACY_FCS_VALUE	29
+ #define DSA_TAG_PROTO_MXL862_VALUE		30
+ #define DSA_TAG_PROTO_MXL862_8021Q_VALUE	31
++#define DSA_TAG_PROTO_BCM53344_8021Q_VALUE	32
+ 
+ enum dsa_tag_protocol {
+ 	DSA_TAG_PROTO_NONE		= DSA_TAG_PROTO_NONE_VALUE,
+@@ -91,6 +92,7 @@
+ 	DSA_TAG_PROTO_VSC73XX_8021Q	= DSA_TAG_PROTO_VSC73XX_8021Q_VALUE,
+ 	DSA_TAG_PROTO_MXL862		= DSA_TAG_PROTO_MXL862_VALUE,
+ 	DSA_TAG_PROTO_MXL862_8021Q	= DSA_TAG_PROTO_MXL862_8021Q_VALUE,
++	DSA_TAG_PROTO_BCM53344_8021Q	= DSA_TAG_PROTO_BCM53344_8021Q_VALUE,
+ };
+ 
+ struct dsa_switch;
+--- a/net/dsa/Kconfig
++++ b/net/dsa/Kconfig
+@@ -118,6 +118,12 @@
+ 	  MaxLinear MxL86252 and MxL86282 switches using 802.1Q VLAN-based
+ 	  tagging instead of their native 8-byte tagging protocol.
+ 
++config NET_DSA_TAG_BCM53344_8021Q
++	tristate "Tag driver for the Broadcom BCM53344 behind an NP6Lite, using VLAN"
++	help
++	  Say Y or M if you want to enable support for tagging frames for the
++	  Broadcom BCM53344 switch of the Fortinet FortiGate 100E with tag_8021q.
++
+ config NET_DSA_TAG_KSZ
+ 	tristate "Tag driver for Microchip 8795/937x/9477/9893 families of switches"
+ 	help
+--- a/net/dsa/Makefile
++++ b/net/dsa/Makefile
+@@ -30,6 +30,7 @@
+ obj-$(CONFIG_NET_DSA_TAG_MTK) += tag_mtk.o
+ obj-$(CONFIG_NET_DSA_TAG_MXL_862XX) += tag_mxl862xx.o
+ obj-$(CONFIG_NET_DSA_TAG_MXL_862XX_8021Q) += tag_mxl862xx_8021q.o
++obj-$(CONFIG_NET_DSA_TAG_BCM53344_8021Q) += tag_bcm53344_8021q.o
+ obj-$(CONFIG_NET_DSA_TAG_NONE) += tag_none.o
+ obj-$(CONFIG_NET_DSA_TAG_OCELOT) += tag_ocelot.o
+ obj-$(CONFIG_NET_DSA_TAG_OCELOT_8021Q) += tag_ocelot_8021q.o
