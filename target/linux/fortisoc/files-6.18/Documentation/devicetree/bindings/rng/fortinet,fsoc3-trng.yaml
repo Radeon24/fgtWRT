@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/rng/fortinet,fsoc3-trng.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 true random number generator
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  Ring oscillator based random number generator of the miscellaneous block
+  of the NP6Lite network processor of the Fortinet FortiSOC3. Its 64-byte
+  register window lies inside the window of the network processor, whose
+  driver requests the whole range; this one only maps it.
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-trng
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    rng@f500ff80 {
+        compatible = "fortinet,fsoc3-trng";
+        reg = <0xf500ff80 0x40>;
+    };

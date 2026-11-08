@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/crypto/fortinet,fsoc3-cp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 symmetric crypto engine
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  Memory to memory cipher and HMAC engine of the Fortinet FortiSOC3, fed
+  through a host TX queue of the NP6Lite queue fabric. Its registers lie
+  inside the window of the NP6Lite network processor, whose driver requests
+  the whole range, so this one only maps them.
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-cp
+
+  reg:
+    items:
+      - description: the input queue (host TX queue 16)
+      - description: the DMA parameters and control of that queue
+      - description: the engine debug registers
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    crypto@f5018000 {
+        compatible = "fortinet,fsoc3-cp";
+        reg = <0xf5018000 0x400>, <0xf500d860 0x20>, <0xf500e000 0x48>;
+    };

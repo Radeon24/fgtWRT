@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Crypto blocks of the FortiSOC3, for the FortiGate 100E: the TRNG, channel
+ * 0 of the public key engine (RSA) and the symmetric crypto engine. Their
+ * registers lie in the window of the NP6Lite (0xf5000000), whose driver
+ * requests the whole range; the crypto drivers only map them.
+ *
+ * Included at the end of fortinet-fg100e.dts, after fsoc3.dtsi (the /soc
+ * node). Drivers: package/kernel/fortinet-fsoc3 (fsoc3-trng, fsoc3-pkce,
+ * fsoc3-cp).
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+&{/soc} {
+	/* In the miscellaneous block of the NP6Lite window */
+	rng@f500ff80 {
+		compatible = "fortinet,fsoc3-trng";
+		reg = <0xf500ff80 0x40>;
+	};
+
+	/*
+	 * Channel 0 (pketx_0) of the public key engine. The interrupt does
+	 * not reach the GIC on the 100E: the driver polls.
+	 */
+	crypto@f501a000 {
+		compatible = "fortinet,fsoc3-pkce";
+		reg = <0xf501a000 0x80>;
+		interrupts = <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	/*
+	 * Symmetric crypto engine: its input queue (host TX queue 16 of the
+	 * NP6Lite fabric, above the queues 0-15 of the NP6Lite driver), the
+	 * DMA parameters of that queue, the engine debug registers.
+	 */
+	crypto@f5018000 {
+		compatible = "fortinet,fsoc3-cp";
+		reg = <0xf5018000 0x400>, <0xf500d860 0x20>, <0xf500e000 0x48>;
+	};
+};

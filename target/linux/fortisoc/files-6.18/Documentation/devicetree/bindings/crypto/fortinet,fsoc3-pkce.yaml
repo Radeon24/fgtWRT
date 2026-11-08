@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/crypto/fortinet,fsoc3-pkce.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 public key engine
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+description:
+  Modular exponentiation engine (RSA) of the Fortinet FortiSOC3. One node
+  per command channel; its registers lie inside the window of the NP6Lite
+  network processor, whose driver requests the whole range, so this one
+  only maps them.
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-pkce
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+    description: end of a command list (without it, the driver polls)
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    crypto@f501a000 {
+        compatible = "fortinet,fsoc3-pkce";
+        reg = <0xf501a000 0x80>;
+        interrupts = <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>;
+    };

@@ -600,3 +600,5 @@
 		};
 	};
 };
+
+#include "fsoc3-crypto.dtsi"

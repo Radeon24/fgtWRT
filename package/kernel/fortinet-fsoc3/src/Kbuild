@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Out-of-tree Kbuild of the FortiSOC3 crypto drivers
+# (package/kernel/fortinet-fsoc3). The package Makefile selects what to
+# build with the variables below, passed on the make command line:
+#
+#   FORTINET_FSOC3_TRNG      m to build fsoc3-trng.ko (hwrng)
+#   FORTINET_FSOC3_PKCE      m to build fsoc3-pkce.ko (rsa-fsoc3)
+#   FORTINET_FSOC3_PKCE_TEST m to build fsoc3-pkce-test.ko (test tool)
+#   FORTINET_FSOC3_CP        m to build fsoc3-cp.ko (symmetric engine)
+#   FORTINET_FSOC3_CP_TEST   m to build fsoc3-cp-test.ko (test tool)
+
+# include/linux/soc/fortinet/cp-hmac.h: a copy of the header of
+# package/kernel/fortinet (static inline helpers only)
+ccflags-y += -I$(src)/include
+
+# TRNG of the miscellaneous block of the NP6Lite.
+obj-$(FORTINET_FSOC3_TRNG) += fsoc3-trng.o
+
+# Public key engine: RSA for the crypto API.
+obj-$(FORTINET_FSOC3_PKCE) += fsoc3-pkce.o
+
+# Differential test of rsa-fsoc3 against rsa-generic (test tool).
+obj-$(FORTINET_FSOC3_PKCE_TEST) += fsoc3-pkce-test.o
+
+# Symmetric crypto engine for the crypto API.
+obj-$(FORTINET_FSOC3_CP) += fsoc3-cp.o
+
+# Differential test of fsoc3-cp against software (test tool).
+obj-$(FORTINET_FSOC3_CP_TEST) += fsoc3-cp-test.o

@@ -65,7 +65,8 @@ define Device/fortinet_fg-100e
   DEVICE_PACKAGES := ethtool ip-full ip-bridge kmod-fortinet-np6lite \
 	r8a779x-usb3-firmware i2c-tools kmod-hwmon-nct7802 \
 	kmod-usb-storage kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1 \
-	kmod-bonding proto-bonding
+	kmod-bonding proto-bonding \
+	kmod-fortinet-fsoc3-trng kmod-fortinet-fsoc3-pkce kmod-fortinet-fsoc3-cp
   SUPPORTED_DEVICES := fortinet,fg100e
 endef
 TARGET_DEVICES += fortinet_fg-100e
