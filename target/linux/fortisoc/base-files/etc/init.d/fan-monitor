@@ -1,0 +1,14 @@
+#!/bin/sh /etc/rc.common
+# Fan monitor of the FortiGate 100E: ALARM and STATUS LEDs on a failed fan
+
+START=95
+USE_PROCD=1
+
+start_service() {
+	[ "$(board_name)" = fortinet,fg100e ] || return 0
+
+	procd_open_instance
+	procd_set_param command /usr/sbin/fan-monitor
+	procd_set_param respawn
+	procd_close_instance
+}
