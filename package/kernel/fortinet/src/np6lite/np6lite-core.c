@@ -5099,6 +5099,29 @@ static unsigned int fnp6l_ft_bare_lif(struct fnp6l *np, struct net_device *dev)
  */
 /* tag_8021q is part of the DSA core */
 #if IS_REACHABLE(CONFIG_NET_DSA) && defined(DSA_TAG_PROTO_BCM53344_8021Q_VALUE)
+#if __has_include(<linux/dsa/bcm53344.h>)
+#include <linux/dsa/bcm53344.h>
+
+/*
+ * Internal VID of the 802.1Q device @vid on tagged switch port @dev, which
+ * the switch translates (switch driver): matched and pushed in place of
+ * the standalone VID and the 802.1Q tag. 0 when not translated.
+ */
+static u16 fnp6l_ft_q_xlt(struct net_device *dev, u16 vid)
+{
+	struct dsa_port *dp = fnp6l_dsa_port(dev);
+
+	if (IS_ERR_OR_NULL(dp))
+		return 0;
+	return bcm53344_xlt_ivid(dp->ds, dp->index, vid);
+}
+#else
+static u16 fnp6l_ft_q_xlt(struct net_device *dev, u16 vid)
+{
+	return 0;
+}
+#endif
+
 static bool fnp6l_conduit_q(const struct fnp6l_port *c)
 {
 	const struct dsa_port *cpu;
@@ -5307,6 +5330,11 @@ static bool fnp6l_ft_q_member(struct fnp6l *np, struct net_device *dev,
 			      unsigned int *lif, u16 *vid)
 {
 	return false;
+}
+
+static u16 fnp6l_ft_q_xlt(struct net_device *dev, u16 vid)
+{
+	return 0;
 }
 #endif
 
@@ -5718,22 +5746,27 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	 * routed with another one stays with the host.
 	 */
 	if (qvid_in) {
-		if (pop)
+		u16 ivid = 0;
+
+		/* 802.1Q device on the port: its internal VID if translated */
+		if (pop && (qbond_in || !(ivid = fnp6l_ft_q_xlt(idev, fl->vid))))
 			return fnp6l_ft_refuse_dev(idev, extack, "VLAN on a switch port");
-		fl->vid = qvid_in;
+		fl->vid = ivid ?: qvid_in;
 	}
 	if (qvid_out) {
 		struct fnp6l_port *oc = fnp6l_ft_port(np, odev ? odev : idev);
 		struct dsa_port *odp = fnp6l_dsa_port(odev);
 
-		if (push)
+		u16 ivid = 0;
+
+		if (push && !(ivid = fnp6l_ft_q_xlt(odev, push)))
 			return fnp6l_ft_refuse_dev(idev, extack, "VLAN on a switch port");
 		if (!oc && !IS_ERR_OR_NULL(odp) && odp->cpu_dp)
 			oc = fnp6l_ft_port(np, odp->cpu_dp->conduit);
 		if (!oc || !ether_addr_equal(eth + ETH_ALEN, oc->ndev->dev_addr))
 			return fnp6l_ft_refuse_dev(idev, extack,
 						   "source MAC is not the conduit's");
-		push = qvid_out;
+		push = ivid ?: qvid_out;
 	}
 	/* to a bond of tagged switch ports: as to one of its members */
 	if (qbond_out) {
