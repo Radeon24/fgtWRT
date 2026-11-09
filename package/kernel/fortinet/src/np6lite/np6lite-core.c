@@ -3263,8 +3263,12 @@ struct fnp6l_ft_flow {
 	u8 a6o[24];		/* the same after NAT (output headers) */
 	u8 n_in_lif;		/* sessions: one per ingress LIF (bond members) */
 	u8 in_lif[NP6L_SW_PORTS];	/* ingress LIFs of the keys (a port or bond members) */
+	/* in_vid of each session: vid, or the VID of a member of a bond of
+	 * tagged switch ports (all on the conduit's LIF) */
+	u16 in_vid[NP6L_SW_PORTS];
 	/* output to a bond, member pinned: re-picked on member changes */
 	struct net_device *obond;
+	bool qbond;		/* obond of tagged switch ports: out_vid follows */
 	/* a bond at one end: trunk generation at the parse (fnp6l_ft_replace) */
 	bool tbond;
 	unsigned int tgen;
@@ -3581,7 +3585,7 @@ static int fnp6l_ft_fcmd(struct fnp6l *np, bool insert, struct fnp6l_ft_flow *f,
 			 unsigned int i, const struct fnp6l_sse_opt *opt)
 {
 	return fnp6l_ft_cmd6(np, insert, f->proto, f->sip, f->sport, f->dip,
-			     f->dport, f->in_lif[i], f->vid, opt,
+			     f->dport, f->in_lif[i], f->in_vid[i], opt,
 			     f->v6 ? f->a6 : NULL);
 }
 
@@ -3685,8 +3689,8 @@ static void fnp6l_ft_keys(struct fnp6l_ft_flow *flow)
 
 		memset(s->key, 0, sizeof(s->key));
 		fnp6l_sse_entry4(s->key, flow->proto, flow->sip, flow->sport,
-				 flow->dip, flow->dport, flow->in_lif[i], flow->vid,
-				 0, 0, NULL);
+				 flow->dip, flow->dport, flow->in_lif[i],
+				 flow->in_vid[i], 0, 0, NULL);
 		if (flow->v6)
 			s->key[15] |= 0x40;	/* KEY_TAGGED: IPv6 session */
 	}
@@ -5179,6 +5183,102 @@ static bool fnp6l_ft_q_port(struct fnp6l *np, struct net_device *dev)
 	return !IS_ERR_OR_NULL(dp) && dp->cpu_dp &&
 	       fnp6l_conduit_q(fnp6l_ft_port(np, dp->cpu_dp->conduit));
 }
+
+/*
+ * A bond of tagged switch ports: every member a user port behind the same
+ * conduit with the bcm53344-8021q tagger. The switch does not offload the
+ * bond, so each member stays on its standalone VLAN: a frame comes in on
+ * the conduit with the VID of the member it entered by, and goes out by a
+ * member when sent with that member's VID.
+ */
+struct fnp6l_ft_qb {
+	struct fnp6l *np;
+	struct fnp6l_port *c;	/* the conduit of the members */
+	u8 *lifs;
+	u16 *vids;
+	unsigned int n;
+	bool all, bad;
+};
+
+static int fnp6l_ft_qb_lower(struct net_device *ldev,
+			     struct netdev_nested_priv *priv)
+{
+	struct fnp6l_ft_qb *q = priv->data;
+	struct fnp6l_port *c;
+	struct dsa_port *dp;
+	unsigned int i;
+	u16 vid;
+
+	if (netdev_uses_dsa(ldev))	/* the conduit below each member */
+		return 0;
+	dp = fnp6l_dsa_port(ldev);
+	if (IS_ERR_OR_NULL(dp) || !dp->cpu_dp) {
+		q->bad = true;
+		return 1;
+	}
+	c = fnp6l_ft_port(q->np, dp->cpu_dp->conduit);
+	if (!fnp6l_conduit_q(c) || (q->c && q->c != c)) {
+		q->bad = true;
+		return 1;
+	}
+	q->c = c;
+	/* output: the first running member (fnp6l_ft_bond_out follows the hash) */
+	if (!q->all && (q->n || !netif_running(ldev) || !netif_carrier_ok(ldev)))
+		return 0;
+	vid = dsa_tag_8021q_standalone_vid(dp);
+	for (i = 0; i < q->n; i++)
+		if (q->vids[i] == vid)
+			return 0;
+	if (q->n >= NP6L_SW_PORTS) {
+		q->bad = true;
+		return 1;
+	}
+	q->lifs[q->n] = c->lif;
+	q->vids[q->n++] = vid;
+	return 0;
+}
+
+/*
+ * The conduit's LIF and the VID of every member of @bond (@all, the
+ * ingress: one session per member) or of the first running one (output).
+ * False when @bond is not a bond of tagged switch ports; *n is 0 then, or
+ * when no member runs.
+ */
+static bool fnp6l_ft_q_bond(struct fnp6l *np, struct net_device *bond,
+			    u8 *lifs, u16 *vids, bool all, unsigned int *n)
+{
+	struct fnp6l_ft_qb q = { .np = np, .lifs = lifs, .vids = vids,
+				 .all = all };
+	struct netdev_nested_priv priv = { .data = &q };
+
+	*n = 0;
+	if (!bond || !netif_is_bond_master(bond))
+		return false;
+	rcu_read_lock();
+	netdev_walk_all_lower_dev_rcu(bond, fnp6l_ft_qb_lower, &priv);
+	rcu_read_unlock();
+	if (q.bad || !q.c)
+		return false;
+	*n = q.n;
+	return true;
+}
+
+/* conduit's LIF and standalone VID of a tagged switch user port */
+static bool fnp6l_ft_q_member(struct fnp6l *np, struct net_device *dev,
+			      unsigned int *lif, u16 *vid)
+{
+	struct dsa_port *dp = fnp6l_dsa_port(dev);
+	struct fnp6l_port *c;
+
+	if (IS_ERR_OR_NULL(dp) || !dp->cpu_dp)
+		return false;
+	c = fnp6l_ft_port(np, dp->cpu_dp->conduit);
+	if (!fnp6l_conduit_q(c))
+		return false;
+	*lif = c->lif;
+	*vid = dsa_tag_8021q_standalone_vid(dp);
+	return true;
+}
 #else
 static bool fnp6l_conduit_q(const struct fnp6l_port *c)
 {
@@ -5192,6 +5292,19 @@ static unsigned int fnp6l_ft_q_end(struct fnp6l *np, struct net_device *dev,
 }
 
 static bool fnp6l_ft_q_port(struct fnp6l *np, struct net_device *dev)
+{
+	return false;
+}
+
+static bool fnp6l_ft_q_bond(struct fnp6l *np, struct net_device *bond,
+			    u8 *lifs, u16 *vids, bool all, unsigned int *n)
+{
+	*n = 0;
+	return false;
+}
+
+static bool fnp6l_ft_q_member(struct fnp6l *np, struct net_device *dev,
+			      unsigned int *lif, u16 *vid)
 {
 	return false;
 }
@@ -5259,15 +5372,17 @@ static unsigned int fnp6l_ft_end(struct fnp6l *np, struct net_device *dev,
  */
 static bool fnp6l_ft_bond_out(struct fnp6l *np, struct net_device *bond,
 			      const u8 *eth, const u8 *l3, const u8 *l4,
-			      u8 proto, const u8 *a6, unsigned int *out)
+			      u8 proto, const u8 *a6, unsigned int *out,
+			      u16 *out_vid)
 {
 	struct net_device *slave;
 	struct sk_buff *skb;
 	struct ipv6hdr *ip6h;
 	struct iphdr *iph;
 	struct ethhdr *eh;
-	unsigned int lif = 0, nh;
+	unsigned int lif = 0, nh, n;
 	u8 lifs[NP6L_SW_PORTS];
+	u16 vids[NP6L_SW_PORTS], vid = 0;
 	bool found = false, nport;
 
 	/* a header like the flow's first frame, for the bond's own hash */
@@ -5311,7 +5426,8 @@ static bool fnp6l_ft_bond_out(struct fnp6l *np, struct net_device *bond,
 		rcu_read_lock();
 		slave = netdev_get_xmit_slave(bond, skb, false);
 		if (slave && netif_running(slave) && netif_carrier_ok(slave))
-			found = fnp6l_ft_member_lif(np, slave, &lif, &nport);
+			found = fnp6l_ft_member_lif(np, slave, &lif, &nport) ||
+				fnp6l_ft_q_member(np, slave, &lif, &vid);
 		rcu_read_unlock();
 		kfree_skb(skb);
 	}
@@ -5320,7 +5436,13 @@ static bool fnp6l_ft_bond_out(struct fnp6l *np, struct net_device *bond,
 		lif = lifs[0];
 		found = true;
 	}
+	if (!found && fnp6l_ft_q_bond(np, bond, lifs, vids, false, &n) && n) {
+		lif = lifs[0];
+		vid = vids[0];
+		found = true;
+	}
 	*out = lif;
+	*out_vid = vid;
 	return found;
 }
 
@@ -5361,11 +5483,12 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	/* IPv6: source then destination address, before and after NAT */
 	u8 o6[32] = { }, n6[32] = { }, a6o[24] = { };
 	u8 nat6_sel = 0;
-	unsigned int nout = 0, i, j;
+	unsigned int nout = 0, i, j, nq;
 	struct net_device *odev = NULL;
-	bool redirect = false, pop = false;
+	bool redirect = false, pop = false, qbond_in = false, qbond_out = false;
 	__be32 osip, odip;
 	u16 push = 0, qvid_in = 0, qvid_out = 0;
+	u16 qvids[NP6L_SW_PORTS], ovids[NP6L_SW_PORTS];
 	u64 used;
 	int k;
 
@@ -5380,6 +5503,13 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	if (!fl->n_in_lif && np->ic_on) {
 		fl->in_lif[0] = fnp6l_ft_q_end(np, idev, &qvid_in);
 		fl->n_in_lif = fl->in_lif[0] ? 1 : 0;
+	}
+	/* a bond of tagged switch ports: one session per member VID */
+	if (!fl->n_in_lif && np->ic_on &&
+	    fnp6l_ft_q_bond(np, idev, fl->in_lif, qvids, true, &nq) && nq) {
+		fl->n_in_lif = nq;
+		qvid_in = qvids[0];
+		qbond_in = true;
 	}
 	if (!fl->n_in_lif)
 		return fnp6l_ft_refuse_dev(idev, extack, "ingress is not an NP end");
@@ -5501,6 +5631,13 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 								 &qvid_out);
 					nout = olif[0] ? 1 : 0;
 				}
+				/* member and VID picked below (fnp6l_ft_bond_out) */
+				if (!nout &&
+				    fnp6l_ft_q_bond(np, act->dev, olif, ovids,
+						    false, &nq) && nq) {
+					nout = 1;
+					qbond_out = true;
+				}
 				break;
 			}
 			/* unclassified, the ingress is the loader's LIF */
@@ -5598,6 +5735,16 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 						   "source MAC is not the conduit's");
 		push = qvid_out;
 	}
+	/* to a bond of tagged switch ports: as to one of its members */
+	if (qbond_out) {
+		struct fnp6l_port *oc = np->port[olif[0]];
+
+		if (push)
+			return fnp6l_ft_refuse_dev(idev, extack, "VLAN on a switch port");
+		if (!oc || !ether_addr_equal(eth + ETH_ALEN, oc->ndev->dev_addr))
+			return fnp6l_ft_refuse_dev(idev, extack,
+						   "source MAC is not the conduit's");
+	}
 	/*
 	 * Same LIF both ways: refused, except through the trunk between two
 	 * VLANs of the bond (bond.X <-> bond.Y, the NP sends back by the
@@ -5621,19 +5768,29 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	if (!is_valid_ether_addr(eth))
 		return fnp6l_ft_refuse_dev(idev, extack, "no destination MAC");
 	fl->obond = NULL;
+	fl->qbond = false;
 	fl->tbond = netif_is_bond_master(idev) ||
 		    (odev && netif_is_bond_master(odev));
 	if (olif[0] != NP6L_LIF_TRUNK && odev && netif_is_bond_master(odev)) {
 		unsigned int lif;
+		u16 vid;
 
 		if (!fnp6l_ft_bond_out(np, odev, eth, l3, l4,
 				       basic.key->ip_proto,
-				       fl->v6 ? a6o : NULL, &lif))
+				       fl->v6 ? a6o : NULL, &lif, &vid) ||
+		    (qbond_out && (!vid || lif != olif[0])))
 			return fnp6l_ft_refuse_dev(idev, extack,
 						   "no usable bond member");
 		olif[0] = lif;
 		fl->obond = odev;
+		if (qbond_out) {
+			push = vid;
+			fl->qbond = true;
+		}
 	}
+	/* the VID of each session */
+	for (i = 0; i < fl->n_in_lif; i++)
+		fl->in_vid[i] = qbond_in ? qvids[i] : fl->vid;
 	memcpy(fl->eth, eth, sizeof(fl->eth));
 	memcpy(fl->l3, l3, sizeof(fl->l3));
 	memcpy(fl->l4, l4, sizeof(fl->l4));
@@ -5955,12 +6112,18 @@ static unsigned int fnp6l_ft_lag_rebalance(struct fnp6l *np, unsigned int *faile
 	int ret;
 
 	list_for_each_entry(flow, &np->ft_flows, node) {
+		u16 vid;
+
 		if (!flow->obond)
 			continue;
+		/* a bond of tagged switch ports: the member is the VID */
 		if (!fnp6l_ft_bond_out(np, flow->obond, flow->eth, flow->l3,
 				       flow->l4, flow->proto,
-				       flow->v6 ? flow->a6o : NULL, &lif) ||
-		    (lif == flow->opt.out && !flow->hw_bad))
+				       flow->v6 ? flow->a6o : NULL, &lif, &vid) ||
+		    (flow->qbond && (!vid || lif != flow->opt.out)) ||
+		    (lif == flow->opt.out &&
+		     (!flow->qbond || vid == flow->opt.out_vid) &&
+		     !flow->hw_bad))
 			continue;
 		if (fnp6l_ft_del(np, flow)) {
 			flow->hw_bad = true;
@@ -5968,7 +6131,10 @@ static unsigned int fnp6l_ft_lag_rebalance(struct fnp6l *np, unsigned int *faile
 			continue;
 		}
 		flow->opt.out = lif;
-		fnp6l_ft_set_smac(np, lif, flow->eth + ETH_ALEN);
+		if (flow->qbond)
+			flow->opt.out_vid = vid;
+		else
+			fnp6l_ft_set_smac(np, lif, flow->eth + ETH_ALEN);
 		for (ret = 0, i = 0; i < flow->n_in_lif && !ret; i++) {
 			ret = fnp6l_ft_fcmd(np, true, flow, i, &flow->opt);
 			/* inserted again: an earlier miss no longer holds */
@@ -6542,8 +6708,18 @@ static int fnp6l_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 		 * RTNL, as the flow table does itself on NETDEV_DOWN. A port
 		 * of the NP: the trunk follows (fnp6l_trunk_sync).
 		 */
-		if (IS_ENABLED(CONFIG_NF_FLOW_TABLE) && (sw || nport))
+		if (IS_ENABLED(CONFIG_NF_FLOW_TABLE) && (sw || nport)) {
+			struct netdev_notifier_changeupper_info *info = ptr;
+
 			nf_flow_table_cleanup(dev);
+			/*
+			 * The flows of a bond of tagged switch ports have a
+			 * session per member: torn down with a member change.
+			 */
+			if (sw && info->upper_dev &&
+			    netif_is_bond_master(info->upper_dev))
+				nf_flow_table_cleanup(info->upper_dev);
+		}
 		if (!nport)
 			return NOTIFY_DONE;
 		break;
@@ -6970,6 +7146,8 @@ static int fnp6l_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 	struct flow_block_cb *block_cb;
 	struct fnp6l_ft_bond *b;
 	u8 lifs[NP6L_SW_PORTS];
+	u16 vids[NP6L_SW_PORTS];
+	unsigned int n;
 
 	if (!dev || type != TC_SETUP_FT || !netif_is_bond_master(dev) ||
 	    f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
@@ -6980,7 +7158,8 @@ static int fnp6l_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 	case FLOW_BLOCK_BIND:
 		mutex_lock(&fnp6l_sse_lock);
 		if (!np->ft_on || !np->ic_on ||
-		    !fnp6l_ft_end(np, dev, lifs, true)) {
+		    (!fnp6l_ft_end(np, dev, lifs, true) &&
+		     !(fnp6l_ft_q_bond(np, dev, lifs, vids, true, &n) && n))) {
 			mutex_unlock(&fnp6l_sse_lock);
 			NL_SET_ERR_MSG_MOD(f->extack,
 					   "bond offload needs the flow offload and members all switch ports or all NP ports");
