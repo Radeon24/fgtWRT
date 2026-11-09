@@ -1342,10 +1342,11 @@ throughput: ESP transport mode AES-GCM 92 Mbit/s and CBC + HMAC-SHA256 95 Mbit/s
 | NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated |
 | Per-flow counters of offloaded flows | ✅ Validated (0.1 %) |
 | Crypto engines (`fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng`) | ✅ Validated against the software implementations, also under load |
-| Hardware monitor, fan profiles (`fan-profile`: `silent`, `performance`) | ✅ Validated |
+| Hardware monitor, fan profiles (`fan-profile`: `silent`, `performance`) | ✅ Validated (`silent`: both fans on the same curve, minimum speed below 40 °C) |
 | USB host port | 🧪 USB 2 storage only |
 | Watchdog | ✅ Validated |
 | LEDs of the front ports | ✅ Validated by a visual check |
+| STATUS, ALARM, HA LEDs | ✅ Validated by a visual check: STATUS green blinking while booting, green once running, red blinking in failsafe and during an upgrade; ALARM red blinks on a kernel panic, STATUS then goes dark; a failed fan (below 1000 rpm, `fan-monitor`) turns ALARM orange and STATUS red, both fans failed turn ALARM red; HA is off, without a trigger (no HA cluster), free for the LED configuration |
 | Installation to the eMMC, persistent storage | ❌ Not available |
 | Continuous operation (24 h) | ❓ Not run yet |
 
