@@ -1297,6 +1297,22 @@ ageing, link speed 10/100/1000 through phylink. Flow offload of the NP6Lite work
 flow on the uplink and the tag_8021q VID). Not offloaded yet: DSA bonds and VLAN devices on DSA ports (forwarded by
 the CPU).
 
+**Address learning.** All DSA ports, `ha1` and `ha2` included, learn source addresses in the switch, also outside a
+bridge: in a small office the HA ports are often used as plain ports. Linux DSA expects standalone ports not to
+learn; to get that on some ports, name them in the `nolearn` parameter of the switch driver (built into the
+kernel, so it is set at run time):
+
+```
+echo "ha1 ha2" > /sys/module/bcm53344/parameters/nolearn   # at once, until the next boot
+echo "" > /sys/module/bcm53344/parameters/nolearn          # all ports learn again
+```
+
+For every boot, put the first line into `/etc/rc.local`. A port in a bridge also follows the learning flag of the
+bridge (`bridge link set dev ha1 learning off`); a port named in `nolearn` never learns. Turning learning off clears
+what the port learned; frames to unknown destinations are then flooded within the VLAN of the port. A device that
+sends with the MAC address of the FortiGate port back into it (for instance a cable between `ha1` and `ha2`, which
+share one MAC address) loses frames with or without learning: give one side its own MAC address.
+
 ### Packages of the profile
 
 The packages of the 60E profile (LuCI, IPsec, WireGuard, OpenVPN with DCO, `fgtwrt-base`, `luci-app-fgtwrt`),
@@ -1339,7 +1355,7 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 | Boot from RAM, default network | ✅ Validated |
 | `mgmt`, `dmz`, `wan1`, `wan2` | ✅ Validated |
 | `port1`…`port16` (DSA), bridge offload, VLAN-aware bridge | ✅ Validated |
-| `ha1`, `ha2` | ✅ Validated over a cable between both: link 1000/full, ping, TCP and UDP through the host path, link toggles, no frames towards the LAN ports |
+| `ha1`, `ha2` | ✅ Validated over a cable between both: link 1000/full, ping, TCP and UDP through the host path, link toggles, no frames towards the LAN ports. They learn addresses like the other ports; see "Address learning" to turn that off |
 | SFP1, SFP2 | 🧪 Partial: copper SFP modules (1000BASE-X) in both cages, link 1000/full as `port15`/`port16` (`Port: FIBRE` in `ethtool`), ping and the isolation tests; fiber modules, SGMII-only modules and a link on both the SFP and the RJ45 jack of the same port (the SFP wins) not tested; no access to the module EEPROM (`ethtool -m`) |
 | NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated |
 | Per-flow counters of offloaded flows | ✅ Validated (0.1 %) |
