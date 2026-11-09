@@ -2,7 +2,9 @@
 # Fan profiles of the FortiGate 100E, from /etc/config/fan. The hardware
 # monitor (NCT7802Y) drives the fans by itself from what is set here, also if
 # the system hangs: one curve on temp1, the only temperature source in use.
-# The fans keep their minimum speed at duty 0: they cannot be stopped.
+# Each fan output has its own curve in the chip: "follow" writes the curve of
+# the profile to both. The fans keep their minimum speed at duty 0: they
+# cannot be stopped.
 #
 # A profile section holds:
 #   curve        "t:duty t:duty t:duty t:duty t": 4 points, degrees C rising,
@@ -57,13 +59,14 @@ check_curve() {
 	[ "$n" = 5 ] || die "4 points and a last temperature: \"$1\""
 }
 
+# <pwm> <curve>
 apply_curve() {
 	local i=0 p
 
-	for p in $1; do
+	for p in $2; do
 		i=$((i + 1))
-		echo "$((${p%%:*} * 1000))" > "$hw/pwm1_auto_point${i}_temp"
-		[ "$i" -lt 5 ] && echo "${p#*:}" > "$hw/pwm1_auto_point${i}_pwm"
+		echo "$((${p%%:*} * 1000))" > "$hw/${1}_auto_point${i}_temp"
+		[ "$i" -lt 5 ] && echo "${p#*:}" > "$hw/${1}_auto_point${i}_pwm"
 	done
 	return 0
 }
@@ -100,7 +103,8 @@ load() {
 		die "fan2 is follow or fixed:duty"
 		;;
 	esac
-	apply_curve "$curve"
+	apply_curve pwm1 "$curve"
+	[ "$map" = 3 ] && apply_curve pwm2 "$curve"
 	i2cset $I2C $REG_HYST \
 		"$((($(i2cget $I2C $REG_HYST) & 0xf8) | hyst))"
 	i2cset $I2C $REG_MAP "$map"
