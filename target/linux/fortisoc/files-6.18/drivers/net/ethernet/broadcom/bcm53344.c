@@ -261,6 +261,7 @@ static bool bcm53344_nolearn_has(const char *name)
 #define EGR_VLAN_XLATE		0x14140000	/* EPIPE, 3 words */
 #define SCHAN_TABLE_INSERT	0x24
 #define SCHAN_TABLE_DELETE	0x26
+#define SCHAN_TABLE_LOOKUP	0x28	/* reply: LOOKUP_DONE 0x29 */
 #define XLT_PROFILE		1	/* tag action profile: replace the outer VID */
 #define XLT_KEY_OVID		4	/* VLAN_XLATE key: port and outer VID */
 #define XLT_IVID_TOP		3071	/* internal VIDs, taken from the top down */
@@ -3354,6 +3355,37 @@ static int bcm53344_table_op(struct bcm53344 *sw, int op, int blk, u32 base,
 	return ret;
 }
 
+/*
+ * Insert an entry and look it up: in place only if the lookup answers
+ * LOOKUP_DONE with the very entry (the insert reply tells a new entry from
+ * a replaced one, but how it tells a full bucket is not established). A
+ * missing egress entry would let a frame of an internal VLAN leave the
+ * port with the internal VID: never taken for inserted unless found.
+ */
+static int bcm53344_table_insert(struct bcm53344 *sw, int blk, u32 base,
+				 const u32 *e, int n)
+{
+	u32 wr[SCHAN_WORDS], rd[6] = { };
+	int ret;
+
+	ret = bcm53344_table_op(sw, SCHAN_TABLE_INSERT, blk, base, e, n);
+	if (ret)
+		return ret;
+	wr[0] = SCHAN_HDR(SCHAN_TABLE_LOOKUP, blk, n * 4);
+	wr[1] = base;
+	memcpy(&wr[2], e, n * 4);
+	ret = bcm53344_schan_op(sw, wr, n + 2, rd, n + 2);
+	/* EVEN_PARITY (VLAN_XLATE bit 114, EGR_VLAN_XLATE bit 86) is no key */
+	bcm53344_field_set(&rd[2], n == 4 ? 114 : 86, 1, 0);
+	if (!ret && (rd[0] >> 26 != SCHAN_TABLE_LOOKUP + 1 ||
+		     memcmp(&rd[2], e, n * 4)))
+		ret = -EIO;
+	if (ret)
+		dev_err(&sw->pdev->dev, "table %#010x: entry %*ph not in place after insert (reply %#010x %#010x): %d\n",
+			base, n * 4, e, rd[0], rd[1], ret);
+	return ret;
+}
+
 static void bcm53344_xlt_ing_entry(u32 *e, int hw, u16 ovid, u16 nvid)
 {
 	memset(e, 0, 4 * sizeof(*e));
@@ -3387,8 +3419,7 @@ static int bcm53344_xlt_port(struct bcm53344 *sw, int hw, u16 svid, bool on)
 
 	if (on) {
 		bcm53344_xlt_ing_entry(e, hw, 0, svid);
-		ret = bcm53344_table_op(sw, SCHAN_TABLE_INSERT, BLK_IPIPE,
-					VLAN_XLATE, e, 4);
+		ret = bcm53344_table_insert(sw, BLK_IPIPE, VLAN_XLATE, e, 4);
 		if (!ret)
 			ret = bcm53344_reg_read(sw, BLK_EPIPE, EGR_PORT | hw, &v);
 		if (!ret)
@@ -3446,16 +3477,19 @@ static int bcm53344_xlt_set(struct bcm53344 *sw, struct bcm53344_xlt *x,
 		set_bit(i, sw->xlt_ivid);
 		x->ivid = i;
 		x->l2mc = L2MC_USER + bit;
-		ret = bcm53344_vlan_write(sw, x->ivid, BIT(hw) | BIT(cpu), 0,
-					  x->l2mc, true);
+		/*
+		 * The egress entry in place before the VLAN exists: a frame
+		 * of the internal VLAN never leaves the port untranslated.
+		 * The ingress entry last: nothing enters the VLAN before.
+		 */
 		bcm53344_xlt_egr_entry(e, hw, x->ivid, x->vid);
+		ret = bcm53344_table_insert(sw, BLK_EPIPE, EGR_VLAN_XLATE, e, 3);
 		if (!ret)
-			ret = bcm53344_table_op(sw, SCHAN_TABLE_INSERT, BLK_EPIPE,
-						EGR_VLAN_XLATE, e, 3);
+			ret = bcm53344_vlan_write(sw, x->ivid, BIT(hw) | BIT(cpu),
+						  0, x->l2mc, true);
 		bcm53344_xlt_ing_entry(e, hw, x->vid, x->ivid);
 		if (!ret)
-			ret = bcm53344_table_op(sw, SCHAN_TABLE_INSERT, BLK_IPIPE,
-						VLAN_XLATE, e, 4);
+			ret = bcm53344_table_insert(sw, BLK_IPIPE, VLAN_XLATE, e, 4);
 		if (!ret && td)
 			WRITE_ONCE(td->xlt[x->ivid], BCM53344_XLT_VALID |
 				   FIELD_PREP(BCM53344_XLT_PORT, x->port) |
@@ -3466,13 +3500,18 @@ static int bcm53344_xlt_set(struct bcm53344 *sw, struct bcm53344_xlt *x,
 	}
 	if (!x->ivid)
 		return 0;
+	/*
+	 * Off in the reverse order: nothing enters the VLAN any more, then
+	 * the VLAN goes (a frame the NP6Lite still sends with the internal
+	 * VID is dropped), the egress entry last.
+	 */
 	if (td)
 		WRITE_ONCE(td->xlt[x->ivid], 0);
 	bcm53344_xlt_ing_entry(e, hw, x->vid, x->ivid);
 	bcm53344_table_op(sw, SCHAN_TABLE_DELETE, BLK_IPIPE, VLAN_XLATE, e, 4);
+	ret = bcm53344_vlan_write(sw, x->ivid, 0, 0, x->l2mc, false);
 	bcm53344_xlt_egr_entry(e, hw, x->ivid, x->vid);
 	bcm53344_table_op(sw, SCHAN_TABLE_DELETE, BLK_EPIPE, EGR_VLAN_XLATE, e, 3);
-	ret = bcm53344_vlan_write(sw, x->ivid, 0, 0, x->l2mc, false);
 	clear_bit(x->l2mc - L2MC_USER, sw->l2mc_user);
 	clear_bit(x->ivid, sw->xlt_ivid);
 	x->ivid = 0;
