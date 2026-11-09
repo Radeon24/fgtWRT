@@ -7,13 +7,23 @@
  * flash. mgmt and dmz are BCM54220 PHYs on the MDIO of the network
  * processor; wan1, wan2 and the 18 front ports sit behind the BCM53344
  * switch on PCIe, which the bcm53344 driver sets up as pass-through
- * fabric with one uplink per zone (wan1, wan2, lan, ha). Still unknown on
- * this board, hence left out: the wiring of the NP6Lite GPIO lines (LEDs,
- * button, hogs of the 60E).
+ * fabric with one uplink per zone (wan1, wan2, lan, ha).
+ *
+ * Front panel LEDs (established by observation): STATUS, ALARM and HA are
+ * one bicolour LED each, between two lines of the GPIO block of the
+ * network processor, lit high: STATUS green line 0, red line 1; HA green
+ * line 2, red line 3; ALARM orange line 5, red line 6. Either colour only
+ * lights while the other line is an output at the low level, so every
+ * line of a pair is described (off = output low); both lines at the same
+ * level leave the LED dark. On a kernel panic, ALARM red blinks and STATUS
+ * goes dark: both STATUS lines are panic indicators and follow the same
+ * blink, so STATUS no longer shows green. The reset button and the other
+ * lines are not established on this board.
  */
 
 #include "fsoc3.dtsi"
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
 
 / {
 	model = "Fortinet FortiGate 100E";
@@ -22,6 +32,60 @@
 	aliases {
 		serial0 = &uart0;
 		i2c0 = &i2c0;
+		led-boot = &led_status_green;
+		led-failsafe = &led_status_red;
+		led-running = &led_status_green;
+		led-upgrade = &led_status_red;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_status_green: led-status-green {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&np_gpio 0 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+			panic-indicator;
+		};
+
+		led_status_red: led-status-red {
+			color = <LED_COLOR_ID_RED>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&np_gpio 1 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+			panic-indicator;
+		};
+
+		led-ha-green {
+			color = <LED_COLOR_ID_GREEN>;
+			function = "ha";
+			gpios = <&np_gpio 2 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-ha-red {
+			color = <LED_COLOR_ID_RED>;
+			function = "ha";
+			gpios = <&np_gpio 3 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-alarm-orange {
+			color = <LED_COLOR_ID_ORANGE>;
+			function = LED_FUNCTION_ALARM;
+			gpios = <&np_gpio 5 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		/* Lit when the kernel panics, until the board restarts */
+		led-alarm-red {
+			color = <LED_COLOR_ID_RED>;
+			function = LED_FUNCTION_ALARM;
+			gpios = <&np_gpio 6 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+			panic-indicator;
+		};
 	};
 
 	chosen {
@@ -96,11 +160,11 @@
 	};
 
 	/*
-	 * NP6Lite msc GPIO block, without consumers until the wiring of this
-	 * board is known. Reserved as on the 60E: 6 (USB port power, xHCI
-	 * glue), 17-18 (MDC lines) and 20-25 (resets, NP6Lite driver).
+	 * NP6Lite msc GPIO block. Consumers: the front panel LEDs (lines 0-3,
+	 * 5, 6). Reserved: 10 (USB port power), 17-18 (MDC lines) and 20-25
+	 * (resets, NP6Lite driver).
 	 */
-	gpio@f500fc00 {
+	np_gpio: gpio@f500fc00 {
 		compatible = "fortinet,fsoc3-gpio";
 		reg = <0xf500fc00 0x80>;
 		gpio-controller;
