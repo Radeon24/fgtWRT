@@ -1294,8 +1294,10 @@ link-local, flood, malformed and storm frames at a front port, also while the dr
 
 Offloaded: VLAN-unaware bridges and one VLAN-aware bridge of DSA ports, hardware address learning and aging, fast
 ageing, link speed 10/100/1000 through phylink. Flow offload of the NP6Lite works for DSA ports (the NP keys the
-flow on the uplink and the tag_8021q VID). Not offloaded yet: DSA bonds and VLAN devices on DSA ports (forwarded by
-the CPU).
+flow on the uplink and the tag_8021q VID), also for a bond of DSA ports of one switch instance (for instance
+`port15` + `port16` with LACP): one NP session per member on ingress, and on output the member the bond's own hash
+picks, moved to another member when one fails. Not offloaded yet: VLAN devices on DSA ports (forwarded by the CPU),
+and bonds with members on both switch instances or with other ports.
 
 **Address learning.** All DSA ports, `ha1` and `ha2` included, learn source addresses in the switch, also outside a
 bridge: in a small office the HA ports are often used as plain ports. Linux DSA expects standalone ports not to
@@ -1358,6 +1360,7 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 | `ha1`, `ha2` | ✅ Validated over a cable between both: link 1000/full, ping, TCP and UDP through the host path, link toggles, no frames towards the LAN ports. They learn addresses like the other ports; see "Address learning" to turn that off |
 | SFP1, SFP2 | 🧪 Partial: copper SFP modules (1000BASE-X) in both cages, link 1000/full as `port15`/`port16` (`Port: FIBRE` in `ethtool`), ping and the isolation tests; fiber modules, SGMII-only modules and a link on both the SFP and the RJ45 jack of the same port (the SFP wins) not tested; no access to the module EEPROM (`ethtool -m`) |
 | NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated |
+| NP6Lite flow offload of a bond of DSA ports (LACP) | ✅ Validated: `port15` + `port16` routed to `ha1`, both directions, a member failing and coming back; 654 Mbit/s against 304 Mbit/s with the software flow table, with both ends on the device |
 | Per-flow counters of offloaded flows | ✅ Validated (0.1 %) |
 | Crypto engines (`fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng`) | ✅ Validated against the software implementations, also under load |
 | IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated, **outbound only** as on the 60E (`kmod-fortinet-np6lite-ipsec`), together with `fsoc3-cp`: inbound ESP is decrypted in software on `fsoc3-cp`; the `fsoc3-cp` tests pass while the NP encrypts |
