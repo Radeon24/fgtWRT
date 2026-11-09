@@ -1339,7 +1339,7 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 | Boot from RAM, default network | ✅ Validated |
 | `mgmt`, `dmz`, `wan1`, `wan2` | ✅ Validated |
 | `port1`…`port16` (DSA), bridge offload, VLAN-aware bridge | ✅ Validated |
-| `ha1`, `ha2` | 🧪 Ping only |
+| `ha1`, `ha2` | ✅ Validated over a cable between both: link 1000/full, ping, TCP and UDP through the host path, link toggles, no frames towards the LAN ports |
 | SFP1, SFP2 | 🧪 Partial: copper SFP modules (1000BASE-X) in both cages, link 1000/full as `port15`/`port16` (`Port: FIBRE` in `ethtool`), ping and the isolation tests; fiber modules, SGMII-only modules and a link on both the SFP and the RJ45 jack of the same port (the SFP wins) not tested; no access to the module EEPROM (`ethtool -m`) |
 | NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated |
 | Per-flow counters of offloaded flows | ✅ Validated (0.1 %) |
