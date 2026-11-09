@@ -10,11 +10,21 @@ in config_init, and do not soft-reset the PHY. Also apply the LED
 set-up of the board (spare control link speed LED mode, LED control),
 without which the link LEDs stay dark.
 
+The two PHYs of port15/16 also serve the SFP cages SFP1/SFP2 through
+their second SerDes, which is off after reset. With the device tree
+property brcm,sfp-automedium, set up auto-detect medium with fiber
+preferred and the SerDes for 1000BASE-X with autonegotiation, and report
+the fiber link from the Mode Control register (the copper registers do
+not see it). The first fiber link after the set-up passed only frames
+with bad FCS until the SerDes negotiated again: restart its
+autonegotiation once per fiber link before reporting it. Power the
+SerDes down and up with the PHY.
+
 ---
 diff -ruN a/drivers/net/phy/broadcom.c b/drivers/net/phy/broadcom.c
 --- a/drivers/net/phy/broadcom.c
 +++ b/drivers/net/phy/broadcom.c
-@@ -1547,6 +1547,86 @@
+@@ -1547,6 +1547,221 @@
  	return genphy_read_status(phydev);
  }
  
@@ -47,6 +57,135 @@ diff -ruN a/drivers/net/phy/broadcom.c b/drivers/net/phy/broadcom.c
 +#define BCM54220_RDB_LED_CTRL		0x019
 +#define  BCM54220_LED_CTRL_MASK		0x011b
 +#define  BCM54220_LED_CTRL_VAL		0x0008
++/*
++ * Second SerDes (fiber; the SFP cages of port15/16 on the FortiGate 100E):
++ * off after reset. With "brcm,sfp-automedium" in the device tree, the PHY
++ * selects the medium itself (auto-detect medium, fiber preferred), and the
++ * SerDes runs 1000BASE-X with autonegotiation, its link qualified by the
++ * signal detect pin and the PCS sync. The Mode Control register shows the
++ * link of the SerDes; the copper registers do not see it.
++ */
++#define  BCM54220_MODE_SERDES_LINK	BIT(6)
++#define BCM54220_RDB_EXT_SERDES		0x234
++#define  BCM54220_EXT_SERDES_SETUP	0x000f	/* LED, sync, SD pin, select */
++#define BCM54220_RDB_AUTO_DETECT	0x23e
++#define  BCM54220_AUTO_DETECT_MASK	0x033f
++#define  BCM54220_AUTO_DETECT_FIBER	0x02e7	/* 2nd SerDes, LEDs, fiber first */
++#define BCM54220_RDB_S2_BMCR		0xb00
++#define BCM54220_RDB_S2_ADV		0xb04
++#define BCM54220_RDB_S2_LPA		0xb05
++
++struct bcm54220_priv {
++	bool fiber_kicked;	/* SerDes AN restarted for this fiber link */
++};
++
++static int bcm54220_probe(struct phy_device *phydev)
++{
++	phydev->priv = devm_kzalloc(&phydev->mdio.dev,
++				    sizeof(struct bcm54220_priv), GFP_KERNEL);
++	return phydev->priv ? 0 : -ENOMEM;
++}
++
++static bool bcm54220_sfp(struct phy_device *phydev)
++{
++	return of_property_read_bool(phydev->mdio.dev.of_node,
++				     "brcm,sfp-automedium");
++}
++
++static int bcm54220_sfp_restart(struct phy_device *phydev)
++{
++	return bcm_phy_write_rdb(phydev, BCM54220_RDB_S2_BMCR,
++				 BMCR_ANENABLE | BMCR_ANRESTART |
++				 BMCR_FULLDPLX | BMCR_SPEED1000);
++}
++
++static int bcm54220_sfp_setup(struct phy_device *phydev)
++{
++	int err;
++
++	err = bcm_phy_modify_rdb(phydev, BCM54220_RDB_AUTO_DETECT,
++				 BCM54220_AUTO_DETECT_MASK,
++				 BCM54220_AUTO_DETECT_FIBER);
++	if (err < 0)
++		return err;
++	err = bcm_phy_modify_rdb(phydev, BCM54220_RDB_S2_ADV,
++				 ADVERTISE_1000XFULL | ADVERTISE_1000XHALF |
++				 ADVERTISE_1000XPAUSE | ADVERTISE_1000XPSE_ASYM,
++				 ADVERTISE_1000XFULL | ADVERTISE_1000XPAUSE |
++				 ADVERTISE_1000XPSE_ASYM);
++	if (err < 0)
++		return err;
++	err = bcm_phy_modify_rdb(phydev, BCM54220_RDB_EXT_SERDES,
++				 BCM54220_EXT_SERDES_SETUP,
++				 BCM54220_EXT_SERDES_SETUP);
++	if (err < 0)
++		return err;
++	return bcm54220_sfp_restart(phydev);
++}
++
++static int bcm54220_read_status(struct phy_device *phydev)
++{
++	struct bcm54220_priv *priv = phydev->priv;
++	int mode, lpa, err;
++
++	if (!bcm54220_sfp(phydev))
++		return genphy_read_status(phydev);
++
++	mode = bcm_phy_read_rdb(phydev, BCM54220_RDB_MODE_CTRL);
++	if (mode < 0)
++		return mode;
++	if (!(mode & BCM54220_MODE_SERDES_LINK)) {
++		/* a reported fiber link went down; not the restart below */
++		if (phydev->port == PORT_FIBRE)
++			priv->fiber_kicked = false;
++		phydev->port = PORT_TP;
++		return genphy_read_status(phydev);
++	}
++
++	/*
++	 * The first fiber link after the SerDes set-up (the module or its
++	 * partner coming up while the port was set up) passed only frames
++	 * with bad FCS towards the switch, and none towards the module, until
++	 * the SerDes negotiated again: restart its autonegotiation once per
++	 * fiber link and report the link from the next poll on.
++	 */
++	if (!priv->fiber_kicked) {
++		priv->fiber_kicked = true;
++		err = bcm54220_sfp_restart(phydev);
++		if (err < 0)
++			return err;
++		phydev->link = 0;
++		return 0;
++	}
++
++	/* fiber has priority: the PHY passes the SFP side */
++	lpa = bcm_phy_read_rdb(phydev, BCM54220_RDB_S2_LPA);
++	if (lpa < 0)
++		return lpa;
++	phydev->port = PORT_FIBRE;
++	phydev->link = 1;
++	phydev->speed = SPEED_1000;
++	phydev->duplex = DUPLEX_FULL;
++	phydev->pause = !!(lpa & LPA_1000XPAUSE);
++	phydev->asym_pause = !!(lpa & LPA_1000XPAUSE_ASYM);
++	linkmode_zero(phydev->lp_advertising);
++	return 0;
++}
++
++static int bcm54220_suspend(struct phy_device *phydev)
++{
++	if (bcm54220_sfp(phydev))
++		bcm_phy_modify_rdb(phydev, BCM54220_RDB_S2_BMCR, BMCR_PDOWN,
++				   BMCR_PDOWN);
++	return genphy_suspend(phydev);
++}
++
++static int bcm54220_resume(struct phy_device *phydev)
++{
++	if (bcm54220_sfp(phydev))
++		bcm_phy_modify_rdb(phydev, BCM54220_RDB_S2_BMCR, BMCR_PDOWN, 0);
++	return genphy_resume(phydev);
++}
 +
 +static int bcm54220_rgmii(struct phy_device *phydev)
 +{
@@ -79,6 +218,12 @@ diff -ruN a/drivers/net/phy/broadcom.c b/drivers/net/phy/broadcom.c
 +	if (err < 0)
 +		return err;
 +
++	if (bcm54220_sfp(phydev)) {
++		err = bcm54220_sfp_setup(phydev);
++		if (err < 0)
++			return err;
++	}
++
 +	if (!phy_interface_is_rgmii(phydev))
 +		return 0;
 +
@@ -101,7 +246,7 @@ diff -ruN a/drivers/net/phy/broadcom.c b/drivers/net/phy/broadcom.c
  static struct phy_driver broadcom_drivers[] = {
  {
  	PHY_ID_MATCH_MODEL(PHY_ID_BCM5411),
-@@ -1573,6 +1653,14 @@
+@@ -1573,6 +1788,16 @@
  	.handle_interrupt = bcm_phy_handle_interrupt,
  	.link_change_notify	= bcm54xx_link_change_notify,
  }, {
@@ -109,14 +254,16 @@ diff -ruN a/drivers/net/phy/broadcom.c b/drivers/net/phy/broadcom.c
 +	.name		= "Broadcom BCM54220",
 +	/* PHY_GBIT_FEATURES */
 +	/* no soft reset: it would bring back the strapped interface mode */
++	.probe		= bcm54220_probe,
 +	.config_init	= bcm54220_config_init,
-+	.suspend	= genphy_suspend,
-+	.resume		= genphy_resume,
++	.read_status	= bcm54220_read_status,
++	.suspend	= bcm54220_suspend,
++	.resume		= bcm54220_resume,
 +}, {
  	PHY_ID_MATCH_MODEL(PHY_ID_BCM54210E),
  	.name		= "Broadcom BCM54210E",
  	/* PHY_GBIT_FEATURES */
-@@ -1843,6 +1931,7 @@
+@@ -1843,6 +2068,7 @@
  	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM5411) },
  	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM5421) },
  	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM54210E) },
