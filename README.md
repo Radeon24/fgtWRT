@@ -1285,8 +1285,9 @@ link-local, flood, malformed and storm frames at a front port, also while the dr
 
 - The forwarding of every port is limited by an egress mask, written through a shadow copy and read back; a
   mismatch closes all ports. `wan1`/`wan2` and the two DSA instances are isolated from each other.
-- Front ports do not parse VLAN tags, except the CPU uplinks and the ports of the one VLAN-aware bridge; ingress
-  VLAN filtering on all ports. VIDs 3072–4095 are reserved for tag_8021q.
+- Front ports do not parse VLAN tags, except the CPU uplinks, the ports of the one VLAN-aware bridge and standalone
+  ports with 802.1Q devices (see below); ingress VLAN filtering on all ports. VIDs 3072–4095 are reserved for
+  tag_8021q.
 - The switch stays in reset until the driver has set it up, and goes back to reset on unbind, shutdown or a failed
   step: it never forwards without the driver. No frame is copied to the switch CPU port.
 - Learning is limited per port (excess frames dropped).
@@ -1296,8 +1297,17 @@ Offloaded: VLAN-unaware bridges and one VLAN-aware bridge of DSA ports, hardware
 ageing, link speed 10/100/1000 through phylink. Flow offload of the NP6Lite works for DSA ports (the NP keys the
 flow on the uplink and the tag_8021q VID), also for a bond of DSA ports of one switch instance (for instance
 `port15` + `port16` with LACP): one NP session per member on ingress, and on output the member the bond's own hash
-picks, moved to another member when one fails. Not offloaded yet: VLAN devices on DSA ports (forwarded by the CPU),
-and bonds with members on both switch instances or with other ports.
+picks, moved to another member when one fails. Not offloaded yet: bonds with members on both switch instances or
+with other ports, and 802.1Q devices on bridged ports or bond members.
+
+**802.1Q devices on DSA ports** (`port1.10`). The switch translates the VLAN of such a device to an internal VLAN
+of its own (VIDs from 3071 down, one per device, the port and its CPU uplink as members), so that the frame reaches
+the NP6Lite with one tag, and gives the frame its VID back when it leaves the port. The NP6Lite then offloads the
+flows of the device like those of the port; the same VID may be used on several ports. A port with 802.1Q devices
+parses tags: a tagged frame with a VID it has no device for (an internal VID included) is dropped by the switch,
+untagged and priority-tagged frames go to the port as before. While the port is in a bridge or a bond, its 802.1Q
+devices are not translated (the bridge VLANs apply); the internal VIDs in use cannot be added to the VLAN-aware
+bridge. `/sys/kernel/debug/bcm53344/xlt` lists the translations.
 
 **Address learning.** All DSA ports, `ha1` and `ha2` included, learn source addresses in the switch, also outside a
 bridge: in a small office the HA ports are often used as plain ports. Linux DSA expects standalone ports not to
@@ -1360,6 +1370,7 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 | `ha1`, `ha2` | ✅ Validated over a cable between both: link 1000/full, ping, TCP and UDP through the host path, link toggles, no frames towards the LAN ports. They learn addresses like the other ports; see "Address learning" to turn that off |
 | SFP1, SFP2 | 🧪 Partial: copper SFP modules (1000BASE-X) in both cages, link 1000/full as `port15`/`port16` (`Port: FIBRE` in `ethtool`), ping and the isolation tests; fiber modules, SGMII-only modules and a link on both the SFP and the RJ45 jack of the same port (the SFP wins) not tested; no access to the module EEPROM (`ethtool -m`) |
 | NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated |
+| 802.1Q devices on DSA ports, NP6Lite flow offload of their flows | ✅ Validated: `port13.20` routed to `ha1`, offloaded both ways (437 / 456 Mbit/s with both ends on the device); on the wire, tagged replies from `port1.30`, no reply to other VIDs, internal VIDs or tag stacks; leaving a bridge turns the translation back on; negative tests (including internal VIDs and tag stacks at a port with 802.1Q devices) without leak |
 | NP6Lite flow offload of a bond of DSA ports (LACP) | ✅ Validated: `port15` + `port16` routed to `ha1`, both directions, a member failing and coming back; 654 Mbit/s against 304 Mbit/s with the software flow table, with both ends on the device |
 | Per-flow counters of offloaded flows | ✅ Validated (0.1 %) |
 | Crypto engines (`fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng`) | ✅ Validated against the software implementations, also under load |
