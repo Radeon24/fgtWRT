@@ -41,6 +41,7 @@
 #include <linux/sysfs.h>
 #include <net/dsa.h>
 #include <net/switchdev.h>
+#include <linux/dsa/bcm53344.h>
 #include <linux/workqueue.h>
 
 
@@ -201,6 +202,9 @@ static bool bcm53344_nolearn_has(const char *name)
 #define EGR_ENABLE		0x345c0000	/* memory, by physical port */
 #define  EGR_PRT_ENABLE		BIT(0)
 #define EGR_VLAN_CONTROL_1	0x04000b00	/* port register */
+#define  EGR_VT_ENABLE		BIT(0)
+#define EGR_PORT		0x04000900	/* port register */
+#define  EGR_PORT_VT_GROUP	GENMASK(29, 24)	/* VT_PORT_GROUP_ID */
 #define ING_CONFIG_64		0x06000000	/* IPIPE, 64 bit */
 #define  APPLY_EGR_MASK_ON_L2	BIT_ULL(12)
 #define  APPLY_EGR_MASK_ON_L3	BIT_ULL(13)
@@ -251,6 +255,17 @@ static bool bcm53344_nolearn_has(const char *name)
 #define  CML_LEARN_FWD		8	/* CML_FLAGS: learn in hardware, forward */
 #define  CML_FWD		0	/* CML_FLAGS: forward, no learning */
 #define ING_VLAN_TAG_ACTION_PROFILE 0x102c0000	/* 1 word, 64 entries */
+#define EGR_VLAN_TAG_ACTION_PROFILE 0x14340000	/* EPIPE, 1 word, 64 entries */
+/* VLAN translation: hash tables, entries inserted and deleted by key */
+#define VLAN_XLATE		0x10180000	/* IPIPE, 4 words */
+#define EGR_VLAN_XLATE		0x14140000	/* EPIPE, 3 words */
+#define SCHAN_TABLE_INSERT	0x24
+#define SCHAN_TABLE_DELETE	0x26
+#define XLT_PROFILE		1	/* tag action profile: replace the outer VID */
+#define XLT_KEY_OVID		4	/* VLAN_XLATE key: port and outer VID */
+#define XLT_IVID_TOP		3071	/* internal VIDs, taken from the top down */
+#define XLT_IVID_N		1024
+#define XLT_MAX			128	/* 802.1Q devices translated at a time */
 #define  TAG_ACTION_ADD		1
 #define  TAG_ACTION_REPLACE	2
 #define L2X			0x1c000000	/* 4 words, 16384 entries */
@@ -373,6 +388,16 @@ struct bcm53344 {
 	u16 pvid[NUM_PORTS];		/* PORT_VID set by a DSA instance */
 	u32 egr_mask[NUM_PORTS];	/* EGR_MASK as it must be in hardware */
 	struct bcm53344_dsa *dsa[2];	/* DSA instances, by switch index */
+	/* 802.1Q devices of the user ports, translated by the switch */
+	struct bcm53344_xlt {
+		struct net_device *vdev;	/* the 802.1Q device, a key */
+		struct bcm53344_dsa *d;
+		u8 port;		/* DSA port */
+		u16 vid;		/* VID on the wire */
+		u16 ivid;		/* internal VID, 0 while not translated */
+		u16 l2mc;
+	} xlt[XLT_MAX];
+	DECLARE_BITMAP(xlt_ivid, VLAN_N_VID);	/* internal VIDs in use */
 };
 
 /*
@@ -1846,6 +1871,27 @@ static int bcm53344_setup_passthrough(struct bcm53344 *sw)
 				       prof, 1);
 		if (ret)
 			return ret;
+		/*
+		 * Profile XLT_PROFILE, of the VLAN translation entries: as 0,
+		 * and the outer tag of a tagged frame takes the new VID, on
+		 * ingress and on egress (with profile 0 the entries hit, but
+		 * the VID stays).
+		 */
+		bcm53344_field_set(prof, 14, 2, TAG_ACTION_REPLACE);	/* SOT_OTAG */
+		bcm53344_field_set(prof, 22, 2, TAG_ACTION_REPLACE);	/* DT_OTAG */
+		ret = bcm53344_mem_set(sw, BLK_IPIPE,
+				       ING_VLAN_TAG_ACTION_PROFILE + XLT_PROFILE,
+				       prof, 1);
+		if (ret)
+			return ret;
+		prof[0] = 0;
+		bcm53344_field_set(prof, 0, 2, TAG_ACTION_REPLACE);	/* DT_OTAG */
+		bcm53344_field_set(prof, 8, 2, TAG_ACTION_REPLACE);	/* SOT_OTAG */
+		ret = bcm53344_mem_set(sw, BLK_EPIPE,
+				       EGR_VLAN_TAG_ACTION_PROFILE + XLT_PROFILE,
+				       prof, 1);
+		if (ret)
+			return ret;
 	}
 
 	ret = bcm53344_vlan_dead(sw);
@@ -2551,6 +2597,8 @@ struct bcm53344_dsa {
 	u16 aware_vid[16];		/* bridge VLAN left by a VLAN-aware port */
 	u16 br_nolearn;			/* bridged ports with "learning" off */
 	u16 nolearn;			/* user ports not learning now */
+	u16 xlt_on;			/* user ports translating 802.1Q tags */
+	struct notifier_block xlt_nb;	/* 802.1Q devices, port uppers */
 };
 
 static int bcm53344_dsa_hw(struct bcm53344_dsa *d, int port)
@@ -2692,6 +2740,11 @@ static int bcm53344_dsa_port_vlan_add(struct dsa_switch *ds, int port,
 	}
 	v = &sw->vlan[vid];
 	mutex_lock(&sw->cfg_lock);
+	if (test_bit(vid, sw->xlt_ivid)) {
+		mutex_unlock(&sw->cfg_lock);
+		NL_SET_ERR_MSG_MOD(extack, "VID used internally to translate an 802.1Q device");
+		return -EBUSY;
+	}
 	v->want |= BIT(hw);
 	/* the CPU port always sees the tag: it tells the VLAN to the host */
 	if ((vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED) && !dsa_is_cpu_port(ds, port))
@@ -2737,6 +2790,10 @@ static int bcm53344_dsa_port_vlan_del(struct dsa_switch *ds, int port,
 	mutex_unlock(&sw->cfg_lock);
 	return ret;
 }
+
+static int bcm53344_xlt_event(struct notifier_block *nb, unsigned long event,
+			      void *ptr);
+static void bcm53344_xlt_sync(struct bcm53344_dsa *d, int port);
 
 static int bcm53344_dsa_setup(struct dsa_switch *ds)
 {
@@ -2815,6 +2872,13 @@ static int bcm53344_dsa_setup(struct dsa_switch *ds)
 			ret = bcm53344_mac_enable(sw, i);
 	dev_info(ds->dev, "switch %d: user ports %#x, cpu port %d: %d\n",
 		 ds->index, d->users, l->cpu, ret);
+	/* 802.1Q devices of the user ports (replayed for existing ones) */
+	if (!ret) {
+		d->xlt_nb.notifier_call = bcm53344_xlt_event;
+		ret = register_netdevice_notifier(&d->xlt_nb);
+		if (ret)
+			d->xlt_nb.notifier_call = NULL;
+	}
 	return ret;
 }
 
@@ -3155,7 +3219,17 @@ static void bcm53344_dsa_teardown(struct dsa_switch *ds)
 	struct bcm53344_bulk b = { };
 	int i;
 
+	if (d->xlt_nb.notifier_call)
+		unregister_netdevice_notifier(&d->xlt_nb);
 	rtnl_lock();
+	mutex_lock(&sw->cfg_lock);
+	for (i = 0; i < XLT_MAX; i++)
+		if (sw->xlt[i].d == d)
+			sw->xlt[i].vdev = NULL;
+	mutex_unlock(&sw->cfg_lock);
+	for (i = 0; i < d->lay->n; i++)
+		if (d->xlt_on & BIT(i) || dsa_is_user_port(ds, i))
+			bcm53344_xlt_sync(d, i);
 	dsa_tag_8021q_unregister(ds);
 	rtnl_unlock();
 	mutex_lock(&sw->cfg_lock);
@@ -3241,6 +3315,324 @@ static const struct phylink_mac_ops bcm53344_phylink_mac_ops = {
 	.mac_link_up	= bcm53344_dsa_mac_link_up,
 };
 
+/* ---------------------------------------------- 802.1Q devices on user ports */
+
+/*
+ * An 802.1Q device on a standalone user port (port1.10). Without help, a
+ * frame tagged 10 entering port1 reaches the CPU port with two tags, the
+ * standalone tag_8021q VID of port1 and 10: the NP6Lite keys a flow on one
+ * VLAN only. The switch translates instead: VLAN_XLATE puts a frame from
+ * port1 tagged 10 on an internal VLAN (port1 and the CPU port, both
+ * tagged), so it reaches the CPU port with one tag; EGR_VLAN_XLATE gives a
+ * frame of the internal VLAN leaving port1 the tag 10 back. The tag driver
+ * maps the internal VID to port1 and 10 (tagger_data), the NP6Lite keys
+ * and pushes it like a standalone VID.
+ *
+ * Such a port parses tags (OUTER_TPID_ENABLE) and drops a tagged frame
+ * that misses VLAN_XLATE (VT_MISS_DROP): a VID it has no 802.1Q device
+ * for, or an internal VID sent from outside, never enters a VLAN. VID 0
+ * (priority tag) is mapped to its standalone VID. Untagged frames take the
+ * standalone VID as before. On egress, a frame of any other VLAN misses
+ * EGR_VLAN_XLATE and leaves as before (no drop, no untag on a miss).
+ *
+ * Translated only while the port has no master (no bridge, no bond): a
+ * bridged port takes the VLANs of its bridge. The host sends to port1.10
+ * as before, on the standalone VLAN with the 802.1Q tag inside.
+ */
+static int bcm53344_table_op(struct bcm53344 *sw, int op, int blk, u32 base,
+			     const u32 *e, int n)
+{
+	u32 wr[SCHAN_WORDS], rd[2] = { };
+	int ret;
+
+	wr[0] = SCHAN_HDR(op, blk, n * 4);
+	wr[1] = base;
+	memcpy(&wr[2], e, n * 4);
+	ret = bcm53344_schan_op(sw, wr, n + 2, rd, 2);
+	dev_dbg(&sw->pdev->dev, "table op %#x %#010x %*ph: reply %#010x %#010x: %d\n",
+		op, base, n * 4, e, rd[0], rd[1], ret);
+	return ret;
+}
+
+static void bcm53344_xlt_ing_entry(u32 *e, int hw, u16 ovid, u16 nvid)
+{
+	memset(e, 0, 4 * sizeof(*e));
+	bcm53344_field_set(e, 0, 1, 1);			/* VALID */
+	bcm53344_field_set(e, 1, 3, XLT_KEY_OVID);	/* KEY_TYPE */
+	bcm53344_field_set(e, 4, 6, hw);		/* PORT_NUM (MODULE_ID 0, T 0) */
+	bcm53344_field_set(e, 18, 12, ovid);		/* OVID */
+	bcm53344_field_set(e, 46, 12, nvid);		/* NEW_OVID */
+	bcm53344_field_set(e, 83, 6, XLT_PROFILE);	/* TAG_ACTION_PROFILE_PTR */
+}
+
+static void bcm53344_xlt_egr_entry(u32 *e, int hw, u16 ivid, u16 vid)
+{
+	memset(e, 0, 3 * sizeof(*e));
+	bcm53344_field_set(e, 0, 1, 1);			/* VALID (ENTRY_TYPE 0) */
+	bcm53344_field_set(e, 4, 12, ivid);		/* OVID */
+	bcm53344_field_set(e, 16, 6, hw);		/* PORT_GROUP_ID */
+	bcm53344_field_set(e, 41, 12, vid);		/* NEW_OVID */
+	bcm53344_field_set(e, 74, 6, XLT_PROFILE);	/* TAG_ACTION_PROFILE_PTR */
+}
+
+/*
+ * Translation of switch port @hw on or off; cfg_lock held. On: the key and
+ * the miss drop first, the tag parsing last; off in the reverse order.
+ * The egress port group is the switch port number (unique).
+ */
+static int bcm53344_xlt_port(struct bcm53344 *sw, int hw, u16 svid, bool on)
+{
+	u32 e[4], v = 0;
+	int ret;
+
+	if (on) {
+		bcm53344_xlt_ing_entry(e, hw, 0, svid);
+		ret = bcm53344_table_op(sw, SCHAN_TABLE_INSERT, BLK_IPIPE,
+					VLAN_XLATE, e, 4);
+		if (!ret)
+			ret = bcm53344_reg_read(sw, BLK_EPIPE, EGR_PORT | hw, &v);
+		if (!ret)
+			ret = bcm53344_reg_write(sw, BLK_EPIPE, EGR_PORT | hw,
+						 (v & ~EGR_PORT_VT_GROUP) |
+						 FIELD_PREP(EGR_PORT_VT_GROUP, hw));
+		if (!ret)
+			ret = bcm53344_reg_write(sw, BLK_EPIPE, EGR_VLAN_CONTROL_1 | hw,
+						 REMARK_OUTER_DOT1P | EGR_VT_ENABLE);
+		if (!ret)
+			ret = bcm53344_port_tab_set(sw, hw, 111, 3, XLT_KEY_OVID); /* VT_KEY_TYPE */
+		if (!ret)
+			ret = bcm53344_port_tab_set(sw, hw, 114, 1, 1);	/* VT_KEY_TYPE_USE_GLP */
+		if (!ret)
+			ret = bcm53344_port_tab_set(sw, hw, 1, 1, 1);	/* VT_MISS_DROP */
+		if (!ret)
+			ret = bcm53344_port_tab_set(sw, hw, 2, 1, 1);	/* VT_ENABLE */
+		if (!ret)
+			ret = bcm53344_port_tab_set(sw, hw, 85, 4, 1);	/* OUTER_TPID_ENABLE */
+		return ret;
+	}
+	ret = bcm53344_port_tab_set(sw, hw, 85, 4, 0);
+	if (!ret)
+		ret = bcm53344_port_tab_set(sw, hw, 2, 1, 0);
+	if (!ret)
+		ret = bcm53344_port_tab_set(sw, hw, 1, 1, 0);
+	if (!ret)
+		ret = bcm53344_reg_write(sw, BLK_EPIPE, EGR_VLAN_CONTROL_1 | hw,
+					 REMARK_OUTER_DOT1P);
+	bcm53344_xlt_ing_entry(e, hw, 0, svid);
+	bcm53344_table_op(sw, SCHAN_TABLE_DELETE, BLK_IPIPE, VLAN_XLATE, e, 4);
+	return ret;
+}
+
+/* one translation on (an internal VID, its VLAN, both entries) or off */
+static int bcm53344_xlt_set(struct bcm53344 *sw, struct bcm53344_xlt *x,
+			    bool on)
+{
+	struct bcm53344_dsa *d = x->d;
+	struct bcm53344_tagger_data *td = bcm53344_tagger_data(&d->ds);
+	int hw = bcm53344_dsa_hw(d, x->port), cpu = d->lay->cpu, ret, bit, i;
+	u32 e[4];
+
+	if (on) {
+		for (i = XLT_IVID_TOP; i > XLT_IVID_TOP - XLT_IVID_N; i--)
+			if (!test_bit(i, sw->xlt_ivid) && !sw->vlan[i].want &&
+			    !sw->vlan[i].members)
+				break;
+		if (i == XLT_IVID_TOP - XLT_IVID_N)
+			return -ENOSPC;
+		bit = find_first_zero_bit(sw->l2mc_user, L2MC_USER_N);
+		if (bit >= L2MC_USER_N)
+			return -ENOSPC;
+		set_bit(bit, sw->l2mc_user);
+		set_bit(i, sw->xlt_ivid);
+		x->ivid = i;
+		x->l2mc = L2MC_USER + bit;
+		ret = bcm53344_vlan_write(sw, x->ivid, BIT(hw) | BIT(cpu), 0,
+					  x->l2mc, true);
+		bcm53344_xlt_egr_entry(e, hw, x->ivid, x->vid);
+		if (!ret)
+			ret = bcm53344_table_op(sw, SCHAN_TABLE_INSERT, BLK_EPIPE,
+						EGR_VLAN_XLATE, e, 3);
+		bcm53344_xlt_ing_entry(e, hw, x->vid, x->ivid);
+		if (!ret)
+			ret = bcm53344_table_op(sw, SCHAN_TABLE_INSERT, BLK_IPIPE,
+						VLAN_XLATE, e, 4);
+		if (!ret && td)
+			WRITE_ONCE(td->xlt[x->ivid], BCM53344_XLT_VALID |
+				   FIELD_PREP(BCM53344_XLT_PORT, x->port) |
+				   FIELD_PREP(BCM53344_XLT_VID, x->vid));
+		if (!ret)
+			return 0;
+		/* undone below */
+	}
+	if (!x->ivid)
+		return 0;
+	if (td)
+		WRITE_ONCE(td->xlt[x->ivid], 0);
+	bcm53344_xlt_ing_entry(e, hw, x->vid, x->ivid);
+	bcm53344_table_op(sw, SCHAN_TABLE_DELETE, BLK_IPIPE, VLAN_XLATE, e, 4);
+	bcm53344_xlt_egr_entry(e, hw, x->ivid, x->vid);
+	bcm53344_table_op(sw, SCHAN_TABLE_DELETE, BLK_EPIPE, EGR_VLAN_XLATE, e, 3);
+	ret = bcm53344_vlan_write(sw, x->ivid, 0, 0, x->l2mc, false);
+	clear_bit(x->l2mc - L2MC_USER, sw->l2mc_user);
+	clear_bit(x->ivid, sw->xlt_ivid);
+	x->ivid = 0;
+	x->l2mc = 0;
+	return on ? -EIO : ret;
+}
+
+/*
+ * Bring the translations of user port @port of @d to what they should be:
+ * on while the port has no master, off otherwise. RTNL held.
+ */
+static void bcm53344_xlt_sync(struct bcm53344_dsa *d, int port)
+{
+	struct bcm53344 *sw = d->sw;
+	struct dsa_port *dp = dsa_to_port(&d->ds, port);
+	int hw = bcm53344_dsa_hw(d, port), i, n = 0, ret = 0;
+	bool want, aged = false;
+
+	want = dp && dp->user && !netdev_master_upper_dev_get(dp->user);
+	mutex_lock(&sw->cfg_lock);
+	for (i = 0; i < XLT_MAX; i++)
+		n += sw->xlt[i].vdev && sw->xlt[i].d == d &&
+		     sw->xlt[i].port == port;
+	want = want && n;
+	if (!want && (d->xlt_on & BIT(port))) {
+		/* parsing off first, then the entries */
+		ret = bcm53344_xlt_port(sw, hw, dsa_tag_8021q_standalone_vid(dp),
+					false);
+		d->xlt_on &= ~BIT(port);
+		aged = true;
+	}
+	for (i = 0; i < XLT_MAX; i++) {
+		struct bcm53344_xlt *x = &sw->xlt[i];
+
+		if (!x->d || x->d != d || x->port != port)
+			continue;
+		if (!x->vdev || !want) {
+			if (x->ivid)
+				bcm53344_xlt_set(sw, x, false);
+			if (!x->vdev)
+				x->d = NULL;
+		} else if (!x->ivid) {
+			ret = bcm53344_xlt_set(sw, x, true);
+			if (ret)
+				dev_err(d->ds.dev, "port %d: VID %u not translated: %d\n",
+					port, x->vid, ret);
+		}
+	}
+	if (want && !(d->xlt_on & BIT(port))) {
+		ret = bcm53344_xlt_port(sw, hw, dsa_tag_8021q_standalone_vid(dp),
+					true);
+		if (ret)
+			bcm53344_xlt_port(sw, hw, dsa_tag_8021q_standalone_vid(dp),
+					  false);
+		else
+			d->xlt_on |= BIT(port);
+	}
+	mutex_unlock(&sw->cfg_lock);
+	if (aged)
+		bcm53344_dsa_fast_age(&d->ds, port);
+	if (ret)
+		dev_err(d->ds.dev, "port %d: VLAN translation: %d\n", port, ret);
+}
+
+/* the user port of @dev on instance @d, or -1 */
+static int bcm53344_xlt_user(struct bcm53344_dsa *d, struct net_device *dev)
+{
+	struct dsa_port *dp;
+
+	if (!dev)
+		return -1;
+	dp = dsa_port_from_netdev(dev);
+	if (IS_ERR_OR_NULL(dp))
+		return -1;
+	return dp->ds == &d->ds && dsa_port_is_user(dp) ? dp->index : -1;
+}
+
+static int bcm53344_xlt_event(struct notifier_block *nb, unsigned long event,
+			      void *ptr)
+{
+	struct bcm53344_dsa *d = container_of(nb, struct bcm53344_dsa, xlt_nb);
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct bcm53344 *sw = d->sw;
+	struct bcm53344_xlt *x = NULL;
+	int port, i;
+	u16 vid;
+
+	switch (event) {
+	case NETDEV_CHANGEUPPER:
+		/* a bridge or a bond above the port, or none any more */
+		port = bcm53344_xlt_user(d, dev);
+		if (port >= 0)
+			bcm53344_xlt_sync(d, port);
+		return NOTIFY_DONE;
+	case NETDEV_REGISTER:
+	case NETDEV_UNREGISTER:
+		break;
+	default:
+		return NOTIFY_DONE;
+	}
+	if (!is_vlan_dev(dev) || vlan_dev_vlan_proto(dev) != htons(ETH_P_8021Q))
+		return NOTIFY_DONE;
+	port = bcm53344_xlt_user(d, vlan_dev_real_dev(dev));
+	vid = vlan_dev_vlan_id(dev);
+	if (port < 0 || !vid)
+		return NOTIFY_DONE;
+	mutex_lock(&sw->cfg_lock);
+	for (i = 0; i < XLT_MAX; i++) {
+		if (event == NETDEV_UNREGISTER && sw->xlt[i].vdev == dev) {
+			sw->xlt[i].vdev = NULL;	/* undone by bcm53344_xlt_sync */
+			x = &sw->xlt[i];
+			break;
+		}
+		if (event == NETDEV_REGISTER && !sw->xlt[i].d) {
+			x = &sw->xlt[i];
+			x->vdev = dev;
+			x->d = d;
+			x->port = port;
+			x->vid = vid;
+			x->ivid = 0;
+			break;
+		}
+	}
+	mutex_unlock(&sw->cfg_lock);
+	if (!x && event == NETDEV_REGISTER)
+		dev_warn(d->ds.dev, "%s: more than %d translated VLANs: in software\n",
+			 dev->name, XLT_MAX);
+	if (x)
+		bcm53344_xlt_sync(d, port);
+	return NOTIFY_DONE;
+}
+
+/* debugfs xlt: the 802.1Q devices of the user ports and their translation */
+static int bcm53344_xlt_show(struct seq_file *m, void *unused)
+{
+	struct bcm53344 *sw = m->private;
+	int i;
+
+	mutex_lock(&sw->cfg_lock);
+	for (i = 0; i < XLT_MAX; i++) {
+		struct bcm53344_xlt *x = &sw->xlt[i];
+
+		if (!x->d)
+			continue;
+		seq_printf(m, "switch %d port %u vid %u ivid %u l2mc %u port_on %d%s\n",
+			   x->d->ds.index, x->port, x->vid, x->ivid, x->l2mc,
+			   !!(x->d->xlt_on & BIT(x->port)),
+			   x->vdev ? "" : " (going)");
+	}
+	mutex_unlock(&sw->cfg_lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(bcm53344_xlt);
+
+static int bcm53344_dsa_connect_tag_protocol(struct dsa_switch *ds,
+					     enum dsa_tag_protocol proto)
+{
+	return proto == DSA_TAG_PROTO_BCM53344_8021Q ? 0 : -EPROTONOSUPPORT;
+}
+
 static const struct dsa_switch_ops bcm53344_dsa_ops = {
 	.get_tag_protocol	= bcm53344_dsa_get_tag_protocol,
 	.setup			= bcm53344_dsa_setup,
@@ -3257,6 +3649,7 @@ static const struct dsa_switch_ops bcm53344_dsa_ops = {
 	.port_fast_age		= bcm53344_dsa_fast_age,
 	.port_pre_bridge_flags	= bcm53344_dsa_pre_bridge_flags,
 	.port_bridge_flags	= bcm53344_dsa_bridge_flags,
+	.connect_tag_protocol	= bcm53344_dsa_connect_tag_protocol,
 };
 
 static int bcm53344_dsa_probe(struct platform_device *pdev)
@@ -3382,6 +3775,8 @@ static int bcm53344_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 				    &bcm53344_l2_fops);
 		debugfs_create_file("limits", 0400, sw->debugfs, sw,
 				    &bcm53344_limits_fops);
+		debugfs_create_file("xlt", 0400, sw->debugfs, sw,
+				    &bcm53344_xlt_fops);
 		/*
 		 * PHY buses and the DSA instances (child nodes); without a
 		 * device tree node only the zones work

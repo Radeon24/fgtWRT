@@ -7,8 +7,10 @@
  */
 
 #include <linux/dsa/8021q.h>
+#include <linux/dsa/bcm53344.h>
 #include <linux/etherdevice.h>
 #include <linux/if_bridge.h>
+#include <linux/slab.h>
 
 #include "tag.h"
 #include "tag_8021q.h"
@@ -63,6 +65,30 @@ static struct sk_buff *bcm53344_8021q_rcv(struct sk_buff *skb,
 		return NULL;
 
 	dsa_8021q_rcv(skb, &src_port, &switch_id, &vbid, &vid);
+
+	/*
+	 * An internal VID of a translated 802.1Q device: its user port, the
+	 * frame given back the VID it had on the wire (switch driver).
+	 */
+	if (src_port < 0 && vbid < 1 && vid > 0) {
+		struct dsa_switch *ds = netdev->dsa_ptr->ds;
+		struct bcm53344_tagger_data *td = bcm53344_tagger_data(ds);
+		u32 x = td ? READ_ONCE(td->xlt[vid]) : 0;
+
+		if (x & BCM53344_XLT_VALID) {
+			struct dsa_port *dp;
+			u16 tci = skb_vlan_tag_get(skb);
+
+			dp = dsa_to_port(ds, FIELD_GET(BCM53344_XLT_PORT, x));
+			if (!dp || !dsa_port_is_user(dp) || !dp->user)
+				return NULL;
+			skb->dev = dp->user;
+			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+					       (tci & ~VLAN_VID_MASK) |
+					       FIELD_GET(BCM53344_XLT_VID, x));
+			return skb;
+		}
+	}
 	/*
 	 * Any other VID is a VLAN of the VLAN-aware bridge: the source port is
 	 * unknown, a member of the VLAN stands in for it (hardware learns).
@@ -93,11 +119,30 @@ static struct sk_buff *bcm53344_8021q_rcv(struct sk_buff *skb,
 	return skb;
 }
 
+static int bcm53344_8021q_connect(struct dsa_switch *ds)
+{
+	struct bcm53344_tagger_data *td;
+
+	td = kzalloc(sizeof(*td), GFP_KERNEL);
+	if (!td)
+		return -ENOMEM;
+	ds->tagger_data = td;
+	return 0;
+}
+
+static void bcm53344_8021q_disconnect(struct dsa_switch *ds)
+{
+	kfree(ds->tagger_data);
+	ds->tagger_data = NULL;
+}
+
 static const struct dsa_device_ops bcm53344_8021q_netdev_ops = {
 	.name			= BCM53344_8021Q_NAME,
 	.proto			= DSA_TAG_PROTO_BCM53344_8021Q,
 	.xmit			= bcm53344_8021q_xmit,
 	.rcv			= bcm53344_8021q_rcv,
+	.connect		= bcm53344_8021q_connect,
+	.disconnect		= bcm53344_8021q_disconnect,
 	.needed_headroom	= VLAN_HLEN,
 	.promisc_on_conduit	= true,
 };
