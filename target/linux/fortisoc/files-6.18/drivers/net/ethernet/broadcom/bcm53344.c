@@ -35,7 +35,10 @@
 #include <linux/pci.h>
 #include <linux/phylink.h>
 #include <linux/platform_device.h>
+#include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
+#include <linux/string.h>
+#include <linux/sysfs.h>
 #include <net/dsa.h>
 #include <net/switchdev.h>
 #include <linux/workqueue.h>
@@ -51,6 +54,72 @@ MODULE_PARM_DESC(mac_limit, "learned MAC addresses per front port, frames with a
 static int led_chase_ms = 150;
 module_param(led_chase_ms, int, 0444);
 MODULE_PARM_DESC(led_chase_ms, "chase light: time per jack in ms");
+
+/*
+ * Front ports learn source addresses in hardware, also outside a bridge
+ * (a SOHO set-up may use ha1/ha2 as plain ports). Ports named here never
+ * learn; a bridged port also follows the "learning" flag of its bridge.
+ */
+#define NOLEARN_LEN	128
+static char nolearn[NOLEARN_LEN];
+static DEFINE_MUTEX(nolearn_lock);
+static struct bcm53344 *bcm53344_chip;
+static void bcm53344_dsa_learn_all(struct bcm53344 *sw);
+
+static int bcm53344_nolearn_set(const char *val, const struct kernel_param *kp)
+{
+	struct bcm53344 *sw;
+
+	if (strlen(val) >= NOLEARN_LEN)
+		return -ENOSPC;
+	mutex_lock(&nolearn_lock);
+	strscpy(nolearn, val, NOLEARN_LEN);
+	strim(nolearn);
+	sw = bcm53344_chip;
+	mutex_unlock(&nolearn_lock);
+	if (sw)
+		bcm53344_dsa_learn_all(sw);
+	return 0;
+}
+
+static int bcm53344_nolearn_get(char *buf, const struct kernel_param *kp)
+{
+	int n;
+
+	mutex_lock(&nolearn_lock);
+	n = sysfs_emit(buf, "%s\n", nolearn);
+	mutex_unlock(&nolearn_lock);
+	return n;
+}
+
+static const struct kernel_param_ops bcm53344_nolearn_ops = {
+	.set = bcm53344_nolearn_set,
+	.get = bcm53344_nolearn_get,
+};
+module_param_cb(nolearn, &bcm53344_nolearn_ops, NULL, 0644);
+MODULE_PARM_DESC(nolearn, "DSA user ports that never learn source addresses, by name, separated by spaces or commas (e.g. \"ha1 ha2\")");
+
+/* Is the port named in nolearn? */
+static bool bcm53344_nolearn_has(const char *name)
+{
+	const char *p;
+	size_t n = name ? strlen(name) : 0;
+	bool hit = false;
+
+	if (!n)
+		return false;
+	mutex_lock(&nolearn_lock);
+	for (p = nolearn; *p && !hit; ) {
+		size_t len;
+
+		p += strspn(p, " ,\t\n");
+		len = strcspn(p, " ,\t\n");
+		hit = len == n && !strncmp(p, name, n);
+		p += len;
+	}
+	mutex_unlock(&nolearn_lock);
+	return hit;
+}
 
 /* CMIC (BAR) */
 #define CMIC_SBUS_TIMEOUT	0x10094
@@ -180,6 +249,7 @@ MODULE_PARM_DESC(led_chase_ms, "chase light: time per jack in ms");
 #define STG_TAB			0x14040000	/* 2 words */
 #define PORT_TAB		0x04000000	/* 8 words */
 #define  CML_LEARN_FWD		8	/* CML_FLAGS: learn in hardware, forward */
+#define  CML_FWD		0	/* CML_FLAGS: forward, no learning */
 #define ING_VLAN_TAG_ACTION_PROFILE 0x102c0000	/* 1 word, 64 entries */
 #define  TAG_ACTION_ADD		1
 #define  TAG_ACTION_REPLACE	2
@@ -2479,6 +2549,8 @@ struct bcm53344_dsa {
 	struct net_device *br[16];	/* bridge of each user port */
 	u16 upvid[16];			/* PVID the VLAN-aware bridge asks for */
 	u16 aware_vid[16];		/* bridge VLAN left by a VLAN-aware port */
+	u16 br_nolearn;			/* bridged ports with "learning" off */
+	u16 nolearn;			/* user ports not learning now */
 };
 
 static int bcm53344_dsa_hw(struct bcm53344_dsa *d, int port)
@@ -2699,16 +2771,26 @@ static int bcm53344_dsa_setup(struct dsa_switch *ds)
 	/*
 	 * User ports take every frame as untagged (a tag stays payload) and
 	 * add their PVID; the CPU port parses the tag_8021q tag (outer TPID
-	 * 0, 0x8100). Hardware learning on all of them.
+	 * 0, 0x8100). Hardware learning on all of them, but on the user ports
+	 * named in the nolearn parameter.
 	 */
 	for (i = 0; i < NUM_PORTS && !ret; i++) {
+		u32 cml = CML_LEARN_FWD;
+		int p;
+
 		if (!(d->users & BIT(i)) && i != l->cpu)
 			continue;
+		for (p = 0; p < l->n; p++)
+			if (l->hw[p] == i && dsa_is_user_port(ds, p) &&
+			    bcm53344_nolearn_has(dsa_to_port(ds, p)->name)) {
+				d->nolearn |= BIT(p);
+				cml = CML_FWD;
+			}
 		ret = bcm53344_port_tab_set(sw, i, 85, 4, i == l->cpu);	/* OUTER_TPID_ENABLE */
 		if (!ret)
-			ret = bcm53344_port_tab_set(sw, i, 121, 4, CML_LEARN_FWD);	/* CML_FLAGS_NEW */
+			ret = bcm53344_port_tab_set(sw, i, 121, 4, cml);	/* CML_FLAGS_NEW */
 		if (!ret)
-			ret = bcm53344_port_tab_set(sw, i, 125, 4, CML_LEARN_FWD);	/* CML_FLAGS_MOVE */
+			ret = bcm53344_port_tab_set(sw, i, 125, 4, cml);	/* CML_FLAGS_MOVE */
 	}
 	if (!ret) {
 		sw->link_bmap |= d->users | BIT(l->cpu);
@@ -2884,6 +2966,93 @@ static void bcm53344_dsa_fast_age(struct dsa_switch *ds, int port)
 	}
 	mutex_unlock(&sw->cfg_lock);
 	dev_dbg(ds->dev, "port %d: fast age, %d entries cleared: %d\n", port, n, ret);
+}
+
+/*
+ * Learning of a user port: off when the nolearn parameter names it, or
+ * while it is bridged with the "learning" flag of its bridge off; on
+ * otherwise (also outside a bridge). Turned off, the addresses it learned
+ * go. Called under RTNL.
+ */
+static int bcm53344_dsa_learn_apply(struct bcm53344_dsa *d, int port)
+{
+	struct bcm53344 *sw = d->sw;
+	int hw = bcm53344_dsa_hw(d, port), ret;
+	bool off;
+	u32 cml;
+
+	off = bcm53344_nolearn_has(dsa_to_port(&d->ds, port)->name) ||
+	      (d->br[port] && (d->br_nolearn & BIT(port)));
+	if (off == !!(d->nolearn & BIT(port)))
+		return 0;
+	cml = off ? CML_FWD : CML_LEARN_FWD;
+	mutex_lock(&sw->cfg_lock);
+	ret = bcm53344_port_tab_set(sw, hw, 121, 4, cml);	/* CML_FLAGS_NEW */
+	if (!ret)
+		ret = bcm53344_port_tab_set(sw, hw, 125, 4, cml);	/* CML_FLAGS_MOVE */
+	mutex_unlock(&sw->cfg_lock);
+	if (ret) {
+		dev_err(d->ds.dev, "port %d: learning %s: %d\n", port,
+			off ? "off" : "on", ret);
+		return ret;
+	}
+	if (off) {
+		d->nolearn |= BIT(port);
+		bcm53344_dsa_fast_age(&d->ds, port);
+	} else {
+		d->nolearn &= ~BIT(port);
+	}
+	dev_info(d->ds.dev, "port %d (%s): learning %s\n", port,
+		 dsa_to_port(&d->ds, port)->name, off ? "off" : "on");
+	return 0;
+}
+
+/* After a change of the nolearn parameter: all user ports of both instances */
+static void bcm53344_dsa_learn_all(struct bcm53344 *sw)
+{
+	int i, port;
+
+	rtnl_lock();
+	for (i = 0; i < ARRAY_SIZE(sw->dsa); i++) {
+		struct bcm53344_dsa *d;
+
+		mutex_lock(&sw->cfg_lock);
+		d = sw->dsa[i];
+		mutex_unlock(&sw->cfg_lock);
+		for (port = 0; d && port < d->lay->n; port++)
+			if (dsa_is_user_port(&d->ds, port))
+				bcm53344_dsa_learn_apply(d, port);
+	}
+	rtnl_unlock();
+}
+
+/* Of the flags of a bridge port, only "learning" is offloaded */
+static int bcm53344_dsa_pre_bridge_flags(struct dsa_switch *ds, int port,
+					 struct switchdev_brport_flags flags,
+					 struct netlink_ext_ack *extack)
+{
+	return flags.mask & ~BR_LEARNING ? -EINVAL : 0;
+}
+
+/*
+ * DSA turns "learning" off when a port leaves its bridge (standalone
+ * ports do not learn in its model) and copies the flag of the bridge when
+ * it joins. Here the flag only counts while the port is bridged: outside
+ * a bridge the port learns unless the nolearn parameter names it.
+ */
+static int bcm53344_dsa_bridge_flags(struct dsa_switch *ds, int port,
+				     struct switchdev_brport_flags flags,
+				     struct netlink_ext_ack *extack)
+{
+	struct bcm53344_dsa *d = ds->priv;
+
+	if (!(flags.mask & BR_LEARNING))
+		return -EOPNOTSUPP;
+	if (flags.val & BR_LEARNING)
+		d->br_nolearn &= ~BIT(port);
+	else
+		d->br_nolearn |= BIT(port);
+	return bcm53344_dsa_learn_apply(d, port);
 }
 
 /*
@@ -3086,6 +3255,8 @@ static const struct dsa_switch_ops bcm53344_dsa_ops = {
 	.port_vlan_del		= bcm53344_dsa_port_vlan_del,
 	.port_stp_state_set	= bcm53344_dsa_stp_state,
 	.port_fast_age		= bcm53344_dsa_fast_age,
+	.port_pre_bridge_flags	= bcm53344_dsa_pre_bridge_flags,
+	.port_bridge_flags	= bcm53344_dsa_bridge_flags,
 };
 
 static int bcm53344_dsa_probe(struct platform_device *pdev)
@@ -3215,6 +3386,9 @@ static int bcm53344_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		 * PHY buses and the DSA instances (child nodes); without a
 		 * device tree node only the zones work
 		 */
+		mutex_lock(&nolearn_lock);
+		bcm53344_chip = sw;
+		mutex_unlock(&nolearn_lock);
 		ret = bcm53344_mdio_register(sw, &sw->mii_int, "mdio-int");
 		if (!ret)
 			ret = bcm53344_mdio_register(sw, &sw->mii_ext, "mdio-ext");
@@ -3231,6 +3405,10 @@ static void bcm53344_remove(struct pci_dev *pdev)
 {
 	struct bcm53344 *sw = pci_get_drvdata(pdev);
 
+	mutex_lock(&nolearn_lock);
+	if (bcm53344_chip == sw)
+		bcm53344_chip = NULL;
+	mutex_unlock(&nolearn_lock);
 	/* DSA instances first, then the switch goes into reset (no driver: no forwarding) */
 	of_platform_depopulate(&pdev->dev);
 	cancel_delayed_work_sync(&sw->led_work);
