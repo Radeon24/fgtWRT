@@ -63,7 +63,7 @@ define Device/fortinet_fg-100e
 	fstools_ignore_partname=1
   DEVICE_DTS := fortinet-fg100e
   DEVICE_PACKAGES := firewall4 kmod-nft-offload kmod-bonding proto-bonding \
-	ethtool ip-full ip-bridge kmod-fortinet-np6lite \
+	ethtool ip-full ip-bridge kmod-fortinet-np6lite kmod-fortinet-np6lite-ipsec \
 	kmod-fortinet-fsoc3-trng kmod-fortinet-fsoc3-pkce kmod-fortinet-fsoc3-cp \
 	kmod-ipsec kmod-ipsec4 kmod-ipsec6 kmod-crypto-seqiv \
 	kmod-crypto-chacha20poly1305 kmod-crypto-sha256 \
