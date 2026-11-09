@@ -132,7 +132,7 @@ Routing/NAT Offloading → Hardware flow offloading* (`flow_offloading_hw` in `/
 | L2 bridge / FDB offload in the NP | — | — | — | bridging is done by the switch chip |
 | QoS / shaping offload | ❌ | — | ❌ | NP4Lite: no traffic shaping in the hardware |
 | **Inline IPsec (ESP) in the NP** | | | | |
-| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | ✅ outbound | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on both. NP6Lite: **outbound only**: outbound packets are encrypted by the NP (about 727 Mbit/s), **inbound packets are decrypted in software** (inbound offload not written yet); package `kmod-fortinet-np6lite-ipsec`, in the 60E profile; validated on the published 60E image |
+| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | ✅ outbound | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on both. NP6Lite: **outbound only**: outbound packets are encrypted by the NP (about 727 Mbit/s), **inbound packets are decrypted in software** (inbound offload not written yet); package `kmod-fortinet-np6lite-ipsec`, in the 60E and 100E profiles; validated on the published 60E image and on a 100E |
 | ESP ciphers | — | AES-CBC 128/192/256, 3DES-CBC | AES-CBC, 3DES-CBC (outbound) | as implemented in the drivers; measured with AES-128-CBC |
 | ESP integrity | — | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 (outbound) | as implemented in the drivers; measured with HMAC-SHA1-96 (NP4Lite) and HMAC-SHA256-128 (NP6Lite) |
 | ESN, NAT-T, transport mode | — | ❌ | ❌ | handled in software |
@@ -250,7 +250,7 @@ packages built in.
 
 The 100D profile is described in its own section ([Devices](#devices)): it brings the switch driver, the
 tools of what the switch offloads, LuCI and the fan control, but neither WireGuard nor OpenVPN.
-The 100E profile is that of the 60E without the installer and without `kmod-fortinet-np6lite-ipsec`, plus
+The 100E profile is that of the 60E without the installer, plus
 the crypto engines and the hardware monitor ([Devices](#devices)).
 
 **Which revision builds the published image.**
@@ -1300,7 +1300,7 @@ the CPU).
 ### Packages of the profile
 
 The packages of the 60E profile (LuCI, IPsec, WireGuard, OpenVPN with DCO, `fgtwrt-base`, `luci-app-fgtwrt`),
-but neither the installer nor `kmod-fortinet-np6lite-ipsec` (not tested together with `fsoc3-cp` yet), and:
+but not the installer, and:
 
 | Package (100E profile) | For |
 |---|---|
@@ -1328,7 +1328,9 @@ Latency to the device: 1.4 ms idle, 6.1 ms with offloaded TCP at line rate. Sing
 
 ESP and WireGuard were measured with both tunnel ends on the device, so the figures are ratios, not gateway
 throughput: ESP transport mode AES-GCM 92 Mbit/s and CBC + HMAC-SHA256 95 Mbit/s on `fsoc3-cp`, against
-77 Mbit/s for AES-GCM in software.
+77 Mbit/s for AES-GCM in software. ESP tunnel mode AES-128-CBC + HMAC-SHA256 from `wan2` to `port15`, the
+outbound SA offloaded to the NP6Lite: 147 Mbit/s, against 90 Mbit/s with the same SA in software; both are
+limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 
 ### OpenWrt features
 
@@ -1342,6 +1344,7 @@ throughput: ESP transport mode AES-GCM 92 Mbit/s and CBC + HMAC-SHA256 95 Mbit/s
 | NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated |
 | Per-flow counters of offloaded flows | ✅ Validated (0.1 %) |
 | Crypto engines (`fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng`) | ✅ Validated against the software implementations, also under load |
+| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated, **outbound only** as on the 60E (`kmod-fortinet-np6lite-ipsec`), together with `fsoc3-cp`: inbound ESP is decrypted in software on `fsoc3-cp`; the `fsoc3-cp` tests pass while the NP encrypts |
 | Hardware monitor, fan profiles (`fan-profile`: `silent`, `performance`) | ✅ Validated (`silent`: both fans on the same curve, minimum speed below 40 °C) |
 | USB host port | 🧪 USB 2 storage only |
 | Watchdog | ✅ Validated |
