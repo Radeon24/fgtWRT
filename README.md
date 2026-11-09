@@ -1231,7 +1231,7 @@ nothing in the image writes to it.
 | Crypto | symmetric engine, public key engine and random number generator of the SoC3; drivers `fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng` |
 | Switch | Broadcom BCM53344 (Hurricane 2) on PCIe, driver `bcm53344` with DSA tagger `bcm53344-8021q`; links to the NP6Lite over SGMII/QSGMII |
 | PHYs | 3 × Broadcom BCM54220 (B50220, dual port): `mgmt` and `dmz` (RGMII to the NP6Lite), `port13`…`port16` (SGMII to the switch); `port1`…`port12`, `ha1`, `ha2`, `wan1`, `wan2` on the internal PHYs of the switch |
-| Ethernet ports | 22 × 1 GbE: `mgmt`, `dmz` (NP6Lite); `wan1`, `wan2` (through the switch, each on an NP port of its own); `ha1`, `ha2`, `port1`…`port16` (switch, DSA ports); `port15`/`port16` shared with SFP1/SFP2 |
+| Ethernet ports | 22 × 1 GbE: `mgmt`, `dmz` (NP6Lite); `wan1`, `wan2` (through the switch, each on an NP port of its own); `ha1`, `ha2`, `port1`…`port16` (switch, DSA ports); `port15`/`port16` shared with SFP1/SFP2 (1000BASE-X; the SFP has priority) |
 | Boot disk | eMMC, 3.56 GiB, same partition layout as the 60E (not written by this image) |
 | Boot flash | Macronix MX25L1605E SPI NOR, 2 MiB: boot loader and base MAC address (read-only) |
 | USB | 1 × USB-A (USB 2 tested), port power on an NP GPIO |
@@ -1338,7 +1338,7 @@ throughput: ESP transport mode AES-GCM 92 Mbit/s and CBC + HMAC-SHA256 95 Mbit/s
 | `mgmt`, `dmz`, `wan1`, `wan2` | ✅ Validated |
 | `port1`…`port16` (DSA), bridge offload, VLAN-aware bridge | ✅ Validated |
 | `ha1`, `ha2` | 🧪 Ping only |
-| SFP1, SFP2 | ❓ Not tested (no module) |
+| SFP1, SFP2 | 🧪 Partial: copper SFP modules (1000BASE-X) in both cages, link 1000/full as `port15`/`port16` (`Port: FIBRE` in `ethtool`), ping and the isolation tests; fiber modules, SGMII-only modules and a link on both the SFP and the RJ45 jack of the same port (the SFP wins) not tested; no access to the module EEPROM (`ethtool -m`) |
 | NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated |
 | Per-flow counters of offloaded flows | ✅ Validated (0.1 %) |
 | Crypto engines (`fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng`) | ✅ Validated against the software implementations, also under load |
