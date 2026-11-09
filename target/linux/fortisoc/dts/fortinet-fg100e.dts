@@ -210,9 +210,13 @@
 					};
 					b50220_15: ethernet-phy@f {
 						reg = <15>;
+						/* port16, SFP2: second SerDes to the SFP cage */
+						brcm,sfp-automedium;
 					};
 					b50220_16: ethernet-phy@10 {
 						reg = <16>;
+						/* port15, SFP1: second SerDes to the SFP cage */
+						brcm,sfp-automedium;
 					};
 					b50220_31: ethernet-phy@1f {
 						reg = <31>;
