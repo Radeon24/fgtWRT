@@ -1235,6 +1235,7 @@ SoC3. The image installs into partition 2 of the internal eMMC as on the 60E (se
 | Boot disk | eMMC, 3.56 GiB, same partition layout as the 60E (OpenWrt in partition 2, sectors 786440 to 1310727) |
 | Boot flash | Macronix MX25L1605E SPI NOR, 2 MiB: boot loader and base MAC address (read-only) |
 | USB | 1 × USB-A (USB 2 tested), port power on an NP GPIO |
+| Buttons | reset (NP GPIO 4) |
 | Console | RJ45 (Cisco pinout), 9600 8N1 |
 | Hardware monitoring | Nuvoton NCT7802Y on I2C (`nct7802`): temperatures, voltages, fan speeds; the chip regulates the fans itself; `fan-profile` sets its curve |
 | LEDs | link and activity LEDs of all front ports (switch LED processor and PHY LED modes) |
@@ -1334,8 +1335,8 @@ share one MAC address) loses frames with or without learning: give one side its 
 
 ### Packages of the profile
 
-The packages of the 60E profile (LuCI, IPsec, WireGuard, OpenVPN with DCO, `fgtwrt-base`, `luci-app-fgtwrt`),
-but not the installer, and:
+The packages of the 60E profile (LuCI, IPsec, WireGuard, OpenVPN with DCO, `fgtwrt-base`, `luci-app-fgtwrt`,
+the installer, the reset button), and:
 
 | Package (100E profile) | For |
 |---|---|
@@ -1398,6 +1399,7 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 | USB host port | 🧪 USB 2 storage only |
 | Watchdog | ✅ Validated |
 | LEDs of the front ports | ✅ Validated by a visual check |
+| Reset button | ✅ A short press reboots cleanly (`gpio-button-hotplug`, polled every 100 ms; hold it about 0.3 s); a press of 5 s or more triggers the OpenWrt factory reset (standard OpenWrt behaviour, not tested on this unit) |
 | STATUS, ALARM, HA LEDs | ✅ Validated by a visual check: STATUS green blinking while booting, green once running, red blinking in failsafe and during an upgrade; ALARM red blinks on a kernel panic, STATUS then goes dark; a failed fan (below 1000 rpm, `fan-monitor`) turns ALARM orange and STATUS red, both fans failed turn ALARM red; HA is off, without a trigger (no HA cluster), free for the LED configuration |
 | Installation to the eMMC, persistent storage | 🧪 Partial: `sysupgrade -n` from a RAM boot into partition 2, boot from the eMMC without TFTP, persistence across a power cycle and `sysupgrade` from the installed system (configuration kept) validated once; [B] back to the stock firmware and back to OpenWrt not tested yet |
 | Continuous operation (24 h) | ❓ Not run yet |

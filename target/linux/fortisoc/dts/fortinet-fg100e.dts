@@ -23,6 +23,7 @@
 
 #include "fsoc3.dtsi"
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
 #include <dt-bindings/leds/common.h>
 
 / {
@@ -92,6 +93,18 @@
 			gpios = <&np_gpio 6 GPIO_ACTIVE_HIGH>;
 			default-state = "off";
 			panic-indicator;
+		};
+	};
+
+	/* Reset button of the front panel: NP GPIO 4, low while pressed */
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
+
+		button-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&np_gpio 4 GPIO_ACTIVE_LOW>;
 		};
 	};
 
@@ -179,8 +192,8 @@
 
 	/*
 	 * NP6Lite msc GPIO block. Consumers: the front panel LEDs (lines 0-3,
-	 * 5, 6). Reserved: 10 (USB port power), 17-18 (MDC lines) and 20-25
-	 * (resets, NP6Lite driver).
+	 * 5, 6) and the reset button (4). Reserved: 10 (USB port power), 17-18
+	 * (MDC lines) and 20-25 (resets, NP6Lite driver).
 	 */
 	np_gpio: gpio@f500fc00 {
 		compatible = "fortinet,fsoc3-gpio";
