@@ -382,6 +382,7 @@ struct bcm53344 {
 	u8 tsc_speed[4];		/* ports 26-29: 2 1000, 1 100, 0 10 */
 	struct mii_bus *mii_int;	/* internal MDIO bus 0: QGPHYs */
 	struct mii_bus *mii_ext;	/* external MDIO bus 1: B50220 */
+	struct mii_bus *b50220_bus;	/* mii_ext once registered (its lock) */
 	struct mutex cfg_lock;		/* VLANs, link bitmap, port table */
 	u32 link_bmap;			/* EPC_LINK_BMAP */
 	u32 dsa_ports;			/* ports owned by a DSA instance */
@@ -2432,13 +2433,21 @@ static int bcm53344_b50220_rdb(struct bcm53344 *sw, int addr, u16 reg,
 	return bcm53344_miim(sw, false, 1, addr, 0x1f, write, val);
 }
 
-/* LED1..LED4 modes (4 bits each); bits 15:8 of the selectors kept */
+/*
+ * LED1..LED4 modes (4 bits each); bits 15:8 of the selectors kept. Under
+ * the lock of the registered bus: the PHY driver reaches the same RDB
+ * registers through it (LED and SFP set-up), and the two steps of an RDB
+ * access must not interleave with its own.
+ */
 static void bcm53344_b50220_led_modes(struct bcm53344 *sw, int addr,
 				      const u8 *m)
 {
 	static const u16 reg[2] = { B50220_RDB_LED_SEL1, B50220_RDB_LED_SEL2 };
+	struct mii_bus *bus = smp_load_acquire(&sw->b50220_bus);
 	int i, v;
 
+	if (bus)
+		mutex_lock(&bus->mdio_lock);
 	for (i = 0; i < 2; i++) {
 		v = bcm53344_b50220_rdb(sw, addr, reg[i], false, 0);
 		if (v < 0)
@@ -2446,6 +2455,8 @@ static void bcm53344_b50220_led_modes(struct bcm53344 *sw, int addr,
 		bcm53344_b50220_rdb(sw, addr, reg[i], true,
 				    (v & 0xff00) | m[2 * i + 1] << 4 | m[2 * i]);
 	}
+	if (bus)
+		mutex_unlock(&bus->mdio_lock);
 }
 
 /*
@@ -4009,6 +4020,8 @@ static int bcm53344_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		ret = bcm53344_mdio_register(sw, &sw->mii_int, "mdio-int");
 		if (!ret)
 			ret = bcm53344_mdio_register(sw, &sw->mii_ext, "mdio-ext");
+		if (!ret && sw->mii_ext)
+			smp_store_release(&sw->b50220_bus, sw->mii_ext);
 		if (!ret && pdev->dev.of_node)
 			ret = of_platform_populate(pdev->dev.of_node, NULL, NULL,
 						   &pdev->dev);
