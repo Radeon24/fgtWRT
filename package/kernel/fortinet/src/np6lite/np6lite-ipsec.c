@@ -26,7 +26,11 @@
  * ipsec_outbound_only set. A decrypted frame goes up with a sec_path
  * xfrm checks against its policies, as after a decryption in software. The
  * engine checks the sequence numbers of an inbound SA with a replay window
- * (fnp6l_sa_replay_window).
+ * (fnp6l_sa_replay_window). The flows of the decrypted frames can be
+ * offloaded too (FLOW_ACTION_XFRM_IN): each inbound SA has a VID the engine
+ * looks its decrypted frames up with, a flow session keyed on it takes the
+ * frames of that SA only (fnp6l_ipsec_ft_in); a deleted SA takes its SPI
+ * session and its flows with it at once (fnp6l_sa_teardown).
  *
  * Register layout and values established by observation, for
  * interoperability; what is still to confirm on hardware is marked FIXME
@@ -282,6 +286,10 @@ struct fnp6l_sa {
 	bool hw;			/* in the engine */
 	bool deleted;			/* by xfrm, no longer used */
 	__be32 saddr, daddr, spi;
+	/* Inbound */
+	u16 in_vid;			/* VID of its decrypted frames */
+	bool spi_gone;			/* its SPI session deleted */
+	struct work_struct del_work;	/* fnp6l_sa_del_work */
 	struct u64_stats_sync syncp;
 	u64_stats_t bytes, packets;
 	u32 sn;				/* last sequence number reported */
@@ -311,6 +319,7 @@ struct fnp6l_ipsec {
 	void *ob_mem;			/* outbound SA table (DDR) */
 	struct fnp6l_sa __rcu **sa_by_idx;
 	/* The rest under the flow-engine lock */
+	DECLARE_BITMAP(in_vids, VLAN_N_VID);	/* VIDs of the inbound SAs */
 	bool hw_ok;			/* engine set up since the last reset */
 	bool ctrl_done;			/* ctrl1 set up (once) */
 	unsigned int nr_sa;
@@ -832,20 +841,60 @@ static void fnp6l_sa_tx_unlink(struct fnp6l_sa *sa)
 /* -------------------------------------------------------- xfrm state ops */
 
 /*
- * Another inbound SA in the engine with the same SPI session key as @sa
- * (an SA deleted and added again: xfrm frees the old one later, from its
- * garbage collector). Under the flow-engine lock.
+ * Another inbound SA in the engine whose SPI session, with the same key as
+ * the one of @sa, may still be in the engine (an SA deleted and added
+ * again, before the old one was torn down): taken as gone, the session of
+ * @sa replaces it. Under the flow-engine lock.
  */
 static bool fnp6l_sa_spi_twin(struct fnp6l_ipsec *ips, const struct fnp6l_sa *sa)
 {
-	const struct fnp6l_sa *o;
+	struct fnp6l_sa *o;
+	bool twin = false;
 
 	list_for_each_entry(o, &ips->sas, node)
-		if (o != sa && o->in && o->hw && o->spi == sa->spi &&
-		    o->saddr == sa->saddr && o->daddr == sa->daddr &&
-		    o->lif == sa->lif)
-			return true;
-	return false;
+		if (o != sa && o->in && o->hw && !o->spi_gone &&
+		    o->spi == sa->spi && o->saddr == sa->saddr &&
+		    o->daddr == sa->daddr && o->lif == sa->lif) {
+			o->spi_gone = true;
+			twin = true;
+		}
+	return twin;
+}
+
+/*
+ * Tear an inbound SA down in the engine as soon as xfrm deleted it: its SPI
+ * session (the engine would decrypt its frames on) and the flows of its
+ * decrypted frames (the flow engine would forward them past xfrm). xfrm
+ * frees the SA later, from its garbage collector, and calls
+ * xdo_dev_state_delete under the state lock. Under the flow-engine lock.
+ */
+static void fnp6l_sa_teardown(struct fnp6l_sa *sa)
+{
+	struct fnp6l_ipsec *ips = sa->ips;
+	struct fnp6l *np = ips->np;
+	unsigned int n;
+
+	if (!sa->hw || !sa->in)
+		return;
+	if (!sa->spi_gone)
+		fnp6l_ipsec_spi(np, sa->saddr, sa->daddr, sa->spi, sa->lif,
+				sa->idx, 0, false);
+	sa->spi_gone = true;
+	n = fnp6l_ft_flush_ipsec(np, sa->in_vid);
+	if (n) {
+		atomic_long_add(n, &ips->ft_purged);
+		netdev_dbg(sa->ndev, "IPsec SA %u: %u flows no longer offloaded\n",
+			   sa->idx, n);
+	}
+}
+
+static void fnp6l_sa_del_work(struct work_struct *work)
+{
+	struct fnp6l_sa *sa = container_of(work, struct fnp6l_sa, del_work);
+
+	fnp6l_fe_lock(sa->ips->np);
+	fnp6l_sa_teardown(sa);
+	fnp6l_fe_unlock(sa->ips->np);
 }
 
 static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
@@ -888,6 +937,7 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 	sa->saddr = x->props.saddr.a4;
 	sa->daddr = x->id.daddr.a4;
 	sa->spi = x->id.spi;
+	INIT_WORK(&sa->del_work, fnp6l_sa_del_work);
 	seqlock_init(&sa->mac_lock);
 	u64_stats_init(&sa->syncp);
 	if (!sa->in) {
@@ -920,6 +970,15 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 		goto unlock;
 	}
 	sa->idx = idx;
+	if (sa->in) {
+		/* VIDs 1-4094, one per inbound SA */
+		sa->in_vid = find_next_zero_bit(ips->in_vids, VLAN_N_VID - 1, 1);
+		if (sa->in_vid >= VLAN_N_VID - 1) {
+			NL_SET_ERR_MSG_MOD(extack, "no free VID for the inbound SA");
+			ret = -ENOSPC;
+			goto unlock;
+		}
+	}
 
 	ret = fnp6l_tun_write(ips, sa->in, idx, desc,
 			      sa->in ? NP6L_SA_IB_STRIDE : NP6L_SA_OB_STRIDE);
@@ -937,9 +996,9 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 		/* the session of a twin (same key) points at its SA: replaced */
 		if (fnp6l_sa_spi_twin(ips, sa))
 			fnp6l_ipsec_spi(np, sa->saddr, sa->daddr, sa->spi, lif,
-					idx, false);
+					idx, 0, false);
 		ret = fnp6l_ipsec_spi(np, sa->saddr, sa->daddr, sa->spi, lif,
-				      idx, true);
+				      idx, sa->in_vid, true);
 		if (ret) {
 			fnp6l_tun_write(ips, true, idx, NULL, NP6L_SA_IB_STRIDE);
 			NL_SET_ERR_MSG_MOD(extack, "flow engine refused the SPI entry");
@@ -948,6 +1007,8 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 	}
 
 	__set_bit(idx, ips->sa_used);
+	if (sa->in)
+		__set_bit(sa->in_vid, ips->in_vids);
 	ips->next_idx = idx + 1;
 	WRITE_ONCE(ips->nr_sa, ips->nr_sa + 1);
 	sa->hw = true;
@@ -996,6 +1057,9 @@ static void fnp6l_xdo_state_delete(struct net_device *ndev,
 	WRITE_ONCE(sa->deleted, true);
 	RCU_INIT_POINTER(sa->ips->sa_by_idx[sa->idx], NULL);
 	fnp6l_sa_tx_unlink(sa);
+	/* under the state lock: the SPI session and flows go from a work */
+	if (sa->in)
+		schedule_work(&sa->del_work);
 }
 
 static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
@@ -1011,6 +1075,7 @@ static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
 	WRITE_ONCE(x->xso.offload_handle, 0);
 	ips = sa->ips;
 	np = ips->np;
+	cancel_work_sync(&sa->del_work);
 	RCU_INIT_POINTER(ips->sa_by_idx[sa->idx], NULL);
 	fnp6l_sa_tx_unlink(sa);
 	synchronize_net();
@@ -1019,10 +1084,8 @@ static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
 	if (sa->hw) {
 		if (fnp6l_tx_drain(np))
 			keep = true;
-		/* not the session a twin added since (same key, its SA) */
-		if (sa->in && !fnp6l_sa_spi_twin(ips, sa))
-			fnp6l_ipsec_spi(np, sa->saddr, sa->daddr, sa->spi,
-					sa->lif, sa->idx, false);
+		/* if not done at the delete already */
+		fnp6l_sa_teardown(sa);
 		/* whether the engine wrote the entry back to the DDR meanwhile */
 		fnp6l_sa_diag(ips, sa->in, sa->idx, "before clear");
 		ret = fnp6l_tun_write(ips, sa->in, sa->idx, NULL,
@@ -1032,6 +1095,8 @@ static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
 			keep = true;
 		if (sa->in && ips->nr_in[sa->lif])
 			ips->nr_in[sa->lif]--;
+		if (sa->in)
+			__clear_bit(sa->in_vid, ips->in_vids);
 	}
 	sa->hw = false;
 	list_del(&sa->node);
@@ -1054,7 +1119,7 @@ static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
  * port, @x set with a reference, or -ENOENT. RX path (NAPI).
  */
 int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1, unsigned int lif,
-		   struct xfrm_state **x)
+		   u16 tci, struct xfrm_state **x)
 {
 	struct fnp6l_sa *sa;
 	unsigned int idx;
@@ -1067,6 +1132,7 @@ int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1, unsigned int lif,
 	rcu_read_lock();
 	sa = idx && idx < NP6L_SA_NR ? rcu_dereference(ips->sa_by_idx[idx]) : NULL;
 	if (sa && (!sa->in || !READ_ONCE(sa->hw) || READ_ONCE(sa->deleted) ||
+		   (tci & VLAN_VID_MASK) != sa->in_vid ||
 		   READ_ONCE(ips->stalled)))
 		sa = NULL;
 	if (sa && !refcount_inc_not_zero(&sa->x->refcnt))
@@ -1376,6 +1442,29 @@ bool fnp6l_ipsec_ft_refuse(struct fnp6l_ipsec *ips, unsigned int in_lif,
 		}
 	}
 	return false;
+}
+
+/*
+ * The VID of the inbound SA in service whose xfrm state is @x, on the port
+ * of LIF @lif: the frames it decrypted are looked up with it. -ENOENT if
+ * there is none (deleted, not offloaded, another port). @x is only
+ * compared. Under the flow-engine lock.
+ */
+int fnp6l_ipsec_ft_in(struct fnp6l_ipsec *ips, const struct xfrm_state *x,
+		      unsigned int lif, u16 *vid)
+{
+	const struct fnp6l_sa *sa;
+
+	if (!ips)
+		return -ENOENT;
+	fnp6l_fe_assert_held(ips->np);
+	list_for_each_entry(sa, &ips->sas, node)
+		if (sa->x == x && sa->in && sa->hw && !sa->spi_gone &&
+		    !READ_ONCE(sa->deleted) && sa->lif == lif) {
+			*vid = sa->in_vid;
+			return 0;
+		}
+	return -ENOENT;
 }
 
 static void fnp6l_pol_unlink(struct fnp6l_pol *pol)

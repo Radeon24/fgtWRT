@@ -1314,7 +1314,7 @@ static void fnp6l_rx_deliver(struct fnp6l *np, struct fnp6l_vec *v,
 	 */
 	if (np->ipsec) {
 		struct xfrm_state *x = NULL;
-		int il = fnp6l_ipsec_rx(np->ipsec, w0, w1, lif, &x);
+		int il = fnp6l_ipsec_rx(np->ipsec, w0, w1, lif, tci, &x);
 
 		if (il < 0 && lif == NP6L_LIF_IPSEC_IN) {
 			v->rx_unknown_lif++;
@@ -3288,6 +3288,12 @@ struct fnp6l_ft_flow {
 	/* in_vid of each session: vid, or the VID of a member of a bond of
 	 * tagged switch ports (all on the conduit's LIF) */
 	u16 in_vid[NP6L_SW_PORTS];
+	/*
+	 * Decrypted by this inbound SA (FLOW_ACTION_XFRM_IN), parse only:
+	 * compared with the SAs in service under the flow-engine lock, never
+	 * followed (fnp6l_ipsec_ft_in).
+	 */
+	const struct xfrm_state *xin;
 	/* output to a bond, member pinned: re-picked on member changes */
 	struct net_device *obond;
 	bool qbond;		/* obond of tagged switch ports: out_vid follows */
@@ -5821,11 +5827,28 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 			if (op && !op->conduit && op->lif != NP6L_LIF_LOADER)
 				nout = 1, olif[0] = op->lif;
 			break;
+#if IS_ENABLED(CONFIG_NF_FLOW_TABLE_XFRM_OFFLOAD) && \
+    IS_ENABLED(CONFIG_FORTINET_NP6LITE_IPSEC)
+		case FLOW_ACTION_XFRM_IN:
+			if (fl->xin || !act->xfrm)
+				return -EOPNOTSUPP;
+			fl->xin = act->xfrm;
+			break;
+#endif
 		default:
 			return fnp6l_ft_refuse_dev(idev, extack,
 						   "unsupported action");
 		}
 	}
+	/*
+	 * Decrypted by an inbound SA of the ingress port: keyed on the LIF and
+	 * VID the engine looks those frames up with (fnp6l_ft_replace), so a
+	 * port of the NP, untagged, one session.
+	 */
+	if (fl->xin && (fl->v6 || fl->n_in_lif != 1 || qvid_in || pop ||
+			qbond_in || netif_is_bond_master(idev)))
+		return fnp6l_ft_refuse_dev(idev, extack,
+					   "decrypted flow not from a plain NP port");
 	if (nout != 1)
 		return fnp6l_ft_refuse_dev(idev, extack, "output is not an NP end");
 	if (fl->v6) {
@@ -6048,9 +6071,29 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 		goto out;
 	}
 	/*
+	 * Decrypted by an inbound SA in service on the ingress port: the
+	 * session is keyed on the LIF the engine hands the decrypted frames
+	 * back on and on the VID of that SA, so frames received in the clear,
+	 * or decrypted through another SA, never match it. The SA gone
+	 * (fnp6l_ft_flush_ipsec) takes its flows with it.
+	 */
+	if (fl->xin) {
+		u16 vid;
+
+		if (fnp6l_ipsec_ft_in(np->ipsec, fl->xin, fl->in_lif[0], &vid)) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		fl->in_lif[0] = NP6L_LIF_IPSEC_IN;
+		fl->in_vid[0] = vid;
+		fl->vid = vid;
+	}
+	/*
 	 * A flow through a port with an offloaded IPsec policy, or that may be
 	 * the traffic of a tunnel once decapsulated, must not be forwarded in
 	 * the clear by the flow engine (IPv4 only; v6 is never IPsec here).
+	 * A decrypted flow (in_lif NP6L_LIF_IPSEC_IN) is checked for the
+	 * output only.
 	 */
 	if (!fl->v6) {
 		struct fnp6l_ipsec_tuple k = {
@@ -7978,12 +8021,14 @@ int fnp6l_tx_drain(struct fnp6l *np)
  * address the lookup never hits. The action sends the frame to the inbound
  * IPsec engine (bit 163, with bit 162) with the SA index at bytes 64-65,
  * and the decrypted frame on to NP6L_LIF_IPSEC_IN (output valid, bit 155,
- * out_lif at bytes 60-61); mtu 0xffff, bytes 104-127 all ones, no timeout
+ * out_lif at bytes 60-61) with the VID @vid (bytes 62-63, big endian: the
+ * frame is looked up again with it as its in_vid, and reaches the host with
+ * it in the TCI of its tag); mtu 0xffff, bytes 104-127 all ones, no timeout
  * (the session stays until deleted). Delete by the same key. Under the
  * flow-engine lock.
  */
 int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
-		    u32 in_lif, u16 sa, bool add)
+		    u32 in_lif, u16 sa, u16 vid, bool add)
 {
 	u8 msg[8 + NP6L_SSE_ENTRY_LEN] = { };
 	u8 *e = msg + 8;
@@ -8003,6 +8048,7 @@ int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
 		put_unaligned_le16(0xffff, e + 58);	/* mtu */
 		e[60] = NP6L_LIF_IPSEC_IN & 0xff;	/* out_lif 489:480 */
 		e[61] = (NP6L_LIF_IPSEC_IN >> 8) & 3;
+		put_unaligned_be16(vid & VLAN_VID_MASK, e + 62);	/* out_vid */
 		put_unaligned_le16(sa, e + 64);	/* SA index */
 		memset(e + 104, 0xff, NP6L_SSE_ENTRY_LEN - 104);
 		msg[0] = 0x80 | NP6L_SSE_CMD_INSERT;
@@ -8089,6 +8135,33 @@ int fnp6l_ipsec_in_init(struct fnp6l *np)
 	dev_info(np->dev, "IPsec: inbound decryption set up (LIF %u)\n",
 		 NP6L_LIF_IPSEC_IN);
 	return 0;
+}
+
+/*
+ * Delete the offloaded flows of the frames an inbound SA decrypted (keyed
+ * on NP6L_LIF_IPSEC_IN and the VID of the SA): the SA is gone. Under the
+ * flow-engine lock; how many were deleted.
+ */
+unsigned int fnp6l_ft_flush_ipsec(struct fnp6l *np, u16 vid)
+{
+	struct fnp6l_ft_flow *flow, *tmp;
+	unsigned int n = 0, i;
+	bool hit;
+
+	lockdep_assert_held(&fnp6l_sse_lock);
+	if (!np->ft_on)
+		return 0;
+	list_for_each_entry_safe(flow, tmp, &np->ft_flows, node) {
+		for (i = 0, hit = false; i < flow->n_in_lif && !hit; i++)
+			hit = flow->in_lif[i] == NP6L_LIF_IPSEC_IN &&
+			      flow->in_vid[i] == vid;
+		if (!hit)
+			continue;
+		fnp6l_ft_unlink(np, flow);
+		fnp6l_ft_drop(np, flow);
+		n++;
+	}
+	return n;
 }
 
 /*

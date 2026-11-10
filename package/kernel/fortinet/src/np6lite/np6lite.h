@@ -38,7 +38,9 @@ struct fnp6l_ipsec_tuple {
 /*
  * The virtual LIF on which the IPsec engine hands a decrypted frame back to
  * the session engine, and through which it reaches the host: none of the
- * ports, high in the LIF space as the vendor firmware takes it.
+ * ports, high in the LIF space as the vendor firmware takes it. The frame
+ * carries the VID of its SA (the output VID of the SPI session), so a flow
+ * session keyed on that LIF and VID takes only the frames of that SA.
  */
 #define NP6L_LIF_IPSEC_IN	249
 
@@ -56,10 +58,11 @@ void fnp6l_fe_unlock(struct fnp6l *np);
 void fnp6l_fe_assert_held(struct fnp6l *np);
 int fnp6l_fe_ready(struct fnp6l *np);
 int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
-		    u32 in_lif, u16 sa, bool add);
+		    u32 in_lif, u16 sa, u16 vid, bool add);
 int fnp6l_ipsec_in_init(struct fnp6l *np);
 int fnp6l_tx_drain(struct fnp6l *np);
 unsigned int fnp6l_ft_flush_lif(struct fnp6l *np, unsigned int lif);
+unsigned int fnp6l_ft_flush_ipsec(struct fnp6l *np, u16 vid);
 
 /* Provided by np6lite-ipsec.c */
 int fnp6l_ipsec_probe(struct fnp6l *np, struct device *dev, void __iomem *base,
@@ -70,12 +73,12 @@ void fnp6l_ipsec_port_init(struct fnp6l_ipsec *ips, struct net_device *ndev);
 /*
  * RX: whether a frame received on LIF @lif is one the IPsec engine
  * decrypted: on NP6L_LIF_IPSEC_IN, word 0 bit 30 "processed", SA index in
- * word 1 bits 15:0. -ENOENT if the frame is not from the IPsec engine,
- * another error to drop it, or the LIF of the port of its SA with @x set
- * (a reference held).
+ * word 1 bits 15:0, the VID of the SA in @tci. -ENOENT if the frame is not
+ * from the IPsec engine, another error to drop it, or the LIF of the port
+ * of its SA with @x set (a reference held).
  */
 int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1, unsigned int lif,
-		   struct xfrm_state **x);
+		   u16 tci, struct xfrm_state **x);
 bool fnp6l_ipsec_rx_skb(struct fnp6l_ipsec *ips, struct sk_buff *skb,
 			struct xfrm_state *x);
 void fnp6l_ipsec_rx_put(struct xfrm_state *x);
@@ -94,6 +97,8 @@ bool fnp6l_ipsec_msg(struct fnp6l_ipsec *ips, const void *buf,
 bool fnp6l_ipsec_ft_refuse(struct fnp6l_ipsec *ips, unsigned int in_lif,
 			   unsigned int out_lif,
 			   const struct fnp6l_ipsec_tuple *key);
+int fnp6l_ipsec_ft_in(struct fnp6l_ipsec *ips, const struct xfrm_state *x,
+		      unsigned int lif, u16 *vid);
 #else
 static inline struct fnp6l_ipsec *
 fnp6l_port_info(const struct net_device *ndev, unsigned int *lif)
@@ -122,7 +127,8 @@ static inline void fnp6l_ipsec_port_init(struct fnp6l_ipsec *ips,
 }
 
 static inline int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1,
-				 unsigned int lif, struct xfrm_state **x)
+				 unsigned int lif, u16 tci,
+				 struct xfrm_state **x)
 {
 	return -ENOENT;
 }
@@ -171,6 +177,13 @@ static inline bool fnp6l_ipsec_ft_refuse(struct fnp6l_ipsec *ips,
 					 const struct fnp6l_ipsec_tuple *key)
 {
 	return false;
+}
+
+static inline int fnp6l_ipsec_ft_in(struct fnp6l_ipsec *ips,
+				    const struct xfrm_state *x,
+				    unsigned int lif, u16 *vid)
+{
+	return -EOPNOTSUPP;
 }
 #endif /* CONFIG_FORTINET_NP6LITE_IPSEC */
 
