@@ -22,8 +22,8 @@
  * the "Linux" logic kept, the backend (tables in DDR, register transport,
  * completion decode) replaced.
  *
- * Outbound SAs are offloaded by default; inbound SAs only with
- * ipsec_outbound_only cleared. A decrypted frame goes up with a sec_path
+ * Outbound and inbound SAs are offloaded; inbound ones not with
+ * ipsec_outbound_only set. A decrypted frame goes up with a sec_path
  * xfrm checks against its policies, as after a decryption in software. The
  * engine checks the sequence numbers of an inbound SA with a replay window
  * (fnp6l_sa_replay_window).
@@ -65,15 +65,14 @@
 #include "np6lite.h"
 
 /*
- * Inbound SAs in the engine are opt-in: by default an inbound SA is left to
- * software (the engine is not told about it). Cleared, an inbound SA added
- * with "offload packet" is decrypted in the network processor (see
- * fnp6l_ipsec_spi and fnp6l_ipsec_in_init).
+ * An inbound SA added with "offload packet" is decrypted in the network
+ * processor (see fnp6l_ipsec_spi and fnp6l_ipsec_in_init). Set, inbound SAs
+ * are refused and left to software (the engine is not told about them).
  */
-static bool ipsec_outbound_only = true;
+static bool ipsec_outbound_only;
 module_param(ipsec_outbound_only, bool, 0644);
 MODULE_PARM_DESC(ipsec_outbound_only,
-		 "offload outbound SAs only, leave inbound to software (default on; 0: inbound SAs in packet offload are decrypted in the NP)");
+		 "offload outbound SAs only, leave inbound to software (default off: inbound SAs in packet offload are decrypted in the NP)");
 
 /*
  * FIXME: the anomaly (anti-replay, integrity) of a received frame is
