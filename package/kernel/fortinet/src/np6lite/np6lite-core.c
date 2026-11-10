@@ -3292,6 +3292,7 @@ struct fnp6l_ft_flow {
 		u32 wbytes, wpkts;	/* window at the last reply */
 		unsigned long rtime;	/* time of the last reply */
 		u64 bytes, pkts;	/* sums, frames without FCS */
+		u64 acc_bytes, acc_pkts;	/* of them, in the netdev stats */
 	} s[NP6L_SW_PORTS];
 	unsigned int nback;	/* times given back before (fnp6l_ft_back_take) */
 };
@@ -3720,11 +3721,14 @@ static void fnp6l_ft_hash_add(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 }
 
 /* off the key and cookie indexes; its session keys kept as deleted */
+static void fnp6l_ft_account(struct fnp6l *np, struct fnp6l_ft_flow *flow);
+
 static void fnp6l_ft_unhash(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 {
 	unsigned int i;
 
 	spin_lock_bh(&np->ft_sess_lock);
+	fnp6l_ft_account(np, flow);	/* what the last report left */
 	hlist_del_init(&flow->cnode);
 	for (i = 0; i < NP6L_SW_PORTS; i++) {
 		if (hlist_unhashed(&flow->s[i].hn))
@@ -4319,12 +4323,50 @@ static void fnp6l_ft_count(struct fnp6l_ft_sess *s, const u8 *st)
 	s->rtime = now;
 }
 
+/*
+ * Offloaded frames into the netdev statistics of the ports of the NP, which
+ * otherwise count the host path only: received on the port of the session's
+ * ingress LIF, sent on the port of the output LIF. A switch port (conduit
+ * LIF) counts in the switch, the output trunk of a bond has no port.
+ */
+static void fnp6l_ft_account(struct fnp6l *np, struct fnp6l_ft_flow *flow)
+{
+	struct fnp6l_port *in, *out = NULL;
+	u64 b, p;
+	unsigned int i, lif = flow->opt.out;
+
+	if (lif < NP6L_MAX_LIF && np->port[lif] && !np->port[lif]->conduit)
+		out = np->port[lif];
+	for (i = 0; i < flow->n_in_lif; i++) {
+		struct fnp6l_ft_sess *s = &flow->s[i];
+
+		b = s->bytes - s->acc_bytes;
+		p = s->pkts - s->acc_pkts;
+		if (!p)
+			continue;
+		s->acc_bytes = s->bytes;
+		s->acc_pkts = s->pkts;
+		lif = flow->in_lif[i];
+		in = lif < NP6L_MAX_LIF ? np->port[lif] : NULL;
+		if (in && !in->conduit) {
+			DEV_STATS_ADD(in->ndev, rx_packets, p);
+			DEV_STATS_ADD(in->ndev, rx_bytes, b);
+		}
+		if (out) {
+			DEV_STATS_ADD(out->ndev, tx_packets, p);
+			DEV_STATS_ADD(out->ndev, tx_bytes, b);
+		}
+	}
+}
+
 /* what a flow counted since its last report, in IP bytes (ft_sess_lock) */
-static void fnp6l_ft_take(struct fnp6l_ft_flow *flow, u64 *bytes, u64 *pkts)
+static void fnp6l_ft_take(struct fnp6l *np, struct fnp6l_ft_flow *flow,
+			  u64 *bytes, u64 *pkts)
 {
 	u64 b = 0, p = 0, db, dp;
 	unsigned int i;
 
+	fnp6l_ft_account(np, flow);
 	for (i = 0; i < flow->n_in_lif; i++) {
 		b += flow->s[i].bytes;
 		p += flow->s[i].pkts;
@@ -6060,7 +6102,7 @@ static int fnp6l_ft_stats(struct fnp6l *np, struct flow_cls_offload *cls)
 		spin_unlock_bh(&np->ft_sess_lock);
 		return -ENOENT;
 	}
-	fnp6l_ft_take(flow, &bytes, &pkts);
+	fnp6l_ft_take(np, flow, &bytes, &pkts);
 	due = fnp6l_ft_missing(flow) ||
 	      (READ_ONCE(np->sse_done) &&
 	       time_after_eq(jiffies, READ_ONCE(flow->qtime) +
