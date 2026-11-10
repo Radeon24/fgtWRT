@@ -10,12 +10,17 @@
 #include <linux/dsa/bcm53344.h>
 #include <linux/etherdevice.h>
 #include <linux/if_bridge.h>
+#include <linux/mm.h>
 #include <linux/slab.h>
 
 #include "tag.h"
 #include "tag_8021q.h"
 
 #define BCM53344_8021Q_NAME "bcm53344-8021q"
+
+/* changes of the VLAN-aware bridge (include/linux/dsa/bcm53344.h) */
+atomic_t bcm53344_aware_gen = ATOMIC_INIT(0);
+EXPORT_SYMBOL_GPL(bcm53344_aware_gen);
 
 static bool bcm53344_8021q_aware(struct dsa_port *dp)
 {
@@ -123,7 +128,7 @@ static int bcm53344_8021q_connect(struct dsa_switch *ds)
 {
 	struct bcm53344_tagger_data *td;
 
-	td = kzalloc(sizeof(*td), GFP_KERNEL);
+	td = kvzalloc(sizeof(*td), GFP_KERNEL);
 	if (!td)
 		return -ENOMEM;
 	ds->tagger_data = td;
@@ -132,7 +137,7 @@ static int bcm53344_8021q_connect(struct dsa_switch *ds)
 
 static void bcm53344_8021q_disconnect(struct dsa_switch *ds)
 {
-	kfree(ds->tagger_data);
+	kvfree(ds->tagger_data);
 	ds->tagger_data = NULL;
 }
 

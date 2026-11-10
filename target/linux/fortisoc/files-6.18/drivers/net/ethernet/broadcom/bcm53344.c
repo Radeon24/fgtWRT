@@ -2821,6 +2821,65 @@ static int bcm53344_user_vlan_sync(struct bcm53344 *sw, u16 vid)
 				   true);
 }
 
+/*
+ * The VLAN-aware bridge as the hardware has it, for the flow offload of the
+ * NP6Lite (bcm53344_aware_vid): in the tagger data of each instance, the
+ * user ports in each VLAN and those leaving it untagged, the PVID of each
+ * port and how many VLANs it leaves untagged. cfg_lock held.
+ */
+static void bcm53344_aware_publish(struct bcm53344 *sw)
+{
+	u16 nut[BCM53344_AW_PORTS];
+	unsigned int k, vid;
+	int p;
+
+	for (k = 0; k < ARRAY_SIZE(sw->dsa); k++) {
+		struct bcm53344_dsa *d = sw->dsa[k];
+		struct bcm53344_tagger_data *td;
+		const struct bcm53344_dsa_layout *l;
+		u16 ports = 0;
+
+		if (!d)
+			continue;
+		td = bcm53344_tagger_data(&d->ds);
+		if (!td)
+			continue;
+		l = d->lay;
+		for (p = 0; p < l->n && p < BCM53344_AW_PORTS; p++)
+			if (dsa_is_user_port(&d->ds, p) &&
+			    (sw->aware_ports & BIT(l->hw[p])))
+				ports |= BIT(p);
+		memset(nut, 0, sizeof(nut));
+		WRITE_ONCE(td->aw_seq, td->aw_seq + 1);
+		smp_wmb();
+		WRITE_ONCE(td->aw_ports, ports);
+		for (vid = 1; vid < 3072; vid++) {
+			const struct bcm53344_vlan *v = &sw->vlan[vid];
+			u16 mem = 0, ut = 0;
+
+			for (p = 0; ports && p < l->n && p < BCM53344_AW_PORTS; p++) {
+				if (!(ports & BIT(p)))
+					continue;
+				if (v->members & BIT(l->hw[p]))
+					mem |= BIT(p);
+				if (v->members & v->untagged & BIT(l->hw[p])) {
+					ut |= BIT(p);
+					nut[p]++;
+				}
+			}
+			WRITE_ONCE(td->aw_mem[vid], mem);
+			WRITE_ONCE(td->aw_ut[vid], ut);
+		}
+		for (p = 0; p < BCM53344_AW_PORTS; p++) {
+			WRITE_ONCE(td->aw_pvid[p], ports & BIT(p) ? d->upvid[p] : 0);
+			WRITE_ONCE(td->aw_nut[p], nut[p]);
+		}
+		smp_wmb();
+		WRITE_ONCE(td->aw_seq, td->aw_seq + 1);
+	}
+	atomic_inc(&bcm53344_aware_gen);
+}
+
 static int bcm53344_dsa_port_vlan_add(struct dsa_switch *ds, int port,
 				      const struct switchdev_obj_port_vlan *vlan,
 				      struct netlink_ext_ack *extack)
@@ -2858,6 +2917,7 @@ static int bcm53344_dsa_port_vlan_add(struct dsa_switch *ds, int port,
 			ret = bcm53344_port_tab_set(sw, hw, 24, 12,
 						    d->upvid[port] ?: VID_DEAD);
 	}
+	bcm53344_aware_publish(sw);
 	mutex_unlock(&sw->cfg_lock);
 	return ret;
 }
@@ -2884,6 +2944,7 @@ static int bcm53344_dsa_port_vlan_del(struct dsa_switch *ds, int port,
 	v->want_ut &= ~BIT(hw);
 	if (!ret)
 		ret = bcm53344_user_vlan_sync(sw, vid);
+	bcm53344_aware_publish(sw);
 	mutex_unlock(&sw->cfg_lock);
 	return ret;
 }
@@ -3273,6 +3334,7 @@ static int bcm53344_dsa_aware_set(struct bcm53344_dsa *d, int port, bool on)
 	for (i = 1; i < 3072 && !ret; i++)
 		if (sw->vlan[i].want & (BIT(hw) | BIT(cpu)))
 			ret = bcm53344_user_vlan_sync(sw, i);
+	bcm53344_aware_publish(sw);
 	mutex_unlock(&sw->cfg_lock);
 	return ret;
 }
