@@ -544,6 +544,9 @@ struct fnp6l {
 	struct list_head ft_dead;
 	unsigned int ft_ndead;
 	unsigned long ft_delfail, ft_dfree, ft_lagfail;
+	u32 ft_aw_gen;			/* VLAN-aware bridge seen (fnp6l_ft_aw_check) */
+	unsigned long ft_aw_quiet;	/* jiffies: until then aware flows are refused */
+	unsigned long ft_aw_purged;
 	struct delayed_work ft_dead_work;
 	/* DESTROY and STATS of a cookie we do not track (ft_sess_lock) */
 	unsigned long ft_unk_destroy, ft_unk_stats;
@@ -3001,8 +3004,9 @@ static int fnp6l_dbg_sse_show(struct seq_file *m, void *unused)
 		   np->sse_wait_max_us, np->sse_sleeps, np->sse_full,
 		   np->sse_tmo, READ_ONCE(sse_spin_us), np->sse_stall_max_ms,
 		   np->sse_qskip, np->cmdq.size);
-	seq_printf(m, "ft dead %u delfail %lu dfree %lu lagfail %lu\n",
-		   np->ft_ndead, np->ft_delfail, np->ft_dfree, np->ft_lagfail);
+	seq_printf(m, "ft dead %u delfail %lu dfree %lu lagfail %lu aware_purged %lu\n",
+		   np->ft_ndead, np->ft_delfail, np->ft_dfree, np->ft_lagfail,
+		   np->ft_aw_purged);
 	/* messages by header byte 0 (3:0); the last one no query matched */
 	seq_printf(m, "ft msg nomatch %lu", np->ft_qnomatch);
 	for (t = 0; t < NP6L_FT_MSGTYPES; t++)
@@ -3367,6 +3371,10 @@ struct fnp6l_ft_flow {
 	 * followed (fnp6l_ipsec_ft_in).
 	 */
 	const struct xfrm_state *xin;
+	/* an end in the VLAN-aware bridge: changes of the bridge after
+	 * aw_gen take the flow off (fnp6l_ft_aw_check) */
+	bool aw;
+	u32 aw_gen;
 	/* output to a bond, member pinned: re-picked on member changes */
 	struct net_device *obond;
 	bool qbond;		/* obond of tagged switch ports: out_vid follows */
@@ -4569,6 +4577,58 @@ static void fnp6l_ft_hot(struct fnp6l *np, struct fnp6l_ft_flow *flow,
 }
 
 /* the fast flows: a query each ft_cnt_ms, off the list once slow */
+static u32 fnp6l_ft_aw_gen(void);
+
+#define NP6L_FT_AW_QUIET		(5 * HZ)
+
+/*
+ * Tear the flow of the flow table down whose direction @cookie is (the
+ * cookie is its tuple): the next packet sets a new flow up, its path taken
+ * from the configuration as it is then. Only while the flow is known to be
+ * there: in its REPLACE, or tracked (its DESTROY waits for the flow-engine
+ * lock).
+ */
+static void fnp6l_ft_kernel_teardown(unsigned long cookie)
+{
+	struct flow_offload_tuple *t = (struct flow_offload_tuple *)cookie;
+	struct flow_offload_tuple_rhash *th;
+
+	th = container_of(t, struct flow_offload_tuple_rhash, tuple);
+	flow_offload_teardown(container_of(th - t->dir, struct flow_offload,
+					   tuplehash[0]));
+}
+
+/*
+ * Flows with an end in the VLAN-aware bridge set up before its last change
+ * (a VLAN, a PVID, a port in or out): their VID may no longer be the one of
+ * the end, and the flow table would offer them again with the path it took
+ * before the change (it does not follow bridge VLANs). Their sessions go,
+ * and their flows in the flow table, set up again by the next packet with
+ * the path as it is now. For a while after a change, aware flows are
+ * refused and torn down too (fnp6l_ft_parse): their path may predate it.
+ * Flow-engine lock.
+ */
+static void fnp6l_ft_aw_check(struct fnp6l *np)
+{
+	struct fnp6l_ft_flow *flow, *tmp;
+	unsigned int n = 0;
+	u32 gen = fnp6l_ft_aw_gen();
+
+	if (gen == np->ft_aw_gen)
+		return;
+	WRITE_ONCE(np->ft_aw_quiet, jiffies + NP6L_FT_AW_QUIET);
+	list_for_each_entry_safe(flow, tmp, &np->ft_flows, node) {
+		if (!flow->aw || flow->aw_gen == gen)
+			continue;
+		fnp6l_ft_kernel_teardown(flow->cookie);
+		fnp6l_ft_unlink(np, flow);
+		fnp6l_ft_drop(np, flow);
+		n++;
+	}
+	WRITE_ONCE(np->ft_aw_gen, gen);
+	np->ft_aw_purged += n;
+}
+
 static void fnp6l_ft_cnt_work(struct work_struct *work)
 {
 	struct fnp6l *np = container_of(to_delayed_work(work), struct fnp6l,
@@ -4577,6 +4637,10 @@ static void fnp6l_ft_cnt_work(struct work_struct *work)
 	struct fnp6l_ft_flow *flow, *tmp;
 	unsigned int i;
 
+	mutex_lock(&fnp6l_sse_lock);
+	if (READ_ONCE(np->ft_on) && np->sse_done)
+		fnp6l_ft_aw_check(np);
+	mutex_unlock(&fnp6l_sse_lock);
 	if (!ms)
 		goto out;
 	mutex_lock(&fnp6l_sse_lock);
@@ -5342,8 +5406,38 @@ static u16 fnp6l_ft_q_xlt(struct net_device *dev, u16 vid)
 		return 0;
 	return bcm53344_xlt_ivid(dp->ds, dp->index, vid);
 }
+
+/*
+ * VID a flow end on port @dev of the VLAN-aware bridge has on the conduit:
+ * @vid of a tagged end, the PVID of an untagged one (@vid 0), as the switch
+ * applies them; 0 when it cannot be told (bcm53344_aware_vid).
+ */
+static u16 fnp6l_ft_aw_vid(struct net_device *dev, u16 vid)
+{
+	struct dsa_port *dp = fnp6l_dsa_port(dev);
+
+	if (IS_ERR_OR_NULL(dp))
+		return 0;
+	return bcm53344_aware_vid(dp->ds, dp->index, vid);
+}
+
+/* changes of the VLAN-aware bridge so far: a flow set up before goes */
+static u32 fnp6l_ft_aw_gen(void)
+{
+	return atomic_read(&bcm53344_aware_gen);
+}
 #else
 static u16 fnp6l_ft_q_xlt(struct net_device *dev, u16 vid)
+{
+	return 0;
+}
+
+static u16 fnp6l_ft_aw_vid(struct net_device *dev, u16 vid)
+{
+	return 0;
+}
+
+static u32 fnp6l_ft_aw_gen(void)
 {
 	return 0;
 }
@@ -5420,6 +5514,43 @@ static unsigned int fnp6l_ft_q_end(struct fnp6l *np, struct net_device *dev,
 			*vid = dsa_tag_8021q_bridge_vid(dsa_port_bridge_num_get(dp));
 			lif = c->lif;
 		}
+	}
+	rcu_read_unlock();
+	return lif;
+}
+
+/*
+ * The conduit's LIF for a user port in the VLAN-aware bridge, offloaded to
+ * the switch with every port of the bridge a user port of the same tree
+ * (bridge_offload): its frames reach the conduit with the VID of their
+ * VLAN (fnp6l_ft_aw_vid). 0 for any other device. RCU taken for the master.
+ */
+static unsigned int fnp6l_ft_aw_end(struct fnp6l *np, struct net_device *dev)
+{
+	struct net_device *master;
+	struct fnp6l_port *c;
+	struct dsa_port *dp;
+	unsigned int lif = 0;
+
+	if (!dev || !IS_REACHABLE(CONFIG_BRIDGE) || !READ_ONCE(bridge_offload))
+		return 0;
+	dp = fnp6l_dsa_port(dev);
+	if (IS_ERR_OR_NULL(dp) || !dp->cpu_dp)
+		return 0;
+	c = fnp6l_ft_port(np, dp->cpu_dp->conduit);
+	if (!fnp6l_conduit_q(c))
+		return 0;
+	rcu_read_lock();
+	master = netdev_master_upper_dev_get_rcu(dev);
+	if (master && netif_is_bridge_master(master) && br_vlan_enabled(master) &&
+	    dsa_port_offloads_bridge_dev(dp, master)) {
+		struct fnp6l_ft_br b = { .np = np, .br = master,
+					 .dst = dp->ds->dst };
+		struct netdev_nested_priv priv = { .data = &b };
+
+		if (!netdev_walk_all_lower_dev_rcu(master, fnp6l_ft_q_br_lower,
+						   &priv))
+			lif = c->lif;
 	}
 	rcu_read_unlock();
 	return lif;
@@ -5537,6 +5668,11 @@ static bool fnp6l_conduit_q(const struct fnp6l_port *c)
 
 static unsigned int fnp6l_ft_q_end(struct fnp6l *np, struct net_device *dev,
 				   u16 *vid)
+{
+	return 0;
+}
+
+static unsigned int fnp6l_ft_aw_end(struct fnp6l *np, struct net_device *dev)
 {
 	return 0;
 }
@@ -5741,6 +5877,7 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	unsigned int nout = 0, i, j, nq;
 	struct net_device *odev = NULL;
 	bool redirect = false, pop = false, qbond_in = false, qbond_out = false;
+	bool aw_in = false, aw_out = false;
 	__be32 osip, odip;
 	u16 push = 0, qvid_in = 0, qvid_out = 0;
 	u16 qvids[NP6L_SW_PORTS], ovids[NP6L_SW_PORTS];
@@ -5753,6 +5890,8 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	 * fnp6l_trunk_sync).
 	 */
 	fl->tgen = READ_ONCE(np->tr.gen);
+	/* read before the VLAN-aware bridge: a later change takes the flow off */
+	fl->aw_gen = fnp6l_ft_aw_gen();
 	smp_rmb();
 	fl->n_in_lif = fnp6l_ft_end(np, idev, fl->in_lif, true);
 	if (!fl->n_in_lif && np->ic_on) {
@@ -5765,6 +5904,12 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 		fl->n_in_lif = nq;
 		qvid_in = qvids[0];
 		qbond_in = true;
+	}
+	/* a port of the VLAN-aware bridge: its VID once the VLAN match is read */
+	if (!fl->n_in_lif && np->ic_on) {
+		fl->in_lif[0] = fnp6l_ft_aw_end(np, idev);
+		fl->n_in_lif = fl->in_lif[0] ? 1 : 0;
+		aw_in = fl->n_in_lif;
 	}
 	if (!fl->n_in_lif)
 		return fnp6l_ft_refuse_dev(idev, extack, "ingress is not an NP end");
@@ -5893,6 +6038,12 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 					nout = 1;
 					qbond_out = true;
 				}
+				/* a port of the VLAN-aware bridge: VID below */
+				if (!nout) {
+					olif[0] = fnp6l_ft_aw_end(np, act->dev);
+					nout = olif[0] ? 1 : 0;
+					aw_out = nout;
+				}
 				break;
 			}
 			/* unclassified, the ingress is the loader's LIF */
@@ -5983,6 +6134,52 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 						   "unsupported VLAN match");
 		fl->vid = vlan.key->vlan_id;
 	}
+	/*
+	 * Ends in the VLAN-aware bridge: the frames of its VLANs reach the
+	 * conduit with their own VID and leave it with it, the switch looking
+	 * the destination up in that VLAN. The VID is the VLAN of the tagged
+	 * end (pop or push), or the PVID of an untagged one when it is the
+	 * only VLAN the port leaves untagged: otherwise the VLAN of the end is
+	 * not known for sure, and a session could take or send frames of
+	 * another VLAN. Refused then.
+	 */
+	if ((aw_in || aw_out) &&
+	    (fl->aw_gen != READ_ONCE(np->ft_aw_gen) ||
+	     time_before(jiffies, READ_ONCE(np->ft_aw_quiet)))) {
+		/* the path of the flow may predate a change of the bridge */
+		fnp6l_ft_kernel_teardown(cls->cookie);
+		return fnp6l_ft_refuse_dev(idev, extack,
+					   "VLAN-aware bridge changed");
+	}
+	if (aw_in) {
+		u16 v = fnp6l_ft_aw_vid(idev, pop ? fl->vid : 0);
+
+		if (!v) {
+			/* a later offer could find a VID: not the flow's own */
+			fnp6l_ft_kernel_teardown(cls->cookie);
+			return fnp6l_ft_refuse_dev(idev, extack,
+						   "VLAN of the VLAN-aware bridge not known");
+		}
+		fl->vid = v;
+	}
+	if (aw_out) {
+		struct fnp6l_port *oc = fnp6l_ft_port(np, odev);
+		struct dsa_port *odp = fnp6l_dsa_port(odev);
+		u16 v = fnp6l_ft_aw_vid(odev, push);
+
+		if (!v) {
+			fnp6l_ft_kernel_teardown(cls->cookie);
+			return fnp6l_ft_refuse_dev(idev, extack,
+						   "VLAN of the VLAN-aware bridge not known");
+		}
+		if (!oc && !IS_ERR_OR_NULL(odp) && odp->cpu_dp)
+			oc = fnp6l_ft_port(np, odp->cpu_dp->conduit);
+		if (!oc || !ether_addr_equal(eth + ETH_ALEN, oc->ndev->dev_addr))
+			return fnp6l_ft_refuse_dev(idev, extack,
+						   "source MAC is not the conduit's");
+		push = v;
+	}
+	fl->aw = aw_in || aw_out;
 	/*
 	 * Ends on a VLAN-tagged switch port: its VID on the conduit, matched
 	 * on ingress, pushed on output (never stacked on another VLAN). The
