@@ -132,7 +132,7 @@ Routing/NAT Offloading → Hardware flow offloading* (`flow_offloading_hw` in `/
 | L2 bridge / FDB offload in the NP | — | — | — | bridging is done by the switch chip |
 | QoS / shaping offload | ❌ | — | ❌ | NP4Lite: no traffic shaping in the hardware |
 | **Inline IPsec (ESP) in the NP** | | | | |
-| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | ✅ outbound | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on both. NP6Lite: **outbound only**: outbound packets are encrypted by the NP (about 727 Mbit/s), **inbound packets are decrypted in software** (inbound offload not written yet); package `kmod-fortinet-np6lite-ipsec`, in the 60E and 100E profiles; validated on the published 60E image and on a 100E |
+| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | ✅ outbound | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on both. NP6Lite: outbound packets are encrypted by the NP (about 727 Mbit/s); **inbound packets are decrypted in software by default**, by the NP on request (`ipsec_outbound_only=0`, validated on a 100E, without anti-replay); package `kmod-fortinet-np6lite-ipsec`, in the 60E and 100E profiles; outbound validated on the published 60E image and on a 100E |
 | ESP ciphers | — | AES-CBC 128/192/256, 3DES-CBC | AES-CBC, 3DES-CBC (outbound) | as implemented in the drivers; measured with AES-128-CBC |
 | ESP integrity | — | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 (outbound) | as implemented in the drivers; measured with HMAC-SHA1-96 (NP4Lite) and HMAC-SHA256-128 (NP6Lite) |
 | ESN, NAT-T, transport mode | — | ❌ | ❌ | handled in software |
@@ -918,7 +918,7 @@ without DCO.
 | Bond of `wan1` + `wan2` offloaded (NP trunk) | 🧪 Partial: in the image; validated on our reference kernel builds (802.3ad, 939 Mbit/s each way, each member alone, CPU about 0 %), **not tested under OpenWrt yet**; the balancing over the two ports needs more work |
 | `wan1`, `wan2` at 100 and 1000 Mbit/s (SGMII) | ✅ Validated: 94.1–94.2 Mbit/s at 100 Mbit/s and 941 Mbit/s at 1000 Mbit/s on both ports; 10 Mbit/s not tested |
 | UDP offload (default) | ⚠️ Partial: validated on test kernels booted from RAM; rare freezes of offloaded UDP flows seen on the lab unit, cause not found (see [Known limitations](#known-limitations)) |
-| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated, **outbound only** (about 727 Mbit/s, `kmod-fortinet-np6lite-ipsec`); inbound traffic is decrypted in software (inbound offload not written yet) |
+| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated, **outbound** (about 727 Mbit/s, `kmod-fortinet-np6lite-ipsec`); inbound traffic is decrypted in software by default; inbound decryption in the NP (`ipsec_outbound_only=0`) validated on a 100E only |
 | IPsec in software (IPv4 and IPv6, tunnel and transport) | ✅ Validated (previous image) |
 | WireGuard, OpenVPN (with DCO) | ✅ Validated (packages included in the 60E profile) |
 | Persistent storage (overlay) | ✅ Validated: survives reboots and power cuts |
@@ -1385,7 +1385,7 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 | `/dev/hwrng` feeding the kernel pool | ✅ the `hwrng` kernel thread feeds the pool from `fsoc3-trng` (quality 128, `entropy_avail` 256); no `rngd` needed |
 | AF_ALG (`kmod-crypto-user`, `libopenssl-afalg`, not in the profile) | ✅ works through `fsoc3-cp`, and OpenWrt enables the OpenSSL engine for every OpenSSL user; AES-CBC only, faster than software from about 8 KiB per call (16 KiB: 88 MB/s against 36 MB/s), 45 times slower at 16-byte calls, so it is left out of the profile |
 | Crypto engines (`fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng`) | ✅ Validated against the software implementations, also under load |
-| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated, **outbound only** as on the 60E (`kmod-fortinet-np6lite-ipsec`), together with `fsoc3-cp`: inbound ESP is decrypted in software on `fsoc3-cp`; the `fsoc3-cp` tests pass while the NP encrypts. The driver's experimental inbound path (`ipsec_outbound_only=0`) brings nothing yet: the NP hands inbound ESP to the host undecrypted (the session entry of the SPI does not take effect) and software decrypts it as before; keep the default. Inbound and forward policies must be installed **without** `offload packet` (the driver refuses them with it): for a policy in packet offload the kernel skips its own check of clear frames, and the NP6Lite does not check them |
+| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated: **outbound** as on the 60E (`kmod-fortinet-np6lite-ipsec`), together with `fsoc3-cp` (inbound ESP decrypted in software on `fsoc3-cp` by default; the `fsoc3-cp` tests pass while the NP encrypts). **Inbound** in the NP on request (`echo 0 > /sys/module/fortinet_np6lite/parameters/ipsec_outbound_only` before the inbound SA is added with `offload packet`): the NP checks the ICV, decrypts and hands the frame to the kernel, which checks it against its policies as after a decryption in software; 2.2 times the software rate in our test (253 against 115 Mbit/s TCP, limited by the software peer on the same appliance). Not with anti-replay (SAs with a replay window are refused, set `replay-window 0`); byte and packet counters of offloaded SAs are not reported. Validated: clear text, a wrong ICV, an inner address outside the policy, an unknown SPI, deleting and adding an SA, two SAs at a time. Inbound and forward policies are installed **without** `offload packet` (the driver refuses them with it): for a policy in packet offload the kernel skips its own check of clear frames |
 | Hardware monitor, fan profiles (`fan-profile`: `silent`, `performance`) | ✅ Validated (`silent`: both fans on the same curve, minimum speed below 40 °C) |
 | USB host port | 🧪 USB 2 storage only |
 | Watchdog | ✅ Validated |
@@ -1491,9 +1491,11 @@ boot flash, and the next power cycle brings the stock firmware back.
   `echo 0 > /sys/module/fortinet_np6lite/parameters/ft_udp`.
 - **NAT66**: only flows with **one** translated address (source or destination) are offloaded; a flow with both
   SNAT and DNAT is forwarded in software. Set `ft_nat66` to 0 to keep all NAT66 on the CPU.
-- **IPsec offload is outbound only**: inbound ESP is decrypted in software (one CPU core). Only the outbound SA
-  and the outbound policy take `offload packet`; the inbound SA and the inbound and forward policies are installed
-  without it (the driver refuses them otherwise, the kernel then checks every inbound frame). The outbound offload
+- **IPsec offload is outbound by default**: inbound ESP is decrypted in software (one CPU core) unless
+  `ipsec_outbound_only` is set to 0 (inbound decryption in the NP, validated on a 100E only, without anti-replay).
+  The outbound SA and the outbound policy take `offload packet`, an inbound SA only with that parameter; the inbound
+  and forward policies are always installed without it (the driver refuses them otherwise, the kernel then checks
+  every inbound frame). The outbound offload
   (about 727 Mbit/s) is below the NP4Lite of the 60D and the 90D; only IPv4 tunnel mode with the AES-CBC / 3DES-CBC
   and HMAC ciphers listed above is offloaded, the rest runs in software.
 - **Bond of `wan1` + `wan2`** (NP trunk): validated on our reference kernel builds, not tested under OpenWrt yet;
@@ -1505,8 +1507,8 @@ boot flash, and the next power cycle brings the stock firmware back.
 - **Watchdog**: the driver is in the image but the watchdog is disabled in the device tree: a frozen appliance
   does not restart by itself.
 - **WAN ports**: 100 and 1000 Mbit/s validated; 10 Mbit/s not tested.
-- **Not supported yet**: the crypto engine (software crypto only), GRE offload (not supported by the NP6Lite),
-  inbound IPsec offload.
+- **Not supported yet**: the crypto engine (software crypto only), GRE offload (not supported by the NP6Lite).
+  Inbound IPsec offload (`ipsec_outbound_only=0`) is validated on the 100E only.
 - The behaviour under saturation of the link between the NP6Lite and the switch, described above for the 60D
   and the 90D, has not been measured on the 60E yet.
 - **Boot time**: about 33 s from power-on to the web interface.
