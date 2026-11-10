@@ -144,6 +144,7 @@ struct fnp6l_sa_desc {
 } __packed;
 
 static_assert(sizeof(struct fnp6l_sa_desc) == NP6L_SA_OB_STRIDE);
+static_assert(NP6L_SA_IB_STRIDE >= sizeof(struct fnp6l_sa_desc));
 static_assert(offsetof(struct fnp6l_sa_desc, hmac) == 48);
 static_assert(offsetof(struct fnp6l_sa_desc, saddr) == 88);
 static_assert(offsetof(struct fnp6l_sa_desc, action) == 100);
@@ -844,7 +845,8 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 		return ret;
 
 	sa = kzalloc(sizeof(*sa), GFP_KERNEL);
-	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+	/* an inbound entry is longer than the descriptor: the rest zeroed too */
+	desc = kzalloc(NP6L_SA_IB_STRIDE, GFP_KERNEL);
 	if (!sa || !desc) {
 		ret = -ENOMEM;
 		goto out;
