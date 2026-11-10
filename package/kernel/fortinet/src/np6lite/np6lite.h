@@ -81,7 +81,7 @@ bool fnp6l_ipsec_rx_skb(struct fnp6l_ipsec *ips, struct sk_buff *skb,
 void fnp6l_ipsec_rx_put(struct xfrm_state *x);
 unsigned int fnp6l_ipsec_nr_stats(const struct fnp6l_ipsec *ips);
 void fnp6l_ipsec_get_strings(const struct fnp6l_ipsec *ips, u8 **data);
-unsigned int fnp6l_ipsec_get_stats(const struct fnp6l_ipsec *ips, u64 *data);
+unsigned int fnp6l_ipsec_get_stats(struct fnp6l_ipsec *ips, u64 *data);
 /*
  * TX: 0 to send the frame as it is, or an SA index (> 0) for the network
  * processor to encrypt and encapsulate it (the host descriptor is then
@@ -147,7 +147,7 @@ static inline void fnp6l_ipsec_get_strings(const struct fnp6l_ipsec *ips,
 {
 }
 
-static inline unsigned int fnp6l_ipsec_get_stats(const struct fnp6l_ipsec *ips,
+static inline unsigned int fnp6l_ipsec_get_stats(struct fnp6l_ipsec *ips,
 						 u64 *data)
 {
 	return 0;

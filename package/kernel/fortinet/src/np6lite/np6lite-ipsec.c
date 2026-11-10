@@ -23,9 +23,10 @@
  * completion decode) replaced.
  *
  * Outbound SAs are offloaded by default; inbound SAs only with
- * ipsec_outbound_only cleared, and only without anti-replay. A decrypted
- * frame goes up with a sec_path xfrm checks against its policies, as after
- * a decryption in software.
+ * ipsec_outbound_only cleared. A decrypted frame goes up with a sec_path
+ * xfrm checks against its policies, as after a decryption in software. The
+ * engine checks the sequence numbers of an inbound SA with a replay window
+ * (fnp6l_sa_replay_window).
  *
  * Register layout and values established by observation, for
  * interoperability; what is still to confirm on hardware is marked FIXME
@@ -121,7 +122,7 @@ MODULE_PARM_DESC(ipsec_sa_diag,
  * SA descriptor: the first 128 bytes, the same layout as the NP4Lite
  * (identical for the first 128 bytes), the only ones an
  * outbound entry needs; an inbound entry is 192 bytes, the last 64 the
- * anti-replay window (left zero in v1, ipsec_replay off). Multi-byte fields
+ * anti-replay window state of the engine (written zero). Multi-byte fields
  * as the engine reads them. The key bytes are never logged.
  */
 struct fnp6l_sa_desc {
@@ -161,11 +162,25 @@ static_assert(offsetof(struct fnp6l_sa_desc, hmac2) == 104);
 #define NP6L_SA_AUTH		GENMASK(7, 3)
 /*
  * Byte 1: valid (bit 7); the reports of the byte lifetime and of the
- * sequence numbers (bits 5..3), bit 1 set. Anti-replay (bit 6) and ESN
- * (bit 2) stay clear. FIXME (ipsec_cmd_probe): the exact meaning of bits
- * 5..3/1 is to be confirmed on hardware, one parameter at a time.
+ * sequence numbers (bits 5..3), bit 1 set; anti-replay (bit 6) on an
+ * inbound SA with a replay window. ESN (bit 2) stays clear.
+ * FIXME (ipsec_cmd_probe): the exact meaning of bits 5..3/1 is to be
+ * confirmed on hardware, one parameter at a time.
  */
 #define NP6L_SA_F_VALID		BIT(7)
+#define NP6L_SA_F_REPLAY	BIT(6)
+/*
+ * The anti-replay window of the engine (measured): 448 sequence numbers in
+ * seven blocks of 64, aligned; it accepts a number down to the start of the
+ * block six blocks below the one of the highest number received, so at
+ * least 385 numbers below the highest one. A duplicate in the window and
+ * a number below it are dropped (rx_ipsec_err_replay). The window is not
+ * configurable: an SA asking for a smaller one is offloaded with this one
+ * (receivers choose their window, RFC 4303 3.4.3), a larger one is left to
+ * software. Unlike xfrm the engine takes a first sequence number 0, which
+ * no conforming sender uses; a repeated one is dropped.
+ */
+#define NP6L_SA_REPLAY_WIN	385
 #define NP6L_SA_F_DEFAULT	(BIT(5) | BIT(4) | BIT(3) | BIT(1))
 #define NP6L_SA_VOL_MAX		GENMASK_ULL(46, 0)
 #define NP6L_SA_TTL		64
@@ -203,6 +218,11 @@ static_assert(offsetof(struct fnp6l_sa_desc, hmac2) == 104);
 /* control word 1 of the IPsec block: engine enables, set once at init (0x102) */
 #define NP6L_IPSEC_CTRL1	0x6A40
 #define NP6L_IPSEC_CTRL1_INIT	0x00000102
+/* frames the inbound engine dropped, by cause */
+#define NP6L_IPSEC_IB_SAERR	0x6aa0
+#define NP6L_IPSEC_IB_LENERR	0x6ab0
+#define NP6L_IPSEC_IB_RPLERR	0x6ab8
+#define NP6L_IPSEC_IB_HMACERR	0x6ac0
 #define NP6L_TUN_CMD_US		2000	/* a command clears in a few us */
 #define NP6L_TUN_QWA_US		2000
 
@@ -302,6 +322,7 @@ struct fnp6l_ipsec {
 	u32 seq;
 	/* RX path */
 	atomic_long_t rx_dec, rx_nosa, rx_anomaly, rx_sel;
+	atomic64_t rx_icv_err;		/* sum of a clear-on-read counter */
 	/* TX path: outbound policies and SAs per LIF */
 	spinlock_t tx_lock;
 	struct list_head tx_pols[NP6L_MAX_LIF];
@@ -616,6 +637,12 @@ out:
 	memzero_explicit(kb, sizeof(kb));
 }
 
+/* the replay window xfrm keeps for the SA: legacy, or bitmap without ESN */
+static unsigned int fnp6l_sa_replay_window(const struct xfrm_state *x)
+{
+	return x->replay_esn ? x->replay_esn->replay_window : x->props.replay_window;
+}
+
 static void fnp6l_sa_desc_fill(struct fnp6l_sa_desc *desc,
 			       const struct xfrm_state *x, u8 algs, bool in)
 {
@@ -624,6 +651,8 @@ static void fnp6l_sa_desc_fill(struct fnp6l_sa_desc *desc,
 
 	desc->algs = algs;
 	desc->flags = NP6L_SA_F_VALID | NP6L_SA_F_DEFAULT;
+	if (in && fnp6l_sa_replay_window(x))
+		desc->flags |= NP6L_SA_F_REPLAY;
 	desc->vol_lo = cpu_to_le16(lower_16_bits(NP6L_SA_VOL_MAX));
 	desc->vol_hi = cpu_to_le32(NP6L_SA_VOL_MAX >> 16);
 	desc->spi = x->id.spi;
@@ -639,10 +668,11 @@ static void fnp6l_sa_desc_fill(struct fnp6l_sa_desc *desc,
 }
 
 /*
- * What the engine offloads, as the NP4Lite: IPv4 ESP tunnels, without ESN,
- * NAT-T nor anti-replay, AES-CBC or 3DES-CBC with HMAC-MD5-96, HMAC-SHA1-96
- * or HMAC-SHA256-128 (GCM and SHA-384/512 only on the lookaside engine, not
- * here). The local end of the tunnel must be an address of the port.
+ * What the engine offloads, as the NP4Lite: IPv4 ESP tunnels, without ESN
+ * nor NAT-T, an inbound replay window up to NP6L_SA_REPLAY_WIN, AES-CBC or
+ * 3DES-CBC with HMAC-MD5-96, HMAC-SHA1-96 or HMAC-SHA256-128 (GCM and
+ * SHA-384/512 only on the lookaside engine, not here). The local end of the
+ * tunnel must be an address of the port.
  */
 static int fnp6l_sa_check(struct net_device *ndev, struct xfrm_state *x,
 			  struct netlink_ext_ack *extack, u8 *algs)
@@ -677,9 +707,9 @@ static int fnp6l_sa_check(struct net_device *ndev, struct xfrm_state *x,
 		NL_SET_ERR_MSG_MOD(extack, "encapsulation (NAT-T) is not supported");
 		return -EINVAL;
 	}
-	if (in && (x->props.replay_window ||
-		   (x->replay_esn && x->replay_esn->replay_window))) {
-		NL_SET_ERR_MSG_MOD(extack, "anti-replay is not supported, set replay-window 0");
+	if (in && fnp6l_sa_replay_window(x) > NP6L_SA_REPLAY_WIN) {
+		NL_SET_ERR_MSG_FMT_MOD(extack, "replay window above %u is not supported",
+				       NP6L_SA_REPLAY_WIN);
 		return -EINVAL;
 	}
 	if (x->aead || x->calg || !x->ealg || !x->aalg) {
@@ -1184,6 +1214,10 @@ static const char fnp6l_ipsec_stats[][ETH_GSTRING_LEN] = {
 	"flow_purged_ipsec",
 	"ipsec_stalled",
 	"rx_ipsec_sel",
+	"rx_ipsec_err_sa",
+	"rx_ipsec_err_len",
+	"rx_ipsec_err_replay",
+	"rx_ipsec_err_icv",
 };
 
 unsigned int fnp6l_ipsec_nr_stats(const struct fnp6l_ipsec *ips)
@@ -1199,7 +1233,7 @@ void fnp6l_ipsec_get_strings(const struct fnp6l_ipsec *ips, u8 **data)
 		ethtool_puts(data, fnp6l_ipsec_stats[i]);
 }
 
-unsigned int fnp6l_ipsec_get_stats(const struct fnp6l_ipsec *ips, u64 *data)
+unsigned int fnp6l_ipsec_get_stats(struct fnp6l_ipsec *ips, u64 *data)
 {
 	if (!ips)
 		return 0;
@@ -1223,6 +1257,16 @@ unsigned int fnp6l_ipsec_get_stats(const struct fnp6l_ipsec *ips, u64 *data)
 	data[17] = atomic_long_read(&ips->ft_purged);
 	data[18] = READ_ONCE(ips->stalled);
 	data[19] = atomic_long_read(&ips->rx_sel);
+	/*
+	 * Drop counters of the inbound engine: the replay one keeps its value
+	 * and stops at 65535, the ICV one clears on read (summed here); SA and
+	 * length errors not seen counting yet, read as they are.
+	 */
+	data[20] = readl(ips->base + NP6L_IPSEC_IB_SAERR);
+	data[21] = readl(ips->base + NP6L_IPSEC_IB_LENERR);
+	data[22] = readl(ips->base + NP6L_IPSEC_IB_RPLERR);
+	data[23] = atomic64_add_return(readl(ips->base + NP6L_IPSEC_IB_HMACERR),
+				       &ips->rx_icv_err);
 	return ARRAY_SIZE(fnp6l_ipsec_stats);
 }
 
@@ -1654,7 +1698,11 @@ bool fnp6l_ipsec_msg(struct fnp6l_ipsec *ips, const void *buf, unsigned int len)
 		}
 		break;
 	case NP6L_MSG_SA_REPLAY_WIN:
-		if (sa->in)
+		if (!sa->in)
+			break;
+		if (x->replay_esn)
+			x->replay_esn->seq = le32_to_cpu(msg->hi);
+		else
 			x->replay.seq = le32_to_cpu(msg->hi);
 		break;
 	case NP6L_MSG_SA_SEQ_EXHAUSTED:
