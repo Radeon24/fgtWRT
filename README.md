@@ -1338,6 +1338,9 @@ but not the installer, and:
 
 The switch driver, the tagger, the PCIe root port and the BCM54220 PHY support are built into the kernel.
 
+Tested on the 100E but left out of the profile: `snmpd` and `snmp-utils` (SNMP agent, see the features), `kmod-crypto-user`
+with `libopenssl-afalg` (AF_ALG, see the features).
+
 ### Benchmarks
 
 One unit, booted from RAM, fan profile `performance`, method of [Benchmark methodology](#benchmark-methodology)
@@ -1352,7 +1355,11 @@ One unit, booted from RAM, fan profile `performance`, method of [Benchmark metho
 
 64000 concurrent connections were all offloaded (driver limit 65536). Offloaded TCP leaves the CPU about idle.
 Latency to the device: 1.4 ms idle, 6.1 ms with offloaded TCP at line rate. Single CPS runs dipped to
-3000–3600/s, cause not known. The packet rate limit of the NP was not measured (it needs an external generator).
+3000–3600/s, cause not known. Packet rate: a host generator on `port1` (raw socket, 521 000 64-byte frames/s at
+most) routed and NATed to `wan1`, counted at the switch ports: 1 000 000 frames of 64 bytes forwarded without a
+loss in the switch or the NP, so the NP takes at least 521 kpps; its own limit is above what the generator reaches.
+At line rate with 256 to 1024-byte frames the switch drops 0.05–0.2 % on the uplink to the NP (the tag_8021q tag
+adds 4 bytes to every frame there), the NP none.
 
 ESP and WireGuard were measured with both tunnel ends on the device, so the figures are ratios, not gateway
 throughput: ESP transport mode AES-GCM 92 Mbit/s and CBC + HMAC-SHA256 95 Mbit/s on `fsoc3-cp`, against
@@ -1372,9 +1379,13 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 | NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated |
 | 802.1Q devices on DSA ports, NP6Lite flow offload of their flows | ✅ Validated: `port13.20` routed to `ha1`, offloaded both ways; external ends through `port1.10`: 930 / 933 Mbit/s (TCP, one stream) and 934 / 934 (8 streams) at 0 % CPU, against 574 / 600 with 8 streams in the software flow table; on the wire, tagged replies from `port1.30`, no reply to other VIDs, internal VIDs or tag stacks; leaving a bridge turns the translation back on; negative tests (including internal VIDs and tag stacks at a port with 802.1Q devices) without leak |
 | NP6Lite flow offload of a bond of DSA ports (LACP) | ✅ Validated: `port15` + `port16` routed to `ha1`, both directions, a member failing and coming back; 654 Mbit/s against 304 Mbit/s with the software flow table, with both ends on the device |
-| Per-flow counters of offloaded flows | ✅ Validated (0.1 %) |
+| Per-flow counters of offloaded flows | ✅ Validated (0.1 %) at TCP line rate (about 80 000 packets/s); ❌ wrong for one flow well above 100 000 packets/s (521 kpps of 64-byte UDP: between 0.02 and 2.9 times the real count), the session counter windows are then missed or over-estimated; cause under investigation |
+| Interface counters (`ip -s link`, `/proc/net/dev`, SNMP ifTable) | ✅ Validated: the DSA ports report the switch MIB counters (summed every 2 s), so bridged and offloaded frames are counted; the NP ports (`mgmt`, `dmz`, `wan1`, `wan2`) add the offloaded flows from the session counters (with the accuracy limit above) |
+| SNMP (`snmpd`, not in the profile) | ✅ ifTable/ifXTable of all 26 interfaces with speed and status, HOST-RESOURCES (CPU, memory, file systems), UCD memory and load; hardware sensors only through `extend` entries in `/etc/config/snmpd` (no lm-sensors MIB); no MIB files in the image (`snmp-mibs` or numeric OIDs) |
+| `/dev/hwrng` feeding the kernel pool | ✅ the `hwrng` kernel thread feeds the pool from `fsoc3-trng` (quality 128, `entropy_avail` 256); no `rngd` needed |
+| AF_ALG (`kmod-crypto-user`, `libopenssl-afalg`, not in the profile) | ✅ works through `fsoc3-cp`, and OpenWrt enables the OpenSSL engine for every OpenSSL user; AES-CBC only, faster than software from about 8 KiB per call (16 KiB: 88 MB/s against 36 MB/s), 45 times slower at 16-byte calls, so it is left out of the profile |
 | Crypto engines (`fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng`) | ✅ Validated against the software implementations, also under load |
-| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated, **outbound only** as on the 60E (`kmod-fortinet-np6lite-ipsec`), together with `fsoc3-cp`: inbound ESP is decrypted in software on `fsoc3-cp`; the `fsoc3-cp` tests pass while the NP encrypts |
+| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated, **outbound only** as on the 60E (`kmod-fortinet-np6lite-ipsec`), together with `fsoc3-cp`: inbound ESP is decrypted in software on `fsoc3-cp`; the `fsoc3-cp` tests pass while the NP encrypts. The driver's experimental inbound path (`ipsec_outbound_only=0`) is **not usable**: the NP does decrypt, but the driver cannot yet tell a decrypted frame from a clear one, so the kernel's inbound policy check would be bypassed; keep the default |
 | Hardware monitor, fan profiles (`fan-profile`: `silent`, `performance`) | ✅ Validated (`silent`: both fans on the same curve, minimum speed below 40 °C) |
 | USB host port | 🧪 USB 2 storage only |
 | Watchdog | ✅ Validated |
