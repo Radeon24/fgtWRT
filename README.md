@@ -1297,8 +1297,14 @@ Offloaded: VLAN-unaware bridges and one VLAN-aware bridge of DSA ports, hardware
 ageing, link speed 10/100/1000 through phylink. Flow offload of the NP6Lite works for DSA ports (the NP keys the
 flow on the uplink and the tag_8021q VID), also for a bond of DSA ports of one switch instance (for instance
 `port15` + `port16` with LACP): one NP session per member on ingress, and on output the member the bond's own hash
-picks, moved to another member when one fails. Not offloaded yet: bonds with members on both switch instances or
-with other ports, and 802.1Q devices on bridged ports or bond members.
+picks, moved to another member when one fails. Routed flows of the VLAN-aware bridge (`br0.10` to `wan1`, for
+instance) are offloaded too: the NP keys them on the uplink and the VID of the VLAN. A tagged end needs the port to be
+a tagged member of the VLAN, an untagged end its PVID to be the only VLAN the port leaves untagged (otherwise the
+VLAN of the end is not known for sure and the flow stays in software). A change of the bridge VLANs (a VLAN, a
+PVID, a port in or out) takes its offloaded flows off within a second and tears them down in the flow table, so
+they are set up again with the new configuration (for 5 s after a change, none is offloaded). Routing between two
+VLANs of the bridge stays in software. Not offloaded yet: bonds with members on both switch instances or with other
+ports, and 802.1Q devices on bridged ports or bond members.
 
 **802.1Q devices on DSA ports** (`port1.10`). The switch translates the VLAN of such a device to an internal VLAN
 of its own (VIDs from 3071 down, one per device, the port and its CPU uplink as members), so that the frame reaches
@@ -1373,7 +1379,7 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 |---|---|
 | Boot from RAM, default network | ✅ Validated |
 | `mgmt`, `dmz`, `wan1`, `wan2` | ✅ Validated |
-| `port1`…`port16` (DSA), bridge offload, VLAN-aware bridge | ✅ Validated |
+| `port1`…`port16` (DSA), bridge offload, VLAN-aware bridge | ✅ Validated; routed flows of the VLAN-aware bridge offloaded by the NP (TCP about 935 Mbit/s, sessions in the NP) |
 | `ha1`, `ha2` | ✅ Validated over a cable between both: link 1000/full, ping, TCP and UDP through the host path, link toggles, no frames towards the LAN ports. They learn addresses like the other ports; see "Address learning" to turn that off |
 | SFP1, SFP2 | 🧪 Partial: copper SFP modules (1000BASE-X) in both cages, link 1000/full as `port15`/`port16` (`Port: FIBRE` in `ethtool`), ping and the isolation tests; fiber modules, SGMII-only modules and a link on both the SFP and the RJ45 jack of the same port (the SFP wins) not tested; no access to the module EEPROM (`ethtool -m`) |
 | NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated |
