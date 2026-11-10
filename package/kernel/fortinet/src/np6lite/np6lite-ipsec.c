@@ -1148,8 +1148,18 @@ static int fnp6l_xdo_policy_add(struct xfrm_policy *xp,
 	unsigned int lif, n;
 
 	xp->xdo.offload_handle = 0;
-	if (xp->xdo.dir != XFRM_DEV_OFFLOAD_OUT)
-		return 0;
+	/*
+	 * Inbound and forward policies stay with xfrm. For a policy in packet
+	 * offload, xfrm takes a frame without sec_path as checked by the
+	 * hardware, and nothing here checks the clear frames received against
+	 * a policy: accepted, such a policy let clear traffic of its selector
+	 * in (measured). Refused, it is installed without offload and xfrm
+	 * checks every frame itself.
+	 */
+	if (xp->xdo.dir != XFRM_DEV_OFFLOAD_OUT) {
+		NL_SET_ERR_MSG_MOD(extack, "only outbound policies are offloaded, install this one without offload");
+		return -EOPNOTSUPP;
+	}
 
 	ips = fnp6l_port_info(ndev, &lif);
 	if (!ips) {
