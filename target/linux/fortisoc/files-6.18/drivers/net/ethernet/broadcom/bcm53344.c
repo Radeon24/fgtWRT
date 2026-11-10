@@ -247,6 +247,16 @@ static bool bcm53344_nolearn_has(const char *name)
 #define UMAC_MAC_MODE		0x00011100	/* read only */
 #define GPORT_GRPKT		0x00001b00
 #define GPORT_GTPKT		0x00003800
+/* GPORT MIB counters of the front ports (32 bits each, port index in bits 2:0) */
+#define GPORT_GRBYT		0x00001c00
+#define GPORT_GTBYT		0x00003900
+#define GPORT_GRMCA		0x00000f00
+#define GPORT_GRBCA		0x00001000
+#define GPORT_GRFCS		0x00000000
+#define GPORT_GRUND		0x00000c00
+#define GPORT_GROVR		0x00000800
+#define GPORT_GRJBR		0x00000900
+#define GPORT_GTFCS		0x00002100
 
 /* IPIPE VLAN/STG/port tables (memories) and link bitmap */
 #define VLAN_TAB		0x14000000	/* 4 words */
@@ -389,6 +399,13 @@ struct bcm53344 {
 	u16 pvid[NUM_PORTS];		/* PORT_VID set by a DSA instance */
 	u32 egr_mask[NUM_PORTS];	/* EGR_MASK as it must be in hardware */
 	struct bcm53344_dsa *dsa[2];	/* DSA instances, by switch index */
+	/* MIB counters of the DSA user ports, summed every 2 s */
+	struct delayed_work mib_work;
+	spinlock_t mib_lock;
+	struct bcm53344_mib {
+		u64 acc[11];	/* BCM53344_MIB_* */
+		u64 last[11];	/* last reading of each counter */
+	} mib[NUM_PORTS];
 	/* 802.1Q devices of the user ports, translated by the switch */
 	struct bcm53344_xlt {
 		struct net_device *vdev;	/* the 802.1Q device, a key */
@@ -1426,8 +1443,16 @@ static int bcm53344_serdes(struct bcm53344 *sw, int lane, int reg, bool write,
 #define XLMAC_RX_MAX_SIZE	0x00060800
 #define XLMAC_RX_LSS_CTRL	0x00060a00
 #define  XLMAC_DROP_TX_ON_FAULT	GENMASK_ULL(6, 4)	/* local, remote, link int. */
-#define XLPORT_RPKT		0x00000b00	/* counters */
+#define XLPORT_RPKT		0x00000b00	/* counters, 64 bits */
 #define XLPORT_TPKT		0x00004c00
+#define XLPORT_RBYT		0x00003d00
+#define XLPORT_TBYT		0x00006f00
+#define XLPORT_RMCA		0x00000d00
+#define XLPORT_RBCA		0x00000e00
+#define XLPORT_RUND		0x00003400
+#define XLPORT_ROVR		0x00001a00
+#define XLPORT_RJBR		0x00001b00
+#define XLPORT_TERR		0x00005d00
 #define XLPORT_RFCS		0x00000f00
 #define XLPORT_RERPKT		0x00001800
 #define XLMAC_TXFIFO_CELL_CNT	0x00062b00
@@ -2019,6 +2044,76 @@ static int bcm53344_ports_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(bcm53344_ports);
 
+/*
+ * Netdev statistics of the DSA user ports from the MIB counters of the
+ * switch, so that they count what the switch forwards in hardware (bridged
+ * frames, flows the NP6Lite offloads), not only what reaches the CPU. The
+ * GPORT counters are 32 bits wide: read every 2 s and summed (a port at
+ * 1 Gbit/s wraps its byte counter in 34 s); the XLPORT counters are 64
+ * bits wide and summed the same way.
+ */
+enum {
+	BCM53344_MIB_RPKT, BCM53344_MIB_RBYT, BCM53344_MIB_TPKT, BCM53344_MIB_TBYT,
+	BCM53344_MIB_RMCA, BCM53344_MIB_RBCA, BCM53344_MIB_RFCS, BCM53344_MIB_RUND,
+	BCM53344_MIB_ROVR, BCM53344_MIB_RJBR, BCM53344_MIB_TERR, BCM53344_MIB_N
+};
+
+static const u32 bcm53344_gport_mib[BCM53344_MIB_N] = {
+	GPORT_GRPKT, GPORT_GRBYT, GPORT_GTPKT, GPORT_GTBYT, GPORT_GRMCA,
+	GPORT_GRBCA, GPORT_GRFCS, GPORT_GRUND, GPORT_GROVR, GPORT_GRJBR,
+	GPORT_GTFCS,
+};
+
+static const u32 bcm53344_xlport_mib[BCM53344_MIB_N] = {
+	XLPORT_RPKT, XLPORT_RBYT, XLPORT_TPKT, XLPORT_TBYT, XLPORT_RMCA,
+	XLPORT_RBCA, XLPORT_RFCS, XLPORT_RUND, XLPORT_ROVR, XLPORT_RJBR,
+	XLPORT_TERR,
+};
+
+static void bcm53344_mib_work(struct work_struct *work)
+{
+	struct bcm53344 *sw = container_of(to_delayed_work(work),
+					   struct bcm53344, mib_work);
+	u32 ports = READ_ONCE(sw->dsa_ports);
+	int port, i;
+
+	for (port = 2; port < NUM_PORTS; port++) {
+		u64 cur[BCM53344_MIB_N];
+		bool ok = true;
+
+		if (!(ports & BIT(port)) || !bcm53344_port_valid(port))
+			continue;
+		for (i = 0; i < BCM53344_MIB_N && ok; i++) {
+			if (port >= 26) {
+				ok = !bcm53344_reg64_read(sw, BLK_XLPORT(0),
+							  bcm53344_xlport_mib[i] | (port - 26),
+							  &cur[i]);
+			} else {
+				u32 v = 0;
+
+				ok = !bcm53344_reg_read(sw, GPORT_BLK(port),
+							bcm53344_gport_mib[i] | GPORT_IDX(port),
+							&v);
+				cur[i] = v;
+			}
+		}
+		if (!ok)
+			continue;
+		spin_lock(&sw->mib_lock);
+		for (i = 0; i < BCM53344_MIB_N; i++) {
+			struct bcm53344_mib *m = &sw->mib[port];
+			u64 d = cur[i] - m->last[i];
+
+			if (port < 26)
+				d &= U32_MAX;
+			m->acc[i] += d;
+			m->last[i] = cur[i];
+		}
+		spin_unlock(&sw->mib_lock);
+	}
+	schedule_delayed_work(&sw->mib_work, msecs_to_jiffies(2000));
+}
+
 /* QGPHY addresses of ports 2-17 */
 static const u8 bcm53344_gphy_addr[] = { 1, 2, 3, 4, 6, 7, 8, 9,
 					 11, 12, 13, 14, 16, 17, 18, 19 };
@@ -2440,6 +2535,7 @@ static int bcm53344_setup_leds(struct bcm53344 *sw)
 		schedule_delayed_work(&sw->led_work, 0);
 	}
 	schedule_delayed_work(&sw->led_link_work, 0);
+	schedule_delayed_work(&sw->mib_work, msecs_to_jiffies(2000));
 	{
 		int i;
 
@@ -3666,6 +3762,28 @@ static int bcm53344_xlt_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(bcm53344_xlt);
 
+static void bcm53344_dsa_get_stats64(struct dsa_switch *ds, int port,
+				     struct rtnl_link_stats64 *st)
+{
+	struct bcm53344_dsa *d = ds->priv;
+	struct bcm53344 *sw = d->sw;
+	struct bcm53344_mib *m = &sw->mib[bcm53344_dsa_hw(d, port)];
+
+	spin_lock(&sw->mib_lock);
+	st->rx_packets = m->acc[BCM53344_MIB_RPKT];
+	st->rx_bytes = m->acc[BCM53344_MIB_RBYT];
+	st->tx_packets = m->acc[BCM53344_MIB_TPKT];
+	st->tx_bytes = m->acc[BCM53344_MIB_TBYT];
+	st->multicast = m->acc[BCM53344_MIB_RMCA];
+	st->rx_crc_errors = m->acc[BCM53344_MIB_RFCS];
+	st->rx_length_errors = m->acc[BCM53344_MIB_RUND] +
+			       m->acc[BCM53344_MIB_ROVR] +
+			       m->acc[BCM53344_MIB_RJBR];
+	st->rx_errors = st->rx_crc_errors + st->rx_length_errors;
+	st->tx_errors = m->acc[BCM53344_MIB_TERR];
+	spin_unlock(&sw->mib_lock);
+}
+
 static int bcm53344_dsa_connect_tag_protocol(struct dsa_switch *ds,
 					     enum dsa_tag_protocol proto)
 {
@@ -3689,6 +3807,7 @@ static const struct dsa_switch_ops bcm53344_dsa_ops = {
 	.port_pre_bridge_flags	= bcm53344_dsa_pre_bridge_flags,
 	.port_bridge_flags	= bcm53344_dsa_bridge_flags,
 	.connect_tag_protocol	= bcm53344_dsa_connect_tag_protocol,
+	.get_stats64		= bcm53344_dsa_get_stats64,
 };
 
 static int bcm53344_dsa_probe(struct platform_device *pdev)
@@ -3785,6 +3904,8 @@ static int bcm53344_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	memset(sw->tsc_speed, 2, sizeof(sw->tsc_speed));
 	INIT_DELAYED_WORK(&sw->led_link_work, bcm53344_led_link_work);
 	INIT_DELAYED_WORK(&sw->b50220_led_work, bcm53344_b50220_led_work);
+	INIT_DELAYED_WORK(&sw->mib_work, bcm53344_mib_work);
+	spin_lock_init(&sw->mib_lock);
 
 	ret = pcim_enable_device(pdev);
 	if (ret)
@@ -3848,6 +3969,7 @@ static void bcm53344_remove(struct pci_dev *pdev)
 	cancel_delayed_work_sync(&sw->led_work);
 	cancel_delayed_work_sync(&sw->led_link_work);
 	cancel_delayed_work_sync(&sw->b50220_led_work);
+	cancel_delayed_work_sync(&sw->mib_work);
 	debugfs_remove_recursive(sw->debugfs);
 	bcm53344_quiesce(sw);
 }
@@ -3861,6 +3983,7 @@ static void bcm53344_shutdown(struct pci_dev *pdev)
 	cancel_delayed_work_sync(&sw->led_work);
 	cancel_delayed_work_sync(&sw->led_link_work);
 	cancel_delayed_work_sync(&sw->b50220_led_work);
+	cancel_delayed_work_sync(&sw->mib_work);
 	bcm53344_quiesce(sw);
 }
 
