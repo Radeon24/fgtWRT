@@ -84,7 +84,7 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 | FortiGate 60E | SoC3 | 1008 MHz | NP6Lite | on-chip engine (no driver) | BCM53128 | ✅ **Available** |
 | FortiGate 60C | SoC1 (FS1) | 525 MHz | NPLite | VPN_LITE | Marvell 88E6161 | 📋 **Planned** |
 | FortiGate 100D | x86 PC (no Fortinet SoC) | 1.8 GHz | none | CP8 (no driver) | BCM53314 | 🧪 **Preview** |
-| FortiGate 100E | SoC3 | 1000 MHz | NP6Lite | on-chip engines (`fsoc3-*`) | BCM53344 | 🧪 **Preview, RAM boot only** |
+| FortiGate 100E | SoC3 | 1000 MHz | NP6Lite | on-chip engines (`fsoc3-*`) | BCM53344 | 🧪 **Preview** |
 
 - **Available**: image built from this repository, installable with persistent storage (60D, 90D, 60E).
   The published 60E image is built from revision `r0+37780-0b2480e6ba2` (commit `0b2480e6ba2`); the
@@ -93,8 +93,9 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 - **Preview** (100D): image built from this repository, installable with persistent storage and validated on
   one unit; no published revision yet, so no pinned revision to build from (see
   [Getting started](#getting-started)).
-- **Preview, RAM boot only** (100E): image built from this repository and validated on one unit, booted from
-  RAM only; no installation to the internal eMMC yet (see the 100E section in [Devices](#devices)).
+- **Preview** (100E): image built from this repository and validated on one unit; installable to the internal
+  eMMC with persistent storage as on the 60E (installation, boot, persistence and an update with `sysupgrade`
+  validated once; back to the stock firmware with [B] not tested yet; see the 100E section in [Devices](#devices)).
 - **Planned**: no OpenWrt profile in the tree yet.
 
 ## Hardware acceleration
@@ -250,7 +251,7 @@ packages built in.
 
 The 100D profile is described in its own section ([Devices](#devices)): it brings the switch driver, the
 tools of what the switch offloads, LuCI and the fan control, but neither WireGuard nor OpenVPN.
-The 100E profile is that of the 60E without the installer, plus
+The 100E profile is that of the 60E, plus
 the crypto engines and the hardware monitor ([Devices](#devices)).
 
 **Which revision builds the published image.**
@@ -1214,12 +1215,11 @@ is a loading check only: see [Known limitations](#known-limitations).
 </details>
 
 <details>
-<summary><b>FortiGate 100E</b> — SoC3 · NP6Lite · BCM53344 switch — 🧪 Preview, RAM boot only</summary>
+<summary><b>FortiGate 100E</b> — SoC3 · NP6Lite · BCM53344 switch — 🧪 Preview</summary>
 
 The SoC, the network processor and the image format are those of the 60E. The 100E adds a Broadcom BCM53344
 switch on PCIe for sixteen of its front ports and `ha1`/`ha2`, and has drivers for the crypto engines of the
-SoC3. **The image has only been booted from RAM**: there is no installation path to the internal eMMC yet, and
-nothing in the image writes to it.
+SoC3. The image installs into partition 2 of the internal eMMC as on the 60E (see the installation notes).
 
 ### Specifications
 
@@ -1232,7 +1232,7 @@ nothing in the image writes to it.
 | Switch | Broadcom BCM53344 (Hurricane 2) on PCIe, driver `bcm53344` with DSA tagger `bcm53344-8021q`; links to the NP6Lite over SGMII/QSGMII |
 | PHYs | 3 × Broadcom BCM54220 (B50220, dual port): `mgmt` and `dmz` (RGMII to the NP6Lite), `port13`…`port16` (SGMII to the switch); `port1`…`port12`, `ha1`, `ha2`, `wan1`, `wan2` on the internal PHYs of the switch |
 | Ethernet ports | 22 × 1 GbE: `mgmt`, `dmz` (NP6Lite); `wan1`, `wan2` (through the switch, each on an NP port of its own); `ha1`, `ha2`, `port1`…`port16` (switch, DSA ports); `port15`/`port16` shared with SFP1/SFP2 (1000BASE-X; the SFP has priority) |
-| Boot disk | eMMC, 3.56 GiB, same partition layout as the 60E (not written by this image) |
+| Boot disk | eMMC, 3.56 GiB, same partition layout as the 60E (OpenWrt in partition 2, sectors 786440 to 1310727) |
 | Boot flash | Macronix MX25L1605E SPI NOR, 2 MiB: boot loader and base MAC address (read-only) |
 | USB | 1 × USB-A (USB 2 tested), port power on an NP GPIO |
 | Console | RJ45 (Cisco pinout), 9600 8N1 |
@@ -1274,8 +1274,9 @@ Hardware flow offload is on by default.
 ### Image layout
 
 As on the 60E (see its section): one container with the kernel (device tree appended) and `rootfs.gz`, booted from
-RAM by [T] in the boot loader menu. The boot loader checks the model: the gzip name of the ramdisk must be
-`FG100E`, which the image profile sets.
+RAM by [T] in the boot loader menu, or installed by `sysupgrade` into partition 2 of the eMMC, with the persistent
+storage in the rest of that 256 MiB slot (ext4, about 219 MiB). The boot loader checks the model: the gzip name of the
+ramdisk must be `FG100E`, which the image profile sets.
 
 ### Switch driver
 
@@ -1398,13 +1399,24 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 | Watchdog | ✅ Validated |
 | LEDs of the front ports | ✅ Validated by a visual check |
 | STATUS, ALARM, HA LEDs | ✅ Validated by a visual check: STATUS green blinking while booting, green once running, red blinking in failsafe and during an upgrade; ALARM red blinks on a kernel panic, STATUS then goes dark; a failed fan (below 1000 rpm, `fan-monitor`) turns ALARM orange and STATUS red, both fans failed turn ALARM red; HA is off, without a trigger (no HA cluster), free for the LED configuration |
-| Installation to the eMMC, persistent storage | ❌ Not available |
+| Installation to the eMMC, persistent storage | 🧪 Partial: `sysupgrade -n` from a RAM boot into partition 2, boot from the eMMC without TFTP, persistence across a power cycle and `sysupgrade` from the installed system (configuration kept) validated once; [B] back to the stock firmware and back to OpenWrt not tested yet |
 | Continuous operation (24 h) | ❓ Not run yet |
 
 ### Installation notes
 
-There is no installation yet: boot the image from RAM with [T], as below. Nothing is written to the eMMC or the
-boot flash, and the next power cycle brings the stock firmware back.
+> [!WARNING]
+> As on the 60E, OpenWrt is installed into **partition 2** (firmware image 1) of the internal eMMC, which then
+> becomes the default boot partition. **Before installing, make sure the stock firmware you keep runs from
+> partition 1**: anything in partition 2 is overwritten. Back up partition 2 first if you may want it back
+> (for instance `dd if=/dev/mmcblk0p2 | nc <host> <port>` from OpenWrt booted from RAM).
+
+- Install from OpenWrt booted from RAM with `sysupgrade -n` (see [Getting started](#getting-started)); copy the
+  image to `/tmp` first (`scp`, or `nc` from a host). The installer refuses to write if partition 2 is the default
+  boot and does not hold OpenWrt, or if partition 1 holds no firmware.
+- Once partition 2 holds OpenWrt, an OpenWrt image booted from RAM with [T]/[R] mounts and changes the persistent
+  storage of partition 2 too. Update from the installed OpenWrt with `sysupgrade`.
+- To go back to the stock firmware, choose **[B]** in the boot loader menu (not tested on the 100E yet): OpenWrt
+  and its overlay stay in partition 2, and **[B]** again brings them back.
 
 - The boot loader menu (BIOS `05000008`): press a key at
   `Please wait for OS to boot, or press any key to display configuration menu.`, then **[C]** to set the TFTP
@@ -1412,8 +1424,8 @@ boot flash, and the next power cycle brings the stock firmware back.
   (`Please connect TFTP server to Ethernet port 'MGMT'.`). After `Checking image... OK`, answer
   `Save as Default firmware/Backup firmware/Run image without saving:[D/B/R]?` with **[R]** only:
   **[D]** and **[B]** write the image to the eMMC.
-- **Never use [F]** (formats the boot device), **[B]** in the main menu, or the **[I]** sub-menu (persistent
-  boot loader settings).
+- **Never use [F]** (formats the boot device) or the **[I]** sub-menu (persistent boot loader settings). **[B]** in
+  the main menu only switches the default boot partition (see above).
 - `mgmt` stays unconfigured under OpenWrt: after the boot, move your cable to one of `port1`…`port16` to reach
   `192.168.1.1`.
 - The console prompt comes before the end of the boot: wait for `procd: - init complete -` in the log before
