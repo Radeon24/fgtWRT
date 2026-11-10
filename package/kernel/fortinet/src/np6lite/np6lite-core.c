@@ -50,10 +50,12 @@
 #include <linux/udp.h>
 #include <linux/hash.h>
 #include <linux/hex.h>
+#include <linux/hrtimer.h>
 #include <linux/if_bridge.h>
 #include <linux/iopoll.h>
 #include <linux/jhash.h>
 #include <linux/log2.h>
+#include <linux/math64.h>
 #include <linux/ioport.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
@@ -337,6 +339,10 @@ struct fnp6l_port {
 	 */
 	unsigned int sw_nports;
 	u8 sw_lif[NP6L_SW_PORTS];
+	/* transmit pacing (fnp6l_tx_pace), under the transmit lock of ndev */
+	u64 tx_next;		/* ns: what was sent is on the wire by then */
+	bool tx_paced;		/* queue stopped by the pacing, tx_pace_timer wakes it */
+	struct hrtimer tx_pace_timer;
 };
 
 struct fnp6l_mdio {
@@ -1530,7 +1536,8 @@ out:
 	spin_unlock(&np->tx_lock);
 	if (woke)
 		for (i = 0; i < NP6L_MAX_LIF; i++)
-			if (np->port[i] && netif_queue_stopped(np->port[i]->ndev))
+			if (np->port[i] && !READ_ONCE(np->port[i]->tx_paced) &&
+			    netif_queue_stopped(np->port[i]->ndev))
 				netif_wake_queue(np->port[i]->ndev);
 }
 
@@ -1888,6 +1895,67 @@ static const struct ethtool_ops fnp6l_ethtool_ops = {
 	.get_ethtool_stats	= fnp6l_get_ethtool_stats,
 };
 
+/*
+ * Transmit pacing. The NP fetches transmit descriptors as soon as they are
+ * posted and writes the frames into the queue of the output port at bus
+ * speed; the queue holds about 30-60 KB, and what does not fit is dropped,
+ * without a counter (frames never written to the queue). Completions come
+ * at the fetch, so the ring gives no back pressure: a TCP sender on the
+ * host offered about 1.09 Gbit/s to a gigabit port and lost 10 % of its
+ * frames. Keep what a port is given at most tx_pace per mille of its link
+ * rate, counted on the wire (preamble, FCS, inter-frame gap: 24 bytes a
+ * frame; an IPsec frame grows by its encapsulation in the NP), with a
+ * burst under that queue: the queue is stopped once 40 KB are ahead of the
+ * wire, and woken when a fifth of it went out (the wake-up takes tens of
+ * microseconds; woken later, the port idles). Measured on a FortiGate 100E,
+ * TCP from the host: mgmt 922 Mbit/s with 83000 retransmissions in 10 s
+ * unpaced, 928-931 Mbit/s with none paced; port1 (through the switch)
+ * 849 Mbit/s with 11946, 875-897 Mbit/s with 0-140.
+ */
+static unsigned int tx_pace = 995;
+module_param(tx_pace, uint, 0644);
+MODULE_PARM_DESC(tx_pace,
+		 "pace what the host sends to a port to this per mille of its link rate (default 995; 0: off)");
+
+#define NP6L_TX_PACE_BURST		(40 * 1024)	/* bytes on the wire */
+#define NP6L_TX_PACE_WAKE		4	/* woken with 4/5 of the burst left */
+#define NP6L_TX_PACE_OVERHEAD		24	/* preamble, FCS, gap */
+#define NP6L_TX_PACE_IPSEC		80	/* outer IPv4, ESP, IV, pad, ICV */
+
+static enum hrtimer_restart fnp6l_tx_pace_timer(struct hrtimer *t)
+{
+	struct fnp6l_port *p = container_of(t, struct fnp6l_port, tx_pace_timer);
+
+	WRITE_ONCE(p->tx_paced, false);
+	netif_wake_queue(p->ndev);
+	return HRTIMER_NORESTART;
+}
+
+/* after a frame of @len bytes (no FCS) went to the ring for port @p */
+static void fnp6l_tx_pace(struct fnp6l_port *p, unsigned int len, bool ipsec)
+{
+	u32 pm = READ_ONCE(tx_pace);
+	int speed = READ_ONCE(p->speed);
+	u64 now, rate, burst;
+
+	if (!pm || speed <= 0)
+		return;
+	pm = min(pm, 1000U);
+	rate = (u64)speed * pm;		/* kbit/s: wire bytes * 8e6 / rate = ns */
+	len = max(len, (unsigned int)ETH_ZLEN) + NP6L_TX_PACE_OVERHEAD +
+	      (ipsec ? NP6L_TX_PACE_IPSEC : 0);
+	now = ktime_get_ns();
+	p->tx_next = max(p->tx_next, now) + div64_u64((u64)len * 8000000, rate);
+	burst = div64_u64((u64)NP6L_TX_PACE_BURST * 8000000, rate);
+	if (p->tx_next - now <= burst)
+		return;
+	WRITE_ONCE(p->tx_paced, true);
+	netif_stop_queue(p->ndev);
+	hrtimer_start(&p->tx_pace_timer,
+		      ns_to_ktime(p->tx_next - div_u64(burst * NP6L_TX_PACE_WAKE, 5)),
+		      HRTIMER_MODE_ABS_SOFT);
+}
+
 static netdev_tx_t fnp6l_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct fnp6l_port *p = netdev_priv(ndev);
@@ -2029,6 +2097,7 @@ static netdev_tx_t fnp6l_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	ndev->stats.tx_packets++;
 	ndev->stats.tx_bytes += len - NP6L_HTAG_LEN;
+	fnp6l_tx_pace(p, len - NP6L_HTAG_LEN, sa_idx);
 	return NETDEV_TX_OK;
 
 unmap:
@@ -2074,6 +2143,8 @@ static int fnp6l_stop(struct net_device *ndev)
 	struct fnp6l_port *p = netdev_priv(ndev);
 
 	netif_stop_queue(ndev);
+	hrtimer_cancel(&p->tx_pace_timer);
+	WRITE_ONCE(p->tx_paced, false);
 	if (ndev->phydev) {
 		phy_stop(ndev->phydev);
 		phy_disconnect(ndev->phydev);
@@ -2187,6 +2258,8 @@ static int fnp6l_add_port(struct fnp6l *np, struct device_node *dn)
 	p->dn = dn;
 	p->lif = lif;
 	p->link = link;
+	hrtimer_setup(&p->tx_pace_timer, fnp6l_tx_pace_timer, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_ABS_SOFT);
 	p->conduit = fnp6l_dt_is_conduit(dn);
 	fnp6l_dt_switch_lifs(np, p);
 	ret = of_get_phy_mode(dn, &p->phy_mode);
