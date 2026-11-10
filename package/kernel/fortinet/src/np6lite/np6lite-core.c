@@ -525,6 +525,10 @@ struct fnp6l {
 	struct list_head ft_flows;	/* offloaded flows */
 	struct list_head ft_hot;	/* fast flows, queried by ft_cnt_work (fnp6l_sse_lock) */
 	unsigned int ft_nhot;
+	/* flows a query reply found fast: to ft_hot at the next pass (ft_sess_lock) */
+	struct list_head ft_warm;
+	/* windows of the session counters: restarts seen, of them by age, windows estimated */
+	unsigned long ft_wrest, ft_wage, ft_west;
 	struct delayed_work ft_cnt_work;
 	struct hlist_head *ft_chash;	/* the same, by cookie (1 << ft_hbits) */
 	unsigned int ft_hbits;		/* both indexes, fixed at probe */
@@ -2910,6 +2914,8 @@ static int fnp6l_dbg_sse_show(struct seq_file *m, void *unused)
 	seq_printf(m, "ft flows %u qsent %lu qreply %lu qmatch %lu qchange %lu qdrop %lu qoff %d\n",
 		   np->ft_nflows, np->ft_qsent, np->ft_qreply, np->ft_qmatch,
 		   np->ft_qchange, np->ft_qdrop, np->ft_qoff);
+	seq_printf(m, "ft counters: fast %u restarts %lu aged %lu estimated %lu\n",
+		   np->ft_nhot, np->ft_wrest, np->ft_wage, np->ft_west);
 	seq_printf(m, "sse cmds %lu waits %lu wait_us %llu max_us %u sleeps %lu full %lu tmo %lu spin_us %u stall_ms %u qskip %lu slots %u\n",
 		   np->sse_cmds, np->sse_waits, np->sse_wait_us,
 		   np->sse_wait_max_us, np->sse_sleeps, np->sse_full,
@@ -3222,19 +3228,28 @@ MODULE_PARM_DESC(ft_nat66, "offload IPv6 address NAT (default 1: yes; 0: no; 2: 
 #define NP6L_FT_STATS_OFF		24	/* activity counters: what a hit moves */
 #define NP6L_FT_STATS_LEN		32
 /*
- * Counters of a session, in the service bytes (measured): a window of up to
- * 2^24 bytes of frames without FCS or 2^16 packets, whichever comes first,
- * and its length in ticks of 20 ms. A read does not clear them; a window that
- * fills restarts from zero and nothing keeps count of the windows. The sums are therefore kept here,
- * from the query replies, and a fast flow is queried often enough to see each
- * restart: a window lasts 134 ms at 1 Gbit/s.
+ * Counters of a session, in the service bytes (measured): a window of bytes
+ * (frames without FCS) and packets, the time it started on a clock of the
+ * NP and the time of its last packet since then, both in ticks of 20 ms. A
+ * read does not clear them. A packet that finds the window at 0xffc000 bytes
+ * or 0xffc0 packets or more, or older than the timeout of the entry (2000
+ * ticks), starts a new window with itself; idle time alone ends none, and
+ * nothing keeps count of the windows. The sums are therefore kept here, from
+ * the query replies: a new start time tells a restart, and a fast flow is
+ * queried often enough to see each of them (a window lasts 134 ms at
+ * 1 Gbit/s of full frames, 44 ms at the line rate of 64-byte frames).
  */
 #define NP6L_FT_CNT_TICKS		0
+#define NP6L_FT_CNT_AGE			2
+#define NP6L_FT_CNT_START		4
 #define NP6L_FT_CNT_BYTES		15
 #define NP6L_FT_CNT_PKTS		18
-#define NP6L_FT_CNT_WINDOW		BIT(24)
-#define NP6L_FT_CNT_WINDOW_PKTS		BIT(16)
+#define NP6L_FT_CNT_WINDOW		0xffc000
+#define NP6L_FT_CNT_WINDOW_PKTS		0xffc0
 #define NP6L_FT_CNT_TICK_MS		20
+#define NP6L_FT_CNT_MIN_TICKS		2	/* least length of a window */
+#define NP6L_FT_CNT_ACTIVE_TICKS	3	/* last frame seen this close to a reply: active */
+#define NP6L_FT_CNT_RATE_SHIFT		10	/* rates: packets per 1024 ticks */
 #define NP6L_FT_HOT_MAX			64
 #define NP6L_FT_HOT_LIFE		4	/* queries of a new flow, whatever its rate */
 #define NP6L_FT_HOT_BPMS		1000	/* bytes per ms: 8 Mbit/s */
@@ -3278,6 +3293,7 @@ struct fnp6l_ft_flow {
 	unsigned long lastused, qtime;
 	/* counters: on np->ft_hot, sum at the last pass, sums reported */
 	struct list_head hot;
+	struct list_head warm;		/* np->ft_warm (ft_sess_lock) */
 	unsigned int hlife;
 	u64 hbytes, rep_bytes, rep_pkts;
 	u8 l2len;		/* bytes of a frame in front of the IP header */
@@ -3290,6 +3306,8 @@ struct fnp6l_ft_flow {
 		bool missing;		/* a query found no such session */
 		bool refused;		/* missing, matched to a refusal: never deleted */
 		u32 wbytes, wpkts;	/* window at the last reply */
+		u32 wstart, wticks;	/* its start and the time of its last packet */
+		u32 rate;		/* packets per 1024 ticks up to the last reply */
 		unsigned long rtime;	/* time of the last reply */
 		u64 bytes, pkts;	/* sums, frames without FCS */
 		u64 acc_bytes, acc_pkts;	/* of them, in the netdev stats */
@@ -3714,6 +3732,7 @@ static void fnp6l_ft_hash_add(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 		s->snap_ok = false;
 		s->wbytes = 0;
 		s->wpkts = 0;
+		s->rate = 0;
 		s->rtime = 0;
 		hlist_add_head(&s->hn, &np->ft_hash[fnp6l_ft_khash(np, s->key)]);
 	}
@@ -3729,6 +3748,7 @@ static void fnp6l_ft_unhash(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 
 	spin_lock_bh(&np->ft_sess_lock);
 	fnp6l_ft_account(np, flow);	/* what the last report left */
+	list_del_init(&flow->warm);
 	hlist_del_init(&flow->cnode);
 	for (i = 0; i < NP6L_SW_PORTS; i++) {
 		if (hlist_unhashed(&flow->s[i].hn))
@@ -4285,41 +4305,113 @@ static bool fnp6l_ft_deleted_key(struct fnp6l *np, const u8 *k)
 }
 
 /*
- * The counters of a query reply (ft_sess_lock). A restart since the last
- * reply adds what was left of the old window, as frames of its mean size; the
- * windows filled since, if any, are estimated from the rate of the new one,
- * which only happens to a flow not queried often enough (more than
- * ft_cnt_ms, or the list full).
+ * The counters of a query reply (ft_sess_lock). A new start time: the window
+ * of the last reply ended and frames went uncounted, in it and in windows
+ * that filled since, if any.
+ *
+ * The old window: the next window having started before the old one came of
+ * age, it was filled, and what it lacked is counted exactly, as frames of
+ * the mean size of the new window. Otherwise its age may have ended it: it
+ * is given the frames the rate before the gap makes of the gap, less those
+ * of the new window, up to what it lacked.
+ *
+ * Windows filled unseen only happen to a flow not queried often enough (one
+ * that turned fast since its last reply, or the list of the fast flows
+ * full). Their number is estimated from the frames the gap had room for: at
+ * the rate of the new window if the flow was sending at the last reply,
+ * else at the mean of the rate before the gap and the rate of the new
+ * window. The gap is bounded by the time since the last reply and by the
+ * time between the last frame seen then and the start of the new window. A
+ * flow found fast joins the fast flows at their next pass, which leaves the
+ * estimate to its first gap.
  */
-static void fnp6l_ft_count(struct fnp6l_ft_sess *s, const u8 *st)
+static void fnp6l_ft_count(struct fnp6l *np, struct fnp6l_ft_sess *s,
+			   const u8 *st)
 {
 	u32 bytes = get_unaligned_le24(st + NP6L_FT_CNT_BYTES);
 	u32 pkts = get_unaligned_le16(st + NP6L_FT_CNT_PKTS);
 	u32 ticks = get_unaligned_le16(st + NP6L_FT_CNT_TICKS);
+	u32 start = get_unaligned_le32(st + NP6L_FT_CNT_START);
 	unsigned long now = jiffies;
+	u32 ms = s->rtime ? jiffies_to_msecs(now - s->rtime) : 0;
+	bool restart = false;
+	u64 db, dp;
 
-	if (bytes >= s->wbytes && pkts >= s->wpkts) {
-		s->bytes += bytes - s->wbytes;
-		s->pkts += pkts - s->wpkts;
+	if (!s->snap_ok ||
+	    (start == s->wstart && bytes >= s->wbytes && pkts >= s->wpkts)) {
+		db = bytes - s->wbytes;
+		dp = pkts - s->wpkts;
 	} else {
-		u32 size = s->wpkts ? s->wbytes / s->wpkts : 0;
-		u32 cap = size ? min_t(u32, NP6L_FT_CNT_WINDOW_PKTS,
-				       NP6L_FT_CNT_WINDOW / size) : 0;
-		u64 lost = cap > s->wpkts ? cap - s->wpkts : 0;
+		u32 size = pkts ? bytes / pkts :
+			   s->wpkts ? s->wbytes / s->wpkts : 0;
+		u32 cap = NP6L_FT_CNT_WINDOW_PKTS, rest, room, span, a, b, rate = 0;
+		u32 age = get_unaligned_le16(st + NP6L_FT_CNT_AGE);
+		u32 gap = DIV_ROUND_UP(ms, NP6L_FT_CNT_TICK_MS);
+		u32 moved = start - s->wstart;
+		u64 fit, old, full = 0;
 
-		if (cap && s->rtime && ticks && pkts) {
-			u64 ms = jiffies_to_msecs(now - s->rtime);
-			u64 inside = (u64)ticks * NP6L_FT_CNT_TICK_MS;
-			u64 fill = div_u64(inside * cap, pkts);
-
-			if (fill && ms > inside + fill)
-				lost += div64_u64(ms - inside, fill) * cap;
+		rest = cap - min(s->wpkts, cap);
+		if (size) {
+			room = NP6L_FT_CNT_WINDOW -
+			       min_t(u32, s->wbytes, NP6L_FT_CNT_WINDOW);
+			rest = min(rest, DIV_ROUND_UP(room, size));
+			cap = min(cap, DIV_ROUND_UP(NP6L_FT_CNT_WINDOW, size));
 		}
-		s->bytes += lost * size + bytes;
-		s->pkts += lost + pkts;
+		/* the new window, from its first to its last packet */
+		if (pkts)
+			rate = ((pkts - 1) << (NP6L_FT_CNT_RATE_SHIFT + 1)) /
+			       max(2 * ticks, 1U);
+		/*
+		 * From the last frame seen to the new window (a), and from
+		 * the last reply to the new window (b), its last frame taken
+		 * as now. a no longer than b: the flow was sending at the last
+		 * reply, at the rate of the new window ever since (a burst);
+		 * otherwise it started in between, at a rate between the two.
+		 */
+		a = moved > s->wticks ? moved - s->wticks : 0;
+		b = gap > ticks ? gap - ticks : 0;
+		span = min(a, b);
+		if (a <= b + NP6L_FT_CNT_ACTIVE_TICKS)
+			fit = ((u64)span * rate + BIT(NP6L_FT_CNT_RATE_SHIFT - 1)) >>
+			      NP6L_FT_CNT_RATE_SHIFT;
+		else
+			fit = ((u64)span * ((u64)s->rate + rate) +
+			       BIT(NP6L_FT_CNT_RATE_SHIFT)) >>
+			      (NP6L_FT_CNT_RATE_SHIFT + 1);
+		old = rest;
+		if (age && moved >= age) {
+			/* frames of the whole gap, less those of the new window */
+			old = ((u64)gap * s->rate +
+			       BIT(NP6L_FT_CNT_RATE_SHIFT - 1)) >>
+			      NP6L_FT_CNT_RATE_SHIFT;
+			old = min_t(u64, rest, old > pkts ? old - pkts : 0);
+			np->ft_wage++;
+		}
+		if (fit > old)
+			full = min_t(u64, div_u64(fit - old + cap / 2, cap),
+				     span / NP6L_FT_CNT_MIN_TICKS);
+		dp = old + full * cap;
+		db = dp * size + bytes;
+		dp += pkts;
+		np->ft_wrest++;
+		np->ft_west += full;
+		restart = true;
 	}
+	s->bytes += db;
+	s->pkts += dp;
+	if (ms)
+		s->rate = min_t(u64, U32_MAX,
+				div_u64((dp * NP6L_FT_CNT_TICK_MS) <<
+					NP6L_FT_CNT_RATE_SHIFT, ms));
+	/* fast: to the flows queried each ft_cnt_ms (fnp6l_ft_cnt_work) */
+	if (ms && ((restart && dp > pkts) ||
+		   db >= (u64)ms * NP6L_FT_HOT_BPMS) &&
+	    list_empty(&s->flow->warm))
+		list_add_tail(&s->flow->warm, &np->ft_warm);
 	s->wbytes = bytes;
 	s->wpkts = pkts;
+	s->wstart = start;
+	s->wticks = ticks;
 	s->rtime = now;
 }
 
@@ -4404,6 +4496,13 @@ static void fnp6l_ft_cnt_work(struct work_struct *work)
 	mutex_lock(&fnp6l_sse_lock);
 	if (!READ_ONCE(np->ft_on) || !np->sse_done)
 		goto unlock;
+	/* the flows the query replies found fast since the last pass */
+	spin_lock_bh(&np->ft_sess_lock);
+	list_for_each_entry_safe(flow, tmp, &np->ft_warm, warm) {
+		list_del_init(&flow->warm);
+		fnp6l_ft_hot(np, flow, NP6L_FT_HOT_LIFE);
+	}
+	spin_unlock_bh(&np->ft_sess_lock);
 	list_for_each_entry_safe(flow, tmp, &np->ft_hot, hot) {
 		u64 sum = 0;
 
@@ -4488,7 +4587,7 @@ static void fnp6l_rx_msg(struct fnp6l *np, const u8 *buf, unsigned int len)
 			WRITE_ONCE(s->flow->lastused, jiffies);
 			np->ft_qchange++;
 		}
-		fnp6l_ft_count(s, buf + off + NP6L_FT_STATS_OFF);
+		fnp6l_ft_count(np, s, buf + off + NP6L_FT_STATS_OFF);
 		memcpy(s->snap, buf + off + NP6L_FT_STATS_OFF, NP6L_FT_STATS_LEN);
 		s->snap_ok = true;
 		WRITE_ONCE(s->missing, false);
@@ -6031,6 +6130,7 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 	flow->qtime = jiffies;
 	flow->l2len = ETH_HLEN + (fl->vid ? VLAN_HLEN : 0);
 	INIT_LIST_HEAD(&flow->hot);
+	INIT_LIST_HEAD(&flow->warm);
 	fnp6l_ft_hash_add(np, flow);
 	fnp6l_ft_link(np, flow);
 	fnp6l_ft_hot(np, flow, NP6L_FT_HOT_LIFE);
@@ -6151,14 +6251,6 @@ static int fnp6l_ft_stats(struct fnp6l *np, struct flow_cls_offload *cls)
 			WRITE_ONCE(flow->qtime, jiffies);
 			for (i = 0; i < flow->n_in_lif; i++)
 				fnp6l_ft_query(np, &flow->s[i]);
-		}
-		/* window rate of the last reply, in bytes per ms */
-		for (i = 0; i < flow->n_in_lif; i++) {
-			u32 t = get_unaligned_le16(flow->s[i].snap + NP6L_FT_CNT_TICKS);
-
-			if (t && flow->s[i].wbytes / (t * NP6L_FT_CNT_TICK_MS) >=
-			    NP6L_FT_HOT_BPMS)
-				fnp6l_ft_hot(np, flow, 0);
 		}
 	}
 	lastused = READ_ONCE(flow->lastused);
@@ -7715,6 +7807,7 @@ static int fnp6l_setup_net(struct platform_device *pdev, struct fnp6l *np)
 	fnp6l_debugfs_init(np);
 	INIT_LIST_HEAD(&np->ft_flows);
 	INIT_LIST_HEAD(&np->ft_hot);
+	INIT_LIST_HEAD(&np->ft_warm);
 	INIT_LIST_HEAD(&np->ft_dead);
 	INIT_LIST_HEAD(&np->ft_backl);
 	for (q = 0; q < ARRAY_SIZE(np->ft_bhash); q++)
