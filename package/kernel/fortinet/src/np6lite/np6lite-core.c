@@ -450,6 +450,7 @@ struct fnp6l {
 	u64 tx_csum_hw, tx_csum_hw6, tx_csum_sw, tx_sg;
 	bool htx_l4_parse_done;
 	bool sse_done;
+	bool ipsec_in_done;	/* fnp6l_ipsec_in_init (fnp6l_sse_lock) */
 	/* ingress classification: each port to its own LIF via class table */
 	bool ic_on;
 	u8 ic_idx[NP6L_MAX_LIF];	/* class table indices to clear on failure */
@@ -1306,14 +1307,20 @@ static void fnp6l_rx_deliver(struct fnp6l *np, struct fnp6l_vec *v,
 	       get_unaligned_be16(skb->data + 12) == NP6L_PORT_TAG_TPID;
 
 	/*
-	 * A frame the IPsec engine decrypted (completion word 0 bit 30): its
-	 * SA gives the port and the sec_path; delivered to the stack without
-	 * GRO. Inert while no inbound SA is in the engine.
+	 * A frame the IPsec engine decrypted (on NP6L_LIF_IPSEC_IN, completion
+	 * word 0 bit 30): its SA gives the port and the sec_path; delivered to
+	 * the stack without GRO. Anything else on that LIF (no mark, an SA
+	 * gone) is dropped: it is decrypted already, software cannot take it.
 	 */
 	if (np->ipsec) {
 		struct xfrm_state *x = NULL;
-		int il = fnp6l_ipsec_rx(np->ipsec, w0, w1, &x);
+		int il = fnp6l_ipsec_rx(np->ipsec, w0, w1, lif, &x);
 
+		if (il < 0 && lif == NP6L_LIF_IPSEC_IN) {
+			v->rx_unknown_lif++;
+			dev_kfree_skb_any(skb);
+			return;
+		}
 		if (il >= 0) {
 			struct fnp6l_port *ip = il < NP6L_MAX_LIF ?
 						np->port[il] : NULL;
@@ -7965,14 +7972,15 @@ int fnp6l_tx_drain(struct fnp6l *np)
 }
 
 /*
- * Inbound SPI session entry: the key is {destination address, SPI in
- * place of the L4 ports, protocol 50}; the action carries the SA index at
- * byte 0x40, so the engine loads the right tunnel-table entry on a hit, and
- * the output-valid bit (byte 19 bit 3) marks it a tunnel session. Delete by
- * the key. Under the flow-engine lock. FIXME: the exact action encoding and
- * the delete key length are to be confirmed on hardware before inbound is
- * enabled
- * (ipsec_outbound_only); not exercised while it is on.
+ * Inbound SPI session (the format the engine takes, established on
+ * hardware): the key is {source and destination address, SPI in place of
+ * the L4 ports, protocol 50, in_lif of the port}, without the source
+ * address the lookup never hits. The action sends the frame to the inbound
+ * IPsec engine (bit 163, with bit 162) with the SA index at bytes 64-65,
+ * and the decrypted frame on to NP6L_LIF_IPSEC_IN (output valid, bit 155,
+ * out_lif at bytes 60-61); mtu 0xffff, bytes 104-127 all ones, no timeout
+ * (the session stays until deleted). Delete by the same key. Under the
+ * flow-engine lock.
  */
 int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
 		    u32 in_lif, u16 sa, bool add)
@@ -7983,15 +7991,20 @@ int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
 
 	if (ret)
 		return ret;
+	memcpy(e, &saddr, 4);			/* source address (key) */
 	memcpy(e + 4, &daddr, 4);		/* destination address (key) */
 	memcpy(e + 8, &spi, 4);			/* SPI in place of the L4 ports */
 	put_unaligned_le32(IPPROTO_ESP | FIELD_PREP(GENMASK(29, 20), in_lif) |
 			   BIT(31), e + 12);	/* protocol 50, in_lif, KEY_VALID */
 	msg[3] = NP6L_SSE_TXQ;
 	if (add) {
-		e[19] |= BIT(3);		/* output valid: tunnel session */
-		e[0x40] = sa & 0xff;		/* SA index at byte 0x40 */
-		e[0x41] = (sa >> 8) & 0xff;
+		e[19] |= BIT(3);		/* ACT_OUT_VALID */
+		e[20] |= BIT(2) | BIT(3);	/* bits 162-163: inbound IPsec */
+		put_unaligned_le16(0xffff, e + 58);	/* mtu */
+		e[60] = NP6L_LIF_IPSEC_IN & 0xff;	/* out_lif 489:480 */
+		e[61] = (NP6L_LIF_IPSEC_IN >> 8) & 3;
+		put_unaligned_le16(sa, e + 64);	/* SA index */
+		memset(e + 104, 0xff, NP6L_SSE_ENTRY_LEN - 104);
 		msg[0] = 0x80 | NP6L_SSE_CMD_INSERT;
 		msg[1] = (8 + NP6L_SSE_ENTRY_LEN) / 8;
 		return fnp6l_sse_post(np, msg, 8 + NP6L_SSE_ENTRY_LEN);
@@ -7999,6 +8012,83 @@ int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
 	msg[0] = 0x80 | NP6L_SSE_CMD_DELETE;
 	msg[1] = (8 + NP6L_SSE_KEY4_LEN) / 8;
 	return fnp6l_sse_post(np, msg, 8 + NP6L_SSE_KEY4_LEN);
+}
+
+/*
+ * What inbound decryption needs besides the SAs and their SPI sessions
+ * (established on hardware, as the vendor firmware sets it up). The engine
+ * hands a decrypted frame to a second header parser ("xhp"), whose checks,
+ * class types and L4 parse table the loader leaves uninitialised (random
+ * class types; an ICMP frame then fails its length check and is dropped).
+ * Then the frame is looked up again, its input LIF taken from the output of
+ * the SPI session: NP6L_LIF_IPSEC_IN, which needs the tables of any LIF
+ * (source/target action: look up, host target; port to trunk: itself; MAC
+ * entry; trunk config). A decrypted frame no session matches reaches the
+ * host on that LIF, its completion words marked (fnp6l_ipsec_rx). Once per
+ * boot, under the flow-engine lock, each value read back.
+ */
+#define NP6L_XHP_PKEY			0x6d00	/* xhp L4 parse table, by IP protocol */
+
+static const u32 fnp6l_xhp_regs[][2] = {
+	{ 0x6b90, 0x0000ffdf },	/* ihp_ctrl/ctrl */
+	{ 0x6c28, 0xffff073f },	/* ihp_chk/tcpchk_ctrl */
+	{ 0x6d80, 0xfffffff6 },	/* ihp_parser/ihp_ctype_0..7 */
+	{ 0x6d88, 0xffffffff }, { 0x6d90, 0xffffffff }, { 0x6d98, 0xffffffff },
+	{ 0x6da0, 0xffffffff }, { 0x6da8, 0xffffffff }, { 0x6db0, 0xffffffff },
+	{ 0x6db8, 0xffffffff },
+	{ 0x6f90, 0x0000fdff },	/* ihp_chkx/l4aps_ctrl */
+	{ 0x6f98, 0xffff03bf },	/* ihp_chkx/l3v4chk_ctrl */
+	{ 0x6fa8, 0xf8ff0007 },	/* ihp_chkx/tcpchk_ctrl */
+	{ 0x6fb0, 0xfcff0007 },	/* ihp_chkx/udpchk_ctrl */
+};
+
+int fnp6l_ipsec_in_init(struct fnp6l *np)
+{
+	static const struct { u32 tbl; u32 d[4]; } lif_tbl[] = {
+		{ NP6L_TBL_PORT_ACTION, { 0x0ff00000, 0x00020840, 0, 0 } },
+		{ NP6L_TBL_PORT_TRUNK, { NP6L_LIF_IPSEC_IN, 0, 0, 0 } },
+		{ NP6L_TBL_LIF_MAC, { 0x00000001, 0x00070000, 0, 0 } },
+		{ NP6L_TBL_TRUNK_CFG, { 0xf03f703f, 0x7fc10000, 0x1ff0, 0 } },
+	};
+	unsigned int i, k, bad = 0;
+	u32 d[4], rb[4];
+
+	lockdep_assert_held(&fnp6l_sse_lock);
+	if (np->ipsec_in_done)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(fnp6l_xhp_regs); i++) {
+		fnp6l_wr(np, fnp6l_xhp_regs[i][0], fnp6l_xhp_regs[i][1]);
+		bad += fnp6l_rd(np, fnp6l_xhp_regs[i][0]) != fnp6l_xhp_regs[i][1];
+	}
+	/* the L4 parse entries of the xhp as those of the host transmit side */
+	for (i = 0; i < 256; i++) {
+		memset(d, 0, sizeof(d));
+		for (k = 0; k < ARRAY_SIZE(fnp6l_l4_parse_tbl); k++)
+			if (fnp6l_l4_parse_tbl[k].proto == i) {
+				d[0] = fnp6l_l4_parse_tbl[k].l;
+				d[1] = fnp6l_l4_parse_tbl[k].h;
+			}
+		if (fnp6l_tbl_op(np, NP6L_XHP_PKEY, i, d, true) ||
+		    fnp6l_tbl_op(np, NP6L_XHP_PKEY, i, rb, false) ||
+		    rb[0] != d[0] || rb[1] != d[1])
+			bad++;
+	}
+	for (i = 0; i < ARRAY_SIZE(lif_tbl); i++) {
+		memcpy(d, lif_tbl[i].d, sizeof(d));
+		if (fnp6l_tbl_op(np, lif_tbl[i].tbl, NP6L_LIF_IPSEC_IN, d, true) ||
+		    fnp6l_tbl_op(np, lif_tbl[i].tbl, NP6L_LIF_IPSEC_IN, rb, false) ||
+		    memcmp(rb, lif_tbl[i].d, sizeof(rb)))
+			bad++;
+	}
+	if (bad) {
+		dev_err(np->dev, "IPsec: inbound set up failed (%u values not taken)\n",
+			bad);
+		return -EIO;
+	}
+	np->ipsec_in_done = true;
+	dev_info(np->dev, "IPsec: inbound decryption set up (LIF %u)\n",
+		 NP6L_LIF_IPSEC_IN);
+	return 0;
 }
 
 /*

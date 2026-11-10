@@ -35,6 +35,13 @@ struct fnp6l_ipsec_tuple {
 	u8 proto;
 };
 
+/*
+ * The virtual LIF on which the IPsec engine hands a decrypted frame back to
+ * the session engine, and through which it reaches the host: none of the
+ * ports, high in the LIF space as the vendor firmware takes it.
+ */
+#define NP6L_LIF_IPSEC_IN	249
+
 #ifdef CONFIG_FORTINET_NP6LITE_IPSEC
 /*
  * Provided by np6lite-core.c. The flow-engine lock is the global mutex the
@@ -50,6 +57,7 @@ void fnp6l_fe_assert_held(struct fnp6l *np);
 int fnp6l_fe_ready(struct fnp6l *np);
 int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
 		    u32 in_lif, u16 sa, bool add);
+int fnp6l_ipsec_in_init(struct fnp6l *np);
 int fnp6l_tx_drain(struct fnp6l *np);
 unsigned int fnp6l_ft_flush_lif(struct fnp6l *np, unsigned int lif);
 
@@ -60,12 +68,13 @@ void fnp6l_ipsec_start(struct fnp6l_ipsec *ips);
 void fnp6l_ipsec_reset(struct fnp6l_ipsec *ips);
 void fnp6l_ipsec_port_init(struct fnp6l_ipsec *ips, struct net_device *ndev);
 /*
- * RX: whether the completion words of a decrypted frame carry an SA
- * (word 0 bit 30 "processed", SA index in word 1 bits 15:0). -ENOENT if
- * the frame is not from the IPsec engine, another error to drop it, or the
- * LIF of the port of its SA with @x set (a reference held).
+ * RX: whether a frame received on LIF @lif is one the IPsec engine
+ * decrypted: on NP6L_LIF_IPSEC_IN, word 0 bit 30 "processed", SA index in
+ * word 1 bits 15:0. -ENOENT if the frame is not from the IPsec engine,
+ * another error to drop it, or the LIF of the port of its SA with @x set
+ * (a reference held).
  */
-int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1,
+int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1, unsigned int lif,
 		   struct xfrm_state **x);
 bool fnp6l_ipsec_rx_skb(struct fnp6l_ipsec *ips, struct sk_buff *skb,
 			struct xfrm_state *x);
@@ -113,7 +122,7 @@ static inline void fnp6l_ipsec_port_init(struct fnp6l_ipsec *ips,
 }
 
 static inline int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1,
-				 struct xfrm_state **x)
+				 unsigned int lif, struct xfrm_state **x)
 {
 	return -ENOENT;
 }
