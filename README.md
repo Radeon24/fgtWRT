@@ -1238,7 +1238,7 @@ SoC3. The image installs into partition 2 of the internal eMMC as on the 60E (se
 | Buttons | reset (NP GPIO 4) |
 | Console | RJ45 (Cisco pinout), 9600 8N1 |
 | Hardware monitoring | Nuvoton NCT7802Y on I2C (`nct7802`): temperatures, voltages, fan speeds; the chip regulates the fans itself; `fan-profile` sets its curve |
-| LEDs | link and activity LEDs of all front ports (switch LED processor and PHY LED modes) |
+| LEDs | link and activity LEDs of all front ports (switch LED processor and PHY LED modes); one LED per SFP cage, on the activity LED pin of the PHY of `port15`/`port16`, switched over by an NP GPIO |
 | Watchdog | SoC watchdog |
 | Power | about 21 W idle and 21.3 W with offloaded TCP both ways (smart plug, order of magnitude) |
 
@@ -1399,6 +1399,7 @@ limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
 | USB host port | 🧪 USB 2 storage only |
 | Watchdog | ✅ Validated |
 | LEDs of the front ports | ✅ Validated by a visual check |
+| LEDs of the SFP cages | ✅ Validated by a visual check with copper SFP modules: while the SFP side of `port15`/`port16` has the link, the LED of its cage is lit and blinks with traffic, and the LEDs of the RJ45 jack are off (as with the stock firmware); dark again once the port goes down |
 | Reset button | ✅ A short press reboots cleanly (`gpio-button-hotplug`, polled every 100 ms; hold it about 0.3 s); a press of 5 s or more triggers the OpenWrt factory reset (standard OpenWrt behaviour, not tested on this unit) |
 | STATUS, ALARM, HA LEDs | ✅ Validated by a visual check: STATUS green blinking while booting, green once running, red blinking in failsafe and during an upgrade; ALARM red blinks on a kernel panic, STATUS then goes dark; a failed fan (below 1000 rpm, `fan-monitor`) turns ALARM orange and STATUS red, both fans failed turn ALARM red; HA is off, without a trigger (no HA cluster), free for the LED configuration |
 | Installation to the eMMC, persistent storage | 🧪 Partial: `sysupgrade -n` from a RAM boot into partition 2, boot from the eMMC without TFTP, persistence across a power cycle and `sysupgrade` from the installed system (configuration kept) validated once; [B] back to the stock firmware and back to OpenWrt not tested yet |

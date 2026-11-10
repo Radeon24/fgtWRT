@@ -192,8 +192,9 @@
 
 	/*
 	 * NP6Lite msc GPIO block. Consumers: the front panel LEDs (lines 0-3,
-	 * 5, 6) and the reset button (4). Reserved: 10 (USB port power), 17-18
-	 * (MDC lines) and 20-25 (resets, NP6Lite driver).
+	 * 5, 6), the reset button (4) and the LED switches of the SFP cages
+	 * (14, 15). Reserved: 10 (USB port power), 17-18 (MDC lines) and
+	 * 20-25 (resets, NP6Lite driver).
 	 */
 	np_gpio: gpio@f500fc00 {
 		compatible = "fortinet,fsoc3-gpio";
@@ -307,11 +308,15 @@
 						reg = <15>;
 						/* port16, SFP2: second SerDes to the SFP cage */
 						brcm,sfp-automedium;
+						/* high: LED3 lights the SFP2 LED, not the jack */
+						brcm,sfp-led-gpios = <&np_gpio 14 GPIO_ACTIVE_HIGH>;
 					};
 					b50220_16: ethernet-phy@10 {
 						reg = <16>;
 						/* port15, SFP1: second SerDes to the SFP cage */
 						brcm,sfp-automedium;
+						/* high: LED3 lights the SFP1 LED, not the jack */
+						brcm,sfp-led-gpios = <&np_gpio 15 GPIO_ACTIVE_HIGH>;
 					};
 					b50220_31: ethernet-phy@1f {
 						reg = <31>;
