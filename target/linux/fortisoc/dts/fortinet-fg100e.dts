@@ -29,6 +29,13 @@
 	model = "Fortinet FortiGate 100E";
 	compatible = "fortinet,fg100e", "fortinet,fsoc3";
 
+	/* Writable file system of the slot of image 1, on the eMMC, for user space */
+	rootfs-data {
+		compatible = "fortinet,disk-rootfs-data";
+		fortinet,disk-sectors = /bits/ 64 <7471104>;
+		fortinet,rootfs-data = <819208 491520>;
+	};
+
 	aliases {
 		serial0 = &uart0;
 		i2c0 = &i2c0;
@@ -142,9 +149,17 @@
 
 &{/soc} {
 	/*
-	 * eMMC (Micron, 7471104 sectors as on the 60E: FortiOS in partitions
-	 * 1 and 2). Strictly read-only: fortinet,force-ro without write
-	 * windows refuses every data write, and no rootfs_data is described.
+	 * eMMC (Micron, 7471104 sectors, the layout of the 60E: FortiOS in
+	 * partitions 1 and 2, sectors 262152 and 786440, 524288 each).
+	 * Writes the installer may make once armed: sector 0, where only
+	 * the name and build number of image 1 and the active flags of
+	 * partitions 1 and 2 may change, and partition 2, the slot of image 1
+	 * (sectors 786440 to 1310727). Open without arming: the writable file
+	 * system of that slot (rootfs_data, sectors 819208 to 1310727, after
+	 * the 16 380 KiB boot image at sectors 786440 to 819199), aligned on
+	 * the 4 KiB pages of the page cache of the disk, through which its
+	 * loop device writes; sectors 819200 to 819207 of the slot stay
+	 * unused. Every other write is refused (fortinet,force-ro).
 	 */
 	mmc@f3010000 {
 		compatible = "fortinet,fsoc3-sdhi";
@@ -157,6 +172,9 @@
 		no-sdio;
 		no-sd;
 		fortinet,force-ro;
+		fortinet,write-windows = <0 1>, <786440 524288>;
+		fortinet,sector0-bytes = <0x30 32>, <0x12c 4>, <0x1be 1>, <0x1ce 1>;
+		fortinet,persistent-windows = <819208 491520>;
 	};
 
 	/*

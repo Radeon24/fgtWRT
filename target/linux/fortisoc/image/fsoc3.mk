@@ -42,10 +42,10 @@ define Device/fortinet_fg-60e
 endef
 TARGET_DEVICES += fortinet_fg-60e
 
-# RAM boot only: the device tree describes no write
-# window and platform.sh knows no slot for it, so sysupgrade refuses to
-# install. The boot loader checks the model name of the container: FG100E
-# (FGT60E and FGT100E are refused as "Wrong image type").
+# The eMMC of the 100E has the layout of the 60E: the same container
+# geometry and slot (partition 2, rootfs_data behind the container). The
+# boot loader checks the model name of the container: FG100E (FGT60E and
+# FGT100E are refused as "Wrong image type").
 define Device/fortinet_fg-100e
   DEVICE_VENDOR := Fortinet
   DEVICE_MODEL := FortiGate 100E
@@ -64,6 +64,7 @@ define Device/fortinet_fg-100e
   DEVICE_DTS := fortinet-fg100e
   DEVICE_PACKAGES := firewall4 kmod-nft-offload kmod-bonding proto-bonding \
 	ethtool ip-full ip-bridge kmod-fortinet-np6lite kmod-fortinet-np6lite-ipsec \
+	fortigate-dualslot e2fsprogs \
 	kmod-fortinet-fsoc3-trng kmod-fortinet-fsoc3-pkce kmod-fortinet-fsoc3-cp \
 	kmod-ipsec kmod-ipsec4 kmod-ipsec6 kmod-crypto-seqiv \
 	kmod-crypto-chacha20poly1305 kmod-crypto-sha256 \

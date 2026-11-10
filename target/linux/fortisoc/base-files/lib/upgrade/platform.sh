@@ -88,6 +88,25 @@ fgt_board() {
 		FGT_HEADER_FORBIDDEN="0xdc:1 0x170:1"
 		FGT_WW_EXPECTED="0+1 786440+524288 persistent 819208+491520 sector0 0x30+32 0x12c+4 0x1be+1 0x1ce+1"
 		;;
+	fortinet,fg100e)
+		FGT_BOARD="FortiGate 100E"
+		FGT_DISK_KIND=mmc
+		FGT_MMC_DISK="${FGT_DEV:-/dev}/mmcblk0"
+		FGT_MMC_SLOT="${FGT_DEV:-/dev}/mmcblk0p2"
+		FGT_SLOT_PART=2
+		FGT_SLOT_LBA=786440
+		FGT_SLOT_SIZE=524288
+		FGT_DISK_SECTORS=7471104
+		FGT_SLOT_IMAGE=1
+		FGT_IMAGE_NAME=FG100E-OpenWrt
+		# The layout of the 60E: OpenWrt becomes the default slot,
+		# rootfs_data persistent (its place comes from the device
+		# tree); [B] in the boot menu brings FortiOS back
+		FGT_SLOT_MAKE_DEFAULT=1
+		FGT_PERSIST=1
+		FGT_HEADER_FORBIDDEN="0xdc:1 0x170:1"
+		FGT_WW_EXPECTED="0+1 786440+524288 persistent 819208+491520 sector0 0x30+32 0x12c+4 0x1be+1 0x1ce+1"
+		;;
 	*)
 		return 1
 		;;
@@ -121,7 +140,7 @@ case "$(board_name)" in
 fortinet,fg60d|fortinet,fg90d)
 	RAMFS_COPY_BIN="$RAMFS_COPY_BIN blockdev cmp head readlink sha256sum fgt-sector0"
 	;;
-fortinet,fg60e)
+fortinet,fg60e|fortinet,fg100e)
 	RAMFS_COPY_BIN="$RAMFS_COPY_BIN cmp head sha256sum fgt-sector0"
 	;;
 esac
