@@ -12,7 +12,7 @@ caps="$(fgtwrt_caps_file)" || exit 0
 if [ -n "$(jsonfilter -i "$caps" -e '@.fan.hwmon')" ] &&
    [ -z "$(uci -q get fgtwrt.fan)" ]; then
 	uci set fgtwrt.fan=fan
-	uci set fgtwrt.fan.profile=default
+	uci set fgtwrt.fan.profile="$(jsonfilter -i "$caps" -e '@.fan.default_profile' || echo default)"
 fi
 
 # Software calibration of the CPU sensor (per board, set from the command

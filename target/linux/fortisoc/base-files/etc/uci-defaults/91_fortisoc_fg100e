@@ -1,7 +1,7 @@
 #!/bin/sh
 # FortiGate 100E: drop packets whose source address the route back does not
 # reach through the interface they came in on (conntrack matches a flow
-# whatever the interface), and restore the fan profile at each boot.
+# whatever the interface), and take over the fan profile of an earlier image.
 
 . /lib/functions.sh
 
@@ -11,23 +11,25 @@ fortinet,fg100e)
 		net.ipv4.conf.default.rp_filter=1
 		net.ipv4.conf.all.rp_filter=1
 	EOT
-	[ -f /etc/config/fan ] || cat > /etc/config/fan <<-EOT
-		config fan 'main'
-		option profile 'silent'
-
-		# fan 1 on the curve of the board, fan 2 fixed
-		config profile 'performance'
-		option curve '29:1 30:16 37:64 45:144 50'
-		option fan2 'fixed:48'
-		option hysteresis '4'
-
-		# both at minimum speed up to 40 degrees
-		config profile 'silent'
-		option curve '40:0 45:80 50:128 55:200 60'
-		option fan2 'follow'
-		option hysteresis '4'
-	EOT
-	/etc/init.d/fan-profile enable
+	# The fan profile moved to /etc/config/fgtwrt (fgtwrt service): take
+	# over the one of an earlier image, a profile of its own as "custom".
+	if [ -f /etc/config/fan ]; then
+		p="$(uci -q get fan.main.profile)"
+		case "$p" in
+		silent|performance) ;;
+		?*)
+			uci set fgtwrt.fan.curve="$(uci -q get "fan.$p.curve")"
+			uci set fgtwrt.fan.fan2="$(uci -q get "fan.$p.fan2")"
+			uci set fgtwrt.fan.hysteresis="$(uci -q get "fan.$p.hysteresis")"
+			p=custom
+			;;
+		esac
+		[ -n "$p" ] && uci set fgtwrt.fan.profile="$p"
+		r="$(uci -q get fan.main.fail_rpm)"
+		[ -n "$r" ] && uci set fgtwrt.fan.fail_rpm="$r"
+		uci commit fgtwrt
+		rm -f /etc/config/fan
+	fi
 	;;
 esac
 

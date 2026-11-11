@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fan monitor of the FortiGate 100E. A fan below fan.main.fail_rpm (default
+# Fan monitor of the FortiGate 100E. A fan below fgtwrt.fan.fail_rpm (default
 # 1000; the minimum speed is about 3700 rpm) on two readings in a row counts
 # as failed:
 #   one fan failed    ALARM orange, STATUS red
@@ -49,7 +49,7 @@ show() {
 state=0
 last=0
 while :; do
-	limit="$(uci -q get fan.main.fail_rpm)"
+	limit="$(uci -q get fgtwrt.fan.fail_rpm)"
 	limit="${limit:-1000}"
 	n=0
 	for f in 1 2; do

@@ -1,26 +1,32 @@
 #!/bin/sh
-# Fan profiles of the FortiGate 100E, from /etc/config/fan. The hardware
-# monitor (NCT7802Y) drives the fans by itself from what is set here, also if
-# the system hangs: one curve on temp1, the only temperature source in use.
-# Each fan output has its own curve in the chip: "follow" writes the curve of
-# the profile to both. The fans keep their minimum speed at duty 0: they
-# cannot be stopped.
+# Fan curve of the FortiGate 100E. The hardware monitor (NCT7802Y) drives
+# the fans by itself from what is set here, also if the system hangs: one
+# curve on temp1, the only temperature source in use. Each fan output has
+# its own curve in the chip; with fan 2 "follow" the curve is written to
+# both. The fans keep their minimum speed at duty 0: they cannot be
+# stopped.
 #
-# A profile section holds:
-#   curve        "t:duty t:duty t:duty t:duty t": 4 points, degrees C rising,
-#                duty 0-255, then the temperature of full speed
-#   fan2         "follow" (same curve as fan 1) or "fixed:duty"
-#   hysteresis   degrees (0-7) the temperature must fall before the duty does
+# The profile is chosen in /etc/config/fgtwrt (section "fan", applied by
+# the fgtwrt service, strategy "nct7802" of
+# /usr/share/fgtwrt/models/fg100e.json):
+#   profile      default (the curve the board comes up with), silent,
+#                performance or custom
+#   curve        custom: "t:duty t:duty t:duty t:duty t", 4 points, degrees
+#                C rising, duty 0-255, then the temperature of full speed
+#   fan2         custom: "follow" (same curve as fan 1) or "fixed:duty"
+#   hysteresis   custom: degrees (0-7) the temperature must fall before
+#                the duty does
 #
-# usage: fan-profile              show the state
-#        fan-profile NAME         apply and save profile NAME
-#        fan-profile --boot       apply the saved profile if it is not the
-#                                 state the board comes up in
+# usage: fan-profile                    show the state
+#        fan-profile NAME               select and save profile NAME
+#        fan-profile --apply CURVE FAN2 HYST
+#                                       write a curve (fgtwrt service)
 
 I2C="-f -y 0 0x28"
 REG_DUTY2=0x61
 REG_MAP=0x64		# bit 0: temp1 drives fan 1, bit 1: fan 2
 REG_HYST=0x74		# bits 2:0
+STATE=/var/run/fgtwrt/fan-nct7802
 
 hw=
 for d in /sys/class/hwmon/hwmon*; do
@@ -75,20 +81,17 @@ show() {
 	local map
 
 	map="$(i2cget $I2C $REG_MAP)"
-	echo "profile $(uci -q get fan.main.profile || echo performance)"
+	echo "profile $(uci -q get fgtwrt.fan.profile || echo default)"
 	echo "fan1 duty $(cat "$hw/pwm1") $(cat "$hw/fan1_input") rpm"
 	echo "fan2 duty $(cat "$hw/pwm2") $(cat "$hw/fan2_input") rpm" \
 		"$([ $((map & 2)) -ne 0 ] && echo follow || echo fixed)"
 	echo "temp1 $(cat "$hw/temp1_input") hysteresis $(($(i2cget $I2C $REG_HYST) & 7))"
 }
 
-load() {
-	local name="$1" curve fan2 hyst map
+# <curve> <fan2> <hysteresis>
+apply() {
+	local curve="$1" fan2="$2" hyst="$3" map
 
-	[ "$(uci -q get "fan.$name")" = profile ] || die "no profile $name"
-	curve="$(uci -q get "fan.$name.curve")"
-	fan2="$(uci -q get "fan.$name.fan2")"
-	hyst="$(uci -q get "fan.$name.hysteresis")"
 	check_curve "$curve"
 	range "$hyst" 0 7 || die "hysteresis 0-7"
 	case "$fan2" in
@@ -109,6 +112,8 @@ load() {
 		"$((($(i2cget $I2C $REG_HYST) & 0xf8) | hyst))"
 	i2cset $I2C $REG_MAP "$map"
 	[ "$map" = 1 ] && i2cset $I2C $REG_DUTY2 "${fan2#fixed:}"
+	mkdir -p "${STATE%/*}"
+	echo "$curve|$fan2|$hyst" > "$STATE"
 	return 0
 }
 
@@ -116,18 +121,23 @@ case "$1" in
 "")
 	show
 	;;
---boot)
-	p="$(uci -q get fan.main.profile)"
-	[ -n "$p" ] && [ "$p" != performance ] && load "$p"
-	exit 0
+--apply)
+	[ $# = 4 ] || die "--apply CURVE FAN2 HYST"
+	apply "$2" "$3" "$4"
 	;;
 -*)
-	echo "usage: $0 [NAME|--boot]" >&2
+	echo "usage: $0 [NAME|--apply CURVE FAN2 HYST]" >&2
 	exit 1
 	;;
 *)
-	load "$1"
-	uci set fan.main.profile="$1" && uci commit fan
+	case "$1" in
+	default|silent|performance|custom) ;;
+	*) die "profile is default, silent, performance or custom" ;;
+	esac
+	uci set fgtwrt.fan.profile="$1" && uci commit fgtwrt
+	/etc/init.d/fgtwrt reload
+	# the service logs a refused curve and puts back the board curve
+	logread -l 3 -e 'fgtwrt' 2>/dev/null | grep -F 'fan:' | tail -1
 	show
 	;;
 esac

@@ -68,8 +68,9 @@ function fan_status(fan) {
 		enable: rdint(p + '_enable'),
 		target: rdint(p + '_target'),
 		tolerance: rdint(p + '_tolerance'),
-		// hardware table (SmartFan III+), when the driver exposes it
-		points: map([ 1, 2, 3 ], (i) => ({
+		// hardware table (SmartFan III+: 3 points; NCT7802Y: 4 points and
+		// the temperature of full speed), when the driver exposes it
+		points: map((fan.strategy == 'nct7802') ? [ 1, 2, 3, 4, 5 ] : [ 1, 2, 3 ], (i) => ({
 			mdeg: rdint(p + '_auto_point' + i + '_temp'),
 			pwm: rdint(p + '_auto_point' + i + '_pwm')
 		})),
@@ -82,6 +83,11 @@ function fan_status(fan) {
 		// board temperature guard of the custom table on the CPU sensor
 		guard: rd('/var/run/fgtwrt/guard-pwm' + fan.pwm),
 		rpm: fan.fan ? rdint(d + '/fan' + fan.fan + '_input') : null,
+		// second fan (NCT7802Y): duty cycle and speed
+		pwm2: fan.pwm2 ? rdint(d + '/pwm' + fan.pwm2) : null,
+		rpm2: fan.fan2 ? rdint(d + '/fan' + fan.fan2 + '_input') : null,
+		// curve, fan 2 mode and hysteresis last written by fan-profile
+		applied: (fan.strategy == 'nct7802') ? rd('/var/run/fgtwrt/fan-nct7802') : null,
 		overridden: stat('/var/run/fgtwrt/fan-pwm' + fan.pwm + '.orig') != null,
 		temps: map(fan.temps ?? [], (t) => {
 			let td = hwmon_dir(t.hwmon);

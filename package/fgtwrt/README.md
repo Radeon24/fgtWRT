@@ -7,8 +7,7 @@ through the `fgtwrt` service. `luci-app-fgtwrt` adds System → fgtWRT to
 LuCI: an overview, and the fan and USB management port pages on the
 models that have them. Both are in the image of every published FortiGate
 profile (60D, 90D, 60E; the 100D profile when its subtarget is merged)
-and of the 100E profile (no fan entry: its fans follow the curve set by
-`fan-profile`).
+and of the 100E profile.
 
 ## Fan (FortiGate 100D)
 
@@ -87,6 +86,28 @@ current mode, 0 as set by 0x5d), read only. Loaded with
 `cputin_mode_write=1`, it can be written, for a diagnostic comparison of
 both modes only: never in the configuration of a board. The boot firmware
 sets it again at the next reset.
+
+## Fan (FortiGate 100E)
+
+The NCT7802Y hardware monitor of the 100E drives both fans by itself
+from a curve on its board sensor (temp1): four points (temperature, duty
+cycle 0-255) and the temperature of full speed, a hysteresis of 0-7 C
+before the duty cycle goes down, and fan 2 either on the same curve or
+at a fixed duty cycle. The fans cannot be stopped: duty cycle 0 is their
+lowest speed (about 3700 rpm). The `nct7802` strategy writes the curve of
+the profile once with `fan-profile --apply`; the chip keeps it until the
+next power cycle, also if the system hangs.
+
+Profiles: `default` (the curve the board comes up with, the same as
+`performance`), `silent` (the default of the 100E profile: both fans at
+the lowest speed up to 40 C), `performance` (fan 1 on the curve of the
+board, fan 2 fixed at 48) and `custom` (options `curve`, `fan2` and
+`hysteresis` of the section `fan`). On stop the curve of power-on is put
+back; a custom curve that `fan-profile` refuses (temperatures not rising,
+above 70 C, bad duty cycles) leaves that curve too and is logged.
+`fan-profile NAME` selects a profile from the command line, `fan-profile`
+shows the state. `fan-monitor` lights ALARM and STATUS when a fan stays
+below `fail_rpm` (default 1000).
 
 ## USB management port (60D, 90D, 100D)
 
