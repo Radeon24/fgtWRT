@@ -71,6 +71,7 @@ define Device/fortinet_fg-100e
 	kmod-crypto-chacha20poly1305 kmod-crypto-sha256 \
 	luci kmod-wireguard wireguard-tools openvpn-openssl \
 	kmod-ovpn-backports openssl-util fgtwrt-base luci-app-fgtwrt conntrack \
+	strongswan strongswan-default strongswan-mod-openssl luci-app-strongswan-swanctl \
 	kmod-gpio-button-hotplug r8a779x-usb3-firmware i2c-tools kmod-hwmon-nct7802 \
 	kmod-usb-storage kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1
   SUPPORTED_DEVICES := fortinet,fg100e
