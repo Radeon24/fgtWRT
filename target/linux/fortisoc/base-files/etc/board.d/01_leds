@@ -63,6 +63,16 @@ fortinet,fg60e)
 			"$phy:green:wan" "wan$port" "link tx rx"
 	done
 	;;
+fortinet,fg100e)
+	# STATUS is driven by diag.sh through the led-* aliases of the device
+	# tree (green blinking while booting, green once running, red
+	# blinking in failsafe and during an upgrade). On a kernel panic ALARM
+	# red blinks and STATUS goes dark (panic-indicator). A failed fan
+	# turns ALARM orange or red and STATUS red (fan-monitor). HA is
+	# listed for the LED configuration, off and without a trigger.
+	ucidef_set_led_default "ha_green" "HA green" "green:ha" "0"
+	ucidef_set_led_default "ha_red" "HA red" "red:ha" "0"
+	;;
 esac
 
 board_config_flush

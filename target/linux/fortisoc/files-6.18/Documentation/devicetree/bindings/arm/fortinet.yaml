@@ -44,7 +44,9 @@ properties:
           - const: fortinet,fsoc2
       - description: FortiSOC3 based boards
         items:
-          - const: fortinet,fg60e
+          - enum:
+              - fortinet,fg60e
+              - fortinet,fg100e
           - const: fortinet,fsoc3
 
 additionalProperties: true

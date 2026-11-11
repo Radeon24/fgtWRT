@@ -1,0 +1,68 @@
+#!/bin/sh
+# Fan monitor of the FortiGate 100E. A fan below fgtwrt.fan.fail_rpm (default
+# 1000; the minimum speed is about 3700 rpm) on two readings in a row counts
+# as failed:
+#   one fan failed    ALARM orange, STATUS red
+#   both fans failed  ALARM red, STATUS red
+#   both running      ALARM off, STATUS back to green
+# The LEDs are only touched while a fan has failed and when it recovers.
+
+INTERVAL=5
+
+hw=
+for d in /sys/class/hwmon/hwmon*; do
+	[ "$(cat "$d/name" 2>/dev/null)" = nct7802 ] && hw=$d
+done
+[ -n "$hw" ] || { echo "no hardware monitor" >&2; exit 1; }
+
+# <led> <0|1>
+led() {
+	echo none > "/sys/class/leds/$1/trigger"
+	echo "$2" > "/sys/class/leds/$1/brightness"
+}
+
+# <failed fans>: either colour of a bicolour LED only lights while the
+# other one is off, so the colour that goes off is written first
+show() {
+	case "$1" in
+	0)
+		led orange:alarm 0
+		led red:alarm 0
+		led red:status 0
+		led green:status 1
+		;;
+	1)
+		led red:alarm 0
+		led orange:alarm 1
+		led green:status 0
+		led red:status 1
+		;;
+	2)
+		led orange:alarm 0
+		led red:alarm 1
+		led green:status 0
+		led red:status 1
+		;;
+	esac
+}
+
+state=0
+last=0
+while :; do
+	limit="$(uci -q get fgtwrt.fan.fail_rpm)"
+	limit="${limit:-1000}"
+	n=0
+	for f in 1 2; do
+		rpm="$(cat "$hw/fan${f}_input" 2>/dev/null)"
+		[ "${rpm:-0}" -lt "$limit" ] && n=$((n + 1))
+	done
+	if [ "$n" = "$last" ] && [ "$n" != "$state" ]; then
+		logger -t fan-monitor "fans failed: $n (below $limit rpm)"
+		state=$n
+		show "$state"
+	elif [ "$state" != 0 ]; then
+		show "$state"
+	fi
+	last=$n
+	sleep "$INTERVAL"
+done

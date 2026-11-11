@@ -1,0 +1,62 @@
+{
+	"id": "fg100e",
+	"name": "FortiGate 100E",
+	"fan": {
+		"hwmon": "nct7802",
+		"pwm": 1,
+		"fan": 1,
+		"pwm2": 2,
+		"fan2": 2,
+		"strategy": "nct7802",
+		"factory": "performance",
+		"default_profile": "silent",
+		"temps": [
+			{
+				"hwmon": "nct7802",
+				"input": 1,
+				"label": "board (temp1)"
+			},
+			{
+				"hwmon": "nct7802",
+				"input": 4,
+				"label": "monitor chip (temp4)"
+			}
+		],
+		"profiles": {
+			"silent": {
+				"curve": "40:0 45:80 50:128 55:200 60",
+				"fan2": "follow",
+				"hysteresis": 4
+			},
+			"performance": {
+				"curve": "29:1 30:16 37:64 45:144 50",
+				"fan2": "fixed:48",
+				"hysteresis": 4
+			}
+		},
+		"custom": {
+			"t_max": 70,
+			"hysteresis_max": 7,
+			"default_curve": "40:0 45:80 50:128 55:200 60",
+			"default_fan2": "follow",
+			"default_hysteresis": 4
+		}
+	},
+	"usb": {
+		"host": true,
+		"gadget": null
+	},
+	"np": {
+		"module": "fortinet_np6lite",
+		"params": [
+			"ft_nat66",
+			"ft_udp",
+			"ft_cnt_ms",
+			"bridge_offload"
+		]
+	},
+	"leds": [],
+	"leds_missing": [],
+	"button": null,
+	"watchdog": "fsoc3-wdt"
+}

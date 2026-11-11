@@ -8,7 +8,9 @@
 # "smartfan" strategy, the table of the chip is rewritten once; the
 # "custom" profile writes the user's three points, on the board sensor or
 # on the calibrated CPU sensor, the latter with a board temperature guard
-# run here). USB
+# run here; with the "nct7802" strategy, /usr/sbin/fan-profile writes the
+# curve of the profile to the chip, and the curve the board comes up with
+# on stop). USB
 # management port: the mode ("off", "console" or "network") selects a
 # preset of the usbgadget package (section "fgtwrt" of
 # /etc/config/usbgadget); "console" adds a login on /dev/ttyGS0,
@@ -116,6 +118,45 @@ fan_custom() {
 	procd_close_instance
 }
 
+# Curve of the NCT7802Y (FortiGate 100E): the chip follows a curve of four
+# points and a full speed temperature on temp1 by itself; the profile
+# "default" is the curve the board comes up with (capability "factory"),
+# "custom" the curve, fan 2 mode and hysteresis of the section, checked
+# again by fan-profile. A refused curve puts back the one the board comes
+# up with, as the other strategies do with the firmware values.
+FAN_NCT7802=/usr/sbin/fan-profile
+
+fan_nct7802() {
+	local caps="$1" profile="$2" curve fan2 hyst
+
+	[ "$profile" = default ] &&
+		profile="$(jsonfilter -i "$caps" -e '@.fan.factory')"
+	if [ "$profile" = custom ]; then
+		config_get curve fan curve "$(jsonfilter -i "$caps" -e '@.fan.custom.default_curve')"
+		config_get fan2 fan fan2 "$(jsonfilter -i "$caps" -e '@.fan.custom.default_fan2')"
+		config_get hyst fan hysteresis "$(jsonfilter -i "$caps" -e '@.fan.custom.default_hysteresis')"
+	else
+		curve="$(jsonfilter -i "$caps" -e "@.fan.profiles.$profile.curve")"
+		fan2="$(jsonfilter -i "$caps" -e "@.fan.profiles.$profile.fan2")"
+		hyst="$(jsonfilter -i "$caps" -e "@.fan.profiles.$profile.hysteresis")"
+	fi
+	[ -n "$curve" ] || {
+		fan_err "profile '$profile' unknown on this board"
+		return 1
+	}
+	rm -f /var/run/fgtwrt/fan-nct7802
+	"$FAN_NCT7802" --apply "$curve" "$fan2" "$hyst" 2>&1 |
+		logger -t fgtwrt -p daemon.err
+	[ -s /var/run/fgtwrt/fan-nct7802 ] &&
+		[ "$(cat /var/run/fgtwrt/fan-nct7802)" = "$curve|$fan2|$hyst" ] || {
+		fan_err "profile '$profile' refused"
+		[ "$profile" = "$(jsonfilter -i "$caps" -e '@.fan.factory')" ] ||
+			fan_nct7802 "$caps" default
+		return 1
+	}
+	logger -t fgtwrt "fan: profile $profile"
+}
+
 fan_start() {
 	local caps pwm profile strategy mode target tol curve min crit
 	local n temps fan factory interval duty points
@@ -123,6 +164,17 @@ fan_start() {
 	caps="$(fgtwrt_caps_file)" || return 0
 	pwm="$(fan_pwm_path "$caps")" || return 0
 	config_get profile fan profile default
+	case "$profile" in
+	*[!a-z0-9_]*|'')
+		logger -t fgtwrt -p daemon.err "fan: bad profile name '$profile'"
+		return 1
+		;;
+	esac
+	strategy="$(jsonfilter -i "$caps" -e '@.fan.strategy')"
+	if [ "$strategy" = nct7802 ]; then
+		fan_nct7802 "$caps" "$profile"
+		return
+	fi
 	factory="$(jsonfilter -i "$caps" -e '@.fan.factory')"
 
 	# Anything a previous profile left (crash, kill -9, warm reboot when
@@ -130,14 +182,7 @@ fan_start() {
 	"$FAN" -p "$pwm" ${factory:+-D "$factory"} -R
 
 	[ "$profile" = default ] && return 0
-	case "$profile" in
-	*[!a-z0-9_]*|'')
-		logger -t fgtwrt -p daemon.err "fan: bad profile name '$profile'"
-		return 1
-		;;
-	esac
 
-	strategy="$(jsonfilter -i "$caps" -e '@.fan.strategy')"
 	case "$strategy" in
 	smartfan)
 		# Table followed by the chip itself: written once, the hardware
@@ -274,6 +319,10 @@ service_stopped() {
 	local caps pwm factory
 	caps="$(fgtwrt_caps_file)" || return 0
 	pwm="$(fan_pwm_path "$caps")" || return 0
+	if [ "$(jsonfilter -i "$caps" -e '@.fan.strategy')" = nct7802 ]; then
+		fan_nct7802 "$caps" default
+		return 0
+	fi
 	factory="$(jsonfilter -i "$caps" -e '@.fan.factory')"
 	"$FAN" -p "$pwm" ${factory:+-D "$factory"} -R
 }

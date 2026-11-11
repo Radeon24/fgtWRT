@@ -38,8 +38,8 @@ service life. Its goal is to run a standard OpenWrt and still use **as much of t
 
 - the **network processor** of the SoC, which forwards routed and NATed flows in hardware
   (NPLite, NP4Lite, NP6Lite) and, on the NP4Lite and the NP6Lite, encrypts outbound IPsec traffic;
-- the **crypto engines** (VPN_LITE on SoC1, the VPN engine integrated in SoC2), exposed to the
-  Linux crypto API (used by IPsec, for instance);
+- the **crypto engines** (VPN_LITE on SoC1, the VPN engine integrated in SoC2, the engines of SoC3 on the
+  100E), exposed to the Linux crypto API (used by IPsec, for instance);
 - the switches, PHYs, LEDs, buttons, RTC and storage of each board.
 
 It adds a `fortisoc` target[^fortisoc-name] to OpenWrt for the Fortinet **FortiSOC** family of SoCs:
@@ -48,7 +48,7 @@ It adds a `fortisoc` target[^fortisoc-name] to OpenWrt for the Fortinet **FortiS
 |---|---|---|---|---|
 | SoC1 (FS1) | Faraday FA626TE (ARMv5) | 525 MHz (60C) | NPLite | VPN_LITE |
 | SoC2 | Faraday FA726TE (ARMv5TE) | 800 MHz (60D), 900 MHz (90D) | NP4Lite | on-chip VPN engine |
-| SoC3 | 4 × ARM Cortex-A9 (VFPv3-D16, no NEON) | 1008 MHz (60E) | NP6Lite | on-chip engine (no driver) |
+| SoC3 | 4 × ARM Cortex-A9 (VFPv3-D16, no NEON) | 1008 MHz (60E), 1000 MHz (100E) | NP6Lite | on-chip engines (`fsoc3-*`, enabled on the 100E only) |
 
 The CPU clock depends on the model: the 60D and the 90D share the same SoC2 but run at different clocks.
 
@@ -84,6 +84,7 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 | FortiGate 60E | SoC3 | 1008 MHz | NP6Lite | on-chip engine (no driver) | BCM53128 | ✅ **Available** |
 | FortiGate 60C | SoC1 (FS1) | 525 MHz | NPLite | VPN_LITE | Marvell 88E6161 | 📋 **Planned** |
 | FortiGate 100D | x86 PC (no Fortinet SoC) | 1.8 GHz | none | CP8 (no driver) | BCM53314 | 🧪 **Preview** |
+| FortiGate 100E | SoC3 | 1000 MHz | NP6Lite | on-chip engines (`fsoc3-*`) | BCM53344 | 🧪 **Preview** |
 
 - **Available**: image built from this repository, installable with persistent storage (60D, 90D, 60E).
   The published 60E image is built from revision `r0+37780-0b2480e6ba2` (commit `0b2480e6ba2`); the
@@ -92,6 +93,9 @@ a few listed bytes of the boot sector, which the installer opens for the duratio
 - **Preview** (100D): image built from this repository, installable with persistent storage and validated on
   one unit; no published revision yet, so no pinned revision to build from (see
   [Getting started](#getting-started)).
+- **Preview** (100E): image built from this repository and validated on one unit; installable to the internal
+  eMMC with persistent storage as on the 60E (installation, boot, persistence and an update with `sysupgrade`
+  validated once; back to the stock firmware with [B] not tested yet; see the 100E section in [Devices](#devices)).
 - **Planned**: no OpenWrt profile in the tree yet.
 
 ## Hardware acceleration
@@ -117,19 +121,19 @@ Routing/NAT Offloading → Hardware flow offloading* (`flow_offloading_hw` in `/
 | IPv4 SNAT / DNAT, with port translation | 🧪 | ✅ | ✅ | NP6Lite: 48440 concurrent IPv4 NAT connections, all offloaded, on the 60E |
 | IPv6 routing, TCP and UDP | — | — | ✅ | NPLite and NP4Lite flow entries are IPv4 only: IPv6 is always forwarded by the CPU. NP6Lite: 928 Mbit/s each way on the published 60E image |
 | IPv6 NAT | — | — | ✅ | NP6Lite: NAT66 of **one address per flow** (source or destination, NPTv6 included) is offloaded, `ft_nat66` parameter of `fortinet_np6lite` (1 by default; 0 = CPU); a flow with **both** source and destination NAT (SNAT and DNAT combined) stays in software. Validated on the published 60E image (masquerade: 929 / 928 Mbit/s, CPU about 0 %) |
-| ICMP | ❌ | ❌ | ❌ | handled by the CPU: the three NPs can offload ICMP, but the Linux flow table used by the drivers carries TCP and UDP only |
+| ICMP | ❌ | ❌ | ❌ | handled by the CPU: the three NPs can offload ICMP, but the Linux flow table used by the drivers carries TCP and UDP only. Left out on purpose: it would take a kernel patch for control traffic the CPU handles easily |
 | GRE | — | — | — | handled by the CPU. NP6Lite: not supported by the hardware per Fortinet documentation; NP6XLite (FortiGate 40F) to be investigated |
 | 802.1Q VLAN (one tag) | 🧪 | 🧪 | 🧪 | NP4Lite: needs `rx-vlan-offload` and `tx-vlan-offload`, off by default |
-| QinQ / 802.1ad | — | — | ❌ | NPLite / NP4Lite flow entries carry a single tag. NP6Lite: hardware support not established |
-| PPPoE | — | — | ❌ | NP6Lite: hardware support not established |
+| QinQ / 802.1ad | — | — | ❌ | NPLite / NP4Lite flow entries carry a single tag. NP6Lite: not implemented, little use: the session key and the output tag hold one VLAN each, and the switch ports use that VLAN for tag_8021q; such traffic stays on the CPU |
+| PPPoE | — | — | ❌ | NP6Lite: not supported by the hardware (Fortinet: PPPoE session frames are not accelerated by the NP6Lite) |
 | Flows through the ports of the switch | ❌ | ✅ | 🧪 | NP4Lite: one logical interface per switch port in the device tree, validated on the 60D and the 90D; frames from the CPU to the switch ports are dropped when offloaded traffic saturates the NP–switch link (see [Known limitations](#known-limitations)). NP6Lite: `dmz`, single switch ports, bonds of switch ports and bridged switch ports; `dmz` and a bridge over `dmz` validated on the previous published 60E image, the other cases on test kernels and earlier images |
 | Link aggregation (bonding) endpoints | ❌ | ✅ | 🧪 | NPLite / NP4Lite: no aggregation in the NP itself, the bond is handled by the driver. NPLite: driver code, not tested. NP4Lite: active-backup, balance-xor, 802.3ad (LACP validated on the 60D and the 90D); the switch chips aggregate their own ports (90D: groups within one switch chip, two groups at most for both chips). NP6Lite: bonds of switch ports; a bond of `wan1` + `wan2` is offloaded through the output trunk of the NP (`ft_trunk` parameter, 2 by default): in the published image, validated on our reference kernel builds, **not tested under OpenWrt yet** |
 | Offloaded connections | 4096 connections (8192 flow entries) | **4096 connections** (8192 flow entries, one per direction) | 65536 connections | driver limit; further connections stay on the CPU. NP6Lite: also the default conntrack limit of OpenWrt |
-| Per-flow byte / packet counters | 🧪 | 🧪 | ❌ | NPLite: about a hundred counters only. NP4Lite: limited number of counters. NP6Lite: activity only |
+| Per-flow byte / packet counters | 🧪 | 🧪 | 🧪 | NPLite: about a hundred counters only. NP4Lite: limited number of counters. NP6Lite: sessions count windows of up to 0xffc000 bytes or 0xffc0 packets, which also restart after the entry timeout (40 s); the driver tells each restart by the window's start time, sums them and queries fast flows every 50 ms (`ft_cnt_ms`); exact on the 100E once a flow is fast, a burst on a flow that was slow before may be off by a few windows at its start; needs `counter` on the flowtable and `nf_conntrack_acct` |
 | L2 bridge / FDB offload in the NP | — | — | — | bridging is done by the switch chip |
 | QoS / shaping offload | ❌ | — | ❌ | NP4Lite: no traffic shaping in the hardware |
 | **Inline IPsec (ESP) in the NP** | | | | |
-| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | ✅ outbound | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on both. NP6Lite: **outbound only**: outbound packets are encrypted by the NP (about 727 Mbit/s), **inbound packets are decrypted in software** (inbound offload not written yet); package `kmod-fortinet-np6lite-ipsec`, in the 60E profile; validated on the published 60E image |
+| ESP tunnel mode, IPv4 in IPv4 | — | ✅ | ✅ outbound | NPLite: IPsec goes through VPN_LITE (see below). NP4Lite: **outbound** packets are encrypted by the NP; **inbound** packets are decrypted by the NP and then forwarded by the CPU. Package `kmod-fortinet-np4lite-ipsec`, in the 60D and 90D images; validated on both. NP6Lite: outbound packets are encrypted by the NP (about 727 Mbit/s); inbound packets are decrypted by the NP, with anti-replay (inbound offload validated on a 100E; `ipsec_outbound_only=1` keeps inbound in software); package `kmod-fortinet-np6lite-ipsec`, in the 60E and 100E profiles; outbound validated on the published 60E image and on a 100E |
 | ESP ciphers | — | AES-CBC 128/192/256, 3DES-CBC | AES-CBC, 3DES-CBC (outbound) | as implemented in the drivers; measured with AES-128-CBC |
 | ESP integrity | — | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 | HMAC-MD5-96, HMAC-SHA1-96, HMAC-SHA256-128 (outbound) | as implemented in the drivers; measured with HMAC-SHA1-96 (NP4Lite) and HMAC-SHA256-128 (NP6Lite) |
 | ESN, NAT-T, transport mode | — | ❌ | ❌ | handled in software |
@@ -149,25 +153,37 @@ NAT and crypto run on the CPU, and the CP8 crypto engine has no driver in the im
 
 ### Crypto engines
 
-| Feature (Linux crypto API) | VPN_LITE<br>(SoC1) | VPN engine<br>(SoC2) | SoC3<br>(no driver) | Notes |
+| Feature (Linux crypto API) | VPN_LITE<br>(SoC1) | VPN engine<br>(SoC2) | crypto engines<br>(SoC3, 100E) | Notes |
 |---|:---:|:---:|:---:|---|
-| `cbc(aes)` 128/192/256 | 🧪 | ✅ | ❌ | requests under 256 bytes go to software |
-| `cbc(des3_ede)`, `cbc(des)` | 🧪 | 🧪 | ❌ | |
-| `authenc(hmac(sha1\|md5),cbc(aes\|des3_ede))` | 🧪 | ✅ | ❌ | 96-bit ICV; SoC2: used by software IPsec with AES-128-CBC + HMAC-SHA1 |
-| `authenc(hmac(sha256),…)`, `authenc(hmac(sha512),…)` | — | 🧪 | ❌ | 128-bit and 256-bit ICV |
-| HMAC-SHA384 | — | ❌ | ❌ | SoC2: wrong ICVs in our tests, left to software |
-| AES-GCM, AES-CTR, AES-ECB, ChaCha20-Poly1305 | — | — | ❌ | software (generic C code); SoC3: the engine supports AES-GCM, no driver yet; the other modes: hardware support not established |
-| Hash only (ahash) | ❌ | ❌ | ❌ | hardware support not established |
+| `cbc(aes)` 128/192/256 | 🧪 | ✅ | 🧪 | SoC1/SoC2: requests under 256 bytes go to software |
+| `cbc(des3_ede)`, `cbc(des)` | 🧪 | 🧪 | 🧪 | |
+| `authenc(hmac(sha1\|md5),cbc(aes\|des3_ede))` | 🧪 | ✅ | 🧪 | 96-bit ICV; SoC2: used by software IPsec with AES-128-CBC + HMAC-SHA1; SoC3: the ICV of a decryption is checked by encrypting the plaintext again on the engine |
+| `authenc(hmac(sha256),…)`, `authenc(hmac(sha512),…)` | — | 🧪 | 🧪 | 128-bit and 256-bit ICV |
+| HMAC-SHA384 | — | ❌ | 🧪 | SoC2: wrong ICVs in our tests, left to software; SoC3: right, as `authenc(hmac(sha384),…)` (192-bit ICV) |
+| `rfc4106(gcm(aes))` (AES-GCM for IPsec) | — | — | 🧪 | SoC3: 128/192/256-bit keys, 8/12/16-byte tags, without ESN; the tag of a decryption is checked by encrypting the plaintext again on the engine; other cases go to software |
+| `gcm(aes)` | — | — | 🧪 | SoC3: AD of up to 8 bytes, texts of any length up to 16 KiB, 4–16-byte tags (the OpenVPN data channel offload uses 8 bytes of AD); the engine takes the IPsec layout only, the driver fits the request into it and corrects the tag in software; other cases (TLS, MACsec, more AD) go to software |
+| AES-CTR, AES-ECB, ChaCha20-Poly1305 | — | — | ❌ | software (generic C code); SoC3: CTR does not fit (the engine starts the GCM counter at 2, RFC 3686 needs 1); ECB and ChaCha20-Poly1305 not found |
+| Hash only (ahash) | ❌ | ❌ | ❌ | hardware support not established; SoC3: the engine rejects the hash-only commands tried |
 
 **Notes.**
 
 - The Linux crypto driver is called `fortinet-cp7` (algorithms `*-cp7`); it drives the VPN_LITE engine
   of SoC1 and the VPN engine integrated in SoC2 (both possibly derived from Fortinet's CP7 design; no CP7 was
   available for comparison, so this is not confirmed).
-- **SoC3** (60E) has an on-chip crypto engine, but no driver yet.
+- **SoC3 (FortiGate 100E)**: `fsoc3-cp` drives the symmetric engine (the CP7 descriptors, fed through host
+  TX queue 16 of the NP6Lite queue fabric; algorithms `*-fsoc3`), `fsoc3-pkce` the public key engine
+  (`rsa-fsoc3`, raw RSA up to 4064-bit moduli, decryption by the CRT; 4096-bit encryption goes to software)
+  and `fsoc3-trng` the random number generator (`/dev/hwrng`). Packages `kmod-fortinet-fsoc3-*`
+  (`package/kernel/fortinet-fsoc3`); their device tree nodes are in `fsoc3-crypto.dtsi`, which only the 100E
+  device tree includes. Checked on a 100E against the software implementations, with ESP and with the
+  OpenVPN data channel offload between two network namespaces.
+  `/sys/bus/platform/drivers/fsoc3-cp/*/stats` counts the descriptors run on the engine and the requests
+  left to software.
 - **WireGuard** and **OpenVPN** have no hardware acceleration and run on the CPU. OpenVPN uses its kernel
   data channel (DCO, the mainline `ovpn` module) when the cipher allows it, ChaCha20-Poly1305 for instance;
-  AES-256-CBC stays in user space.
+  AES-256-CBC stays in user space. **SoC3:** with AES-GCM the OpenVPN data channel offload goes through
+  `fsoc3-cp` (`gcm(aes)`); on the 100E, both tunnel ends on the same SoC, 114 Mbit/s against 43 Mbit/s
+  with the software implementation and 58 Mbit/s with OpenVPN in user space.
 
 ## Getting started
 
@@ -199,11 +215,11 @@ make menuconfig
 
 In `make menuconfig`, select:
 
-| Option | FortiGate 60D | FortiGate 90D | FortiGate 60E | FortiGate 100D |
-|---|---|---|---|---|
-| Target System | `Fortinet FortiSOC` | `Fortinet FortiSOC` | `Fortinet FortiSOC` | `x86` |
-| Subtarget | `FortiSOC2` | `FortiSOC2` | `FortiSOC3` | `Fortinet FortiGate (x86)` |
-| Target Profile | `FortiGate 60D` | `FortiGate 90D` | `FortiGate 60E` | `FortiGate 100D` |
+| Option | FortiGate 60D | FortiGate 90D | FortiGate 60E | FortiGate 100D | FortiGate 100E |
+|---|---|---|---|---|---|
+| Target System | `Fortinet FortiSOC` | `Fortinet FortiSOC` | `Fortinet FortiSOC` | `x86` | `Fortinet FortiSOC` |
+| Subtarget | `FortiSOC2` | `FortiSOC2` | `FortiSOC3` | `Fortinet FortiGate (x86)` | `FortiSOC3` |
+| Target Profile | `FortiGate 60D` | `FortiGate 90D` | `FortiGate 60E` | `FortiGate 100D` | `FortiGate 100E` |
 
 The device profile brings the drivers, the firewall with hardware flow offload, IPsec (IPv4 and IPv6, with
 the outbound offload of the NP: NP4Lite on the 60D and the 90D, NP6Lite on the 60E) and the installer. It
@@ -235,6 +251,8 @@ packages built in.
 
 The 100D profile is described in its own section ([Devices](#devices)): it brings the switch driver, the
 tools of what the switch offloads, LuCI and the fan control, but neither WireGuard nor OpenVPN.
+The 100E profile is that of the 60E, plus
+the crypto engines and the hardware monitor ([Devices](#devices)).
 
 **Which revision builds the published image.**
 
@@ -243,6 +261,7 @@ tools of what the switch offloads, LuCI and the fan control, but neither WireGua
 | 60D, 90D | commit `59b1585d5e1` | see [Known limitations](#known-limitations) for later revisions |
 | 60E | commit `0b2480e6ba2` (`r0+37780-0b2480e6ba2`) | exact recipe below |
 | 100D | head of the `fgtwrt` branch | no image published and no revision pinned yet: this README describes the state of the branch |
+| 100E | head of the `fgtwrt` branch | as the 100D |
 
 Then build:
 
@@ -259,6 +278,10 @@ for the 60D, `bin/targets/fortisoc/fsoc2/openwrt-fortisoc-fsoc2-fortinet_fg-60d-
 This **single file** is used for both steps: the TFTP boot to RAM and the installation with `sysupgrade`.
 On the 60D and the 90D, the build refuses a kernel file too large for the boot loader (see the 60D section);
 the 100D build has the same kind of checks (see its section).
+
+On the 100E, the three target lines are those of the 60E with the device
+`CONFIG_TARGET_fortisoc_fsoc3_DEVICE_fortinet_fg-100e=y`; the image is
+`bin/targets/fortisoc/fsoc3/openwrt-fortisoc-fsoc3-fortinet_fg-100e-initramfs-kernel.bin`.
 
 On the 100D, `make menuconfig` can be replaced by the three target lines, without any other setting:
 
@@ -329,7 +352,8 @@ Pre-built images may be published later; until then, build from source.
    device profiles).
 
    The 100D has its own layout (`port1`…`port16` bridged as LAN, `wan1` as WAN and `wan2` as a second DHCP
-   WAN; `dmz`, `mgmt`, `ha1` and `ha2` not configured): see its section.
+   WAN; `dmz`, `mgmt`, `ha1` and `ha2` not configured): see its section. The 100E: `port1`…`port16`
+   bridged as LAN, `wan1` as WAN; `dmz`, `wan2`, `mgmt`, `ha1` and `ha2` not configured.
 
 Everything runs in RAM: **nothing is written to the appliance**, and all changes are lost at the next reboot.
 (100D exception: this holds on a unit where OpenWrt was never installed. Once partition 2 holds OpenWrt, the
@@ -373,6 +397,10 @@ notes.
 
 Each step is read back and verified. The write windows are then closed again, and the appliance reboots into
 OpenWrt. On the first boot the persistent area is formatted (ext4) and your configuration is restored.
+
+LuCI then shows "System running in recovery (initramfs) mode." This is expected: the boot loader loads a
+kernel with an initramfs, and procd reports the root file system as `initramfs` even though the persistent
+overlay is mounted on top of it. Settings and `sysupgrade` with kept configuration work as usual.
 
 ### 4. Update
 
@@ -895,7 +923,7 @@ without DCO.
 | Bond of `wan1` + `wan2` offloaded (NP trunk) | 🧪 Partial: in the image; validated on our reference kernel builds (802.3ad, 939 Mbit/s each way, each member alone, CPU about 0 %), **not tested under OpenWrt yet**; the balancing over the two ports needs more work |
 | `wan1`, `wan2` at 100 and 1000 Mbit/s (SGMII) | ✅ Validated: 94.1–94.2 Mbit/s at 100 Mbit/s and 941 Mbit/s at 1000 Mbit/s on both ports; 10 Mbit/s not tested |
 | UDP offload (default) | ⚠️ Partial: validated on test kernels booted from RAM; rare freezes of offloaded UDP flows seen on the lab unit, cause not found (see [Known limitations](#known-limitations)) |
-| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated, **outbound only** (about 727 Mbit/s, `kmod-fortinet-np6lite-ipsec`); inbound traffic is decrypted in software (inbound offload not written yet) |
+| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated, **outbound** (about 727 Mbit/s, `kmod-fortinet-np6lite-ipsec`); inbound SAs added with `offload packet` are decrypted in the NP (validated on a 100E only; `ipsec_outbound_only=1` keeps them in software) |
 | IPsec in software (IPv4 and IPv6, tunnel and transport) | ✅ Validated (previous image) |
 | WireGuard, OpenVPN (with DCO) | ✅ Validated (packages included in the 60E profile) |
 | Persistent storage (overlay) | ✅ Validated: survives reboots and power cuts |
@@ -1190,6 +1218,235 @@ is a loading check only: see [Known limitations](#known-limitations).
 
 </details>
 
+<details>
+<summary><b>FortiGate 100E</b> — SoC3 · NP6Lite · BCM53344 switch — 🧪 Preview</summary>
+
+The SoC, the network processor and the image format are those of the 60E. The 100E adds a Broadcom BCM53344
+switch on PCIe for sixteen of its front ports and `ha1`/`ha2`, and has drivers for the crypto engines of the
+SoC3. The image installs into partition 2 of the internal eMMC as on the 60E (see the installation notes).
+
+### Specifications
+
+| Item | Value |
+|---|---|
+| SoC | Fortinet SoC3, ARM Cortex-A9, 4 cores @ 1000 MHz |
+| RAM | 4 GiB DDR3L (4 × Micron `D9SDN`, 8 Gbit each); the CPU (no LPAE) uses 2912 MiB below the peripherals, the NP6Lite tables lie in between |
+| Network processor | NP6Lite (in the SoC) |
+| Crypto | symmetric engine, public key engine and random number generator of the SoC3; drivers `fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng` |
+| Switch | Broadcom BCM53344 (Hurricane 2) on PCIe, driver `bcm53344` with DSA tagger `bcm53344-8021q`; links to the NP6Lite over SGMII/QSGMII |
+| PHYs | 3 × Broadcom BCM54220 (B50220, dual port): `mgmt` and `dmz` (RGMII to the NP6Lite), `port13`…`port16` (SGMII to the switch); `port1`…`port12`, `ha1`, `ha2`, `wan1`, `wan2` on the internal PHYs of the switch |
+| Ethernet ports | 22 × 1 GbE: `mgmt`, `dmz` (NP6Lite); `wan1`, `wan2` (through the switch, each on an NP port of its own); `ha1`, `ha2`, `port1`…`port16` (switch, DSA ports); `port15`/`port16` shared with SFP1/SFP2 (1000BASE-X; the SFP has priority) |
+| Boot disk | eMMC, 3.56 GiB, same partition layout as the 60E (OpenWrt in partition 2, sectors 786440 to 1310727) |
+| Boot flash | Macronix MX25L1605E SPI NOR, 2 MiB: boot loader and base MAC address (read-only) |
+| USB | 1 × USB-A (USB 2 tested), port power on an NP GPIO |
+| Buttons | reset (NP GPIO 4) |
+| Console | RJ45 (Cisco pinout), 9600 8N1 |
+| Hardware monitoring | Nuvoton NCT7802Y on I2C (`nct7802`): temperatures, voltages, fan speeds; the chip regulates the fans itself; the fan page of `luci-app-fgtwrt` and `fan-profile` set its curve |
+| LEDs | link and activity LEDs of all front ports (switch LED processor and PHY LED modes); one LED per SFP cage, on the activity LED pin of the PHY of `port15`/`port16`, switched over by an NP GPIO |
+| Watchdog | SoC watchdog |
+| Power | about 21 W idle and 21.3 W with offloaded TCP both ways (smart plug, order of magnitude) |
+
+### Hardware topology
+
+```mermaid
+flowchart LR
+  CPU["SoC3<br/>4 × Cortex-A9"]
+  NP["NP6Lite"]
+  CRY["crypto engines<br/>fsoc3-cp · -pkce · -trng"]
+  SW["BCM53344 switch<br/>(PCIe)"]
+  CPU --- NP
+  CPU --- CRY
+  CPU -- "PCIe (control)" --- SW
+  NP -- "RGMII · BCM54220" --- MGMT(["mgmt"])
+  NP -- "RGMII · BCM54220" --- DMZ(["dmz"])
+  NP -- "SGMII, NP port 3" --- SW
+  NP -- "SGMII, NP port 4" --- SW
+  NP -- "QSGMII uplinks (sw0, sw1)" --- SW
+  SW --- WAN(["wan1, wan2"])
+  SW --- LAN(["port1 … port16"])
+  SW --- HA(["ha1, ha2"])
+```
+
+`wan1` and `wan2` cross the switch on fixed paths of their own (one internal PHY, one uplink to the NP each) and
+are plain NP6Lite ports for Linux. `port1`…`port16` and `ha1`/`ha2` are DSA user ports of two switch instances
+(`sw0`, `sw1`), each on its own uplink to the NP; the tagger carries the port in a tag_8021q VID.
+
+**Default layout.** As on the 60E: `port1`…`port16` bridged in `br-lan` (`192.168.1.1`, DHCP server), the bridge
+offloaded to the switch (VLAN-unaware), `wan1` the WAN (DHCP client). `dmz`, `wan2`, `mgmt`, `ha1` and `ha2` are
+left unconfigured. There is no STP: before cabling several LAN ports to one switch, take them out of `br-lan`.
+Hardware flow offload is on by default.
+
+### Image layout
+
+As on the 60E (see its section): one container with the kernel (device tree appended) and `rootfs.gz`, booted from
+RAM by [T] in the boot loader menu, or installed by `sysupgrade` into partition 2 of the eMMC, with the persistent
+storage in the rest of that 256 MiB slot (ext4, about 219 MiB). The boot loader checks the model: the gzip name of the
+ramdisk must be `FG100E`, which the image profile sets.
+
+### Switch driver
+
+The switch is set up from reset by the kernel driver (no firmware of the switch is used; its own Cortex-A9 stays
+unused). Security properties of the configuration, checked by negative tests on the shipped image (crafted VLAN,
+link-local, flood, malformed and storm frames at a front port, also while the driver is unbound and bound again):
+
+- The forwarding of every port is limited by an egress mask, written through a shadow copy and read back; a
+  mismatch closes all ports. `wan1`/`wan2` and the two DSA instances are isolated from each other.
+- Front ports do not parse VLAN tags, except the CPU uplinks, the ports of the one VLAN-aware bridge and standalone
+  ports with 802.1Q devices (see below); ingress VLAN filtering on all ports. VIDs 3072–4095 are reserved for
+  tag_8021q.
+- The switch stays in reset until the driver has set it up, and goes back to reset on unbind, shutdown or a failed
+  step: it never forwards without the driver. No frame is copied to the switch CPU port.
+- Learning is limited per port (excess frames dropped).
+- The tagger drops frames without a valid tag_8021q VID, or with the standalone VID of a bridged port.
+
+Offloaded: VLAN-unaware bridges and one VLAN-aware bridge of DSA ports, hardware address learning and aging, fast
+ageing, link speed 10/100/1000 through phylink. Flow offload of the NP6Lite works for DSA ports (the NP keys the
+flow on the uplink and the tag_8021q VID), also for a bond of DSA ports of one switch instance (for instance
+`port15` + `port16` with LACP): one NP session per member on ingress, and on output the member the bond's own hash
+picks, moved to another member when one fails. Routed flows of the VLAN-aware bridge (`br0.10` to `wan1`, for
+instance) are offloaded too: the NP keys them on the uplink and the VID of the VLAN. A tagged end needs the port to be
+a tagged member of the VLAN, an untagged end its PVID to be the only VLAN the port leaves untagged (otherwise the
+VLAN of the end is not known for sure and the flow stays in software). A change of the bridge VLANs (a VLAN, a
+PVID, a port in or out) takes its offloaded flows off within a second and tears them down in the flow table, so
+they are set up again with the new configuration (for 5 s after a change, none is offloaded). Routing between two
+VLANs of the bridge stays in software. Not offloaded yet: bonds with members on both switch instances or with other
+ports, and 802.1Q devices on bridged ports or bond members.
+
+**802.1Q devices on DSA ports** (`port1.10`). The switch translates the VLAN of such a device to an internal VLAN
+of its own (VIDs from 3071 down, one per device, the port and its CPU uplink as members), so that the frame reaches
+the NP6Lite with one tag, and gives the frame its VID back when it leaves the port. The NP6Lite then offloads the
+flows of the device like those of the port; the same VID may be used on several ports. A port with 802.1Q devices
+parses tags: a tagged frame with a VID it has no device for (an internal VID included) is dropped by the switch,
+untagged and priority-tagged frames go to the port as before. While the port is in a bridge or a bond, its 802.1Q
+devices are not translated (the bridge VLANs apply); the internal VIDs in use cannot be added to the VLAN-aware
+bridge. `/sys/kernel/debug/bcm53344/xlt` lists the translations.
+
+**Address learning.** All DSA ports, `ha1` and `ha2` included, learn source addresses in the switch, also outside a
+bridge: in a small office the HA ports are often used as plain ports. Linux DSA expects standalone ports not to
+learn; to get that on some ports, name them in the `nolearn` parameter of the switch driver (built into the
+kernel, so it is set at run time):
+
+```
+echo "ha1 ha2" > /sys/module/bcm53344/parameters/nolearn   # at once, until the next boot
+echo "" > /sys/module/bcm53344/parameters/nolearn          # all ports learn again
+```
+
+For every boot, put the first line into `/etc/rc.local`. A port in a bridge also follows the learning flag of the
+bridge (`bridge link set dev ha1 learning off`); a port named in `nolearn` never learns. Turning learning off clears
+what the port learned; frames to unknown destinations are then flooded within the VLAN of the port. A device that
+sends with the MAC address of the FortiGate port back into it (for instance a cable between `ha1` and `ha2`, which
+share one MAC address) loses frames with or without learning: give one side its own MAC address.
+
+### Packages of the profile
+
+The packages of the 60E profile (LuCI, IPsec, WireGuard, OpenVPN with DCO, `fgtwrt-base`, `luci-app-fgtwrt`,
+the installer, the reset button), and:
+
+| Package (100E profile) | For |
+|---|---|
+| `kmod-fortinet-fsoc3-trng`, `kmod-fortinet-fsoc3-pkce`, `kmod-fortinet-fsoc3-cp` | crypto engines (see [Crypto engines](#crypto-engines)) |
+| `kmod-crypto-user`, `libopenssl-afalg` | the AES-CBC engine for OpenSSL users (AF_ALG, see the features) |
+| `strongswan`, `strongswan-default`, `strongswan-mod-openssl`, `luci-app-strongswan-swanctl` | IKEv2 (`/etc/config/ipsec`, LuCI); with `hw_offload auto` the SAs go to the NP (see the features) |
+| `kmod-hwmon-nct7802`, `i2c-tools` | hardware monitor, fan control (`fgtwrt-base`: System → fgtWRT → Fan in LuCI, `/etc/config/fgtwrt`; `fan-profile` on the command line) |
+| `r8a779x-usb3-firmware`, `kmod-usb-storage`, `kmod-fs-vfat`, `kmod-nls-cp437`, `kmod-nls-iso8859-1` | USB |
+
+The switch driver, the tagger, the PCIe root port and the BCM54220 PHY support are built into the kernel.
+
+Tested on the 100E but left out of the profile: `snmpd` and `snmp-utils` (SNMP agent, see the features).
+
+### Benchmarks
+
+One unit, booted from RAM, fan profile `performance`, method of [Benchmark methodology](#benchmark-methodology)
+(median of three runs). A host on `port1`, the device routes and NATs to the same host through `mgmt`.
+
+| Test | hw offload | sw flowtable | no offload |
+|---|---|---|---|
+| TCP, one stream, → / ← (Mbit/s) | 939 / 934 | 923 / 854 | 935 / 932 |
+| TCP, 8 streams, → / ← (Mbit/s) | 938 / 934 | 537 / 583 | 743 / 738 |
+| UDP 900 Mbit/s offered, → / ← | 899 / 900 | 900 / 899 | 899 / 899 |
+| New connections per second (SNAT + DNAT) | 6160 | 5014 | 5765 |
+
+64000 concurrent connections were all offloaded (driver limit 65536). Offloaded TCP leaves the CPU about idle.
+Latency to the device: 1.4 ms idle, 6.1 ms with offloaded TCP at line rate. Single CPS runs dipped to
+3000–3600/s, cause not known. Packet rate: a host generator on `port1` (raw socket, 521 000 64-byte frames/s at
+most) routed and NATed to `wan1`, counted at the switch ports: 1 000 000 frames of 64 bytes forwarded without a
+loss in the switch or the NP, so the NP takes at least 521 kpps; its own limit is above what the generator reaches.
+At line rate with 256 to 1024-byte frames the switch drops 0.05–0.2 % on the uplink to the NP (the tag_8021q tag
+adds 4 bytes to every frame there), the NP none.
+
+ESP and WireGuard were measured with both tunnel ends on the device, so the figures are ratios, not gateway
+throughput: ESP transport mode AES-GCM 92 Mbit/s and CBC + HMAC-SHA256 95 Mbit/s on `fsoc3-cp`, against
+77 Mbit/s for AES-GCM in software. ESP tunnel mode AES-128-CBC + HMAC-SHA256 from `wan2` to `port15`, the
+outbound SA offloaded to the NP6Lite: 147 Mbit/s, against 90 Mbit/s with the same SA in software; both are
+limited by the receiving end, which decrypts on `fsoc3-cp` on the same CPU.
+
+### OpenWrt features
+
+| Feature | Status |
+|---|---|
+| Boot from RAM, default network | ✅ Validated |
+| `mgmt`, `dmz`, `wan1`, `wan2` | ✅ Validated |
+| `port1`…`port16` (DSA), bridge offload, VLAN-aware bridge | ✅ Validated; routed flows of the VLAN-aware bridge offloaded by the NP (TCP about 935 Mbit/s, sessions in the NP) |
+| `ha1`, `ha2` | ✅ Validated over a cable between both: link 1000/full, ping, TCP and UDP through the host path, link toggles, no frames towards the LAN ports. They learn addresses like the other ports; see "Address learning" to turn that off |
+| SFP1, SFP2 | 🧪 Partial: copper SFP modules (1000BASE-X) in both cages, link 1000/full as `port15`/`port16` (`Port: FIBRE` in `ethtool`), ping and the isolation tests; fiber modules, SGMII-only modules and a link on both the SFP and the RJ45 jack of the same port (the SFP wins) not tested; no access to the module EEPROM (`ethtool -m`) |
+| NP6Lite flow offload, also between DSA ports and `wan1` | ✅ Validated. An offloaded flow no longer passes the forward chain: a rule added later (for instance with `nft insert` before the `established` rule) only takes effect once the flow leaves the NP, after `conntrack -F` (validated: traffic stops at once) or when it ages out; `fw4` accepts established connections before its own rules anyway, offloaded or not |
+| 802.1Q devices on DSA ports, NP6Lite flow offload of their flows | ✅ Validated: `port13.20` routed to `ha1`, offloaded both ways; external ends through `port1.10`: 930 / 933 Mbit/s (TCP, one stream) and 934 / 934 (8 streams) at 0 % CPU, against 574 / 600 with 8 streams in the software flow table; on the wire, tagged replies from `port1.30`, no reply to other VIDs, internal VIDs or tag stacks; leaving a bridge turns the translation back on; negative tests (including internal VIDs and tag stacks at a port with 802.1Q devices) without leak |
+| NP6Lite flow offload of a bond of DSA ports (LACP) | ✅ Validated: `port15` + `port16` routed to `ha1`, both directions, a member failing and coming back; 654 Mbit/s against 304 Mbit/s with the software flow table, with both ends on the device |
+| Per-flow counters of offloaded flows | ✅ Validated: exact for steady flows (UDP, 64 to 1518 bytes, up to 400 000 packets/s) and for slow flows (one packet every 5 s over minutes); a burst on a flow that was slow before is estimated until the flow is queried as a fast one (at most about 3 s), off by up to two windows of 65 472 packets or 16 MiB at the start of the burst (64-byte burst of 800 000 packets after idle: exact; worst case seen 0.84 times) |
+| Interface counters (`ip -s link`, `/proc/net/dev`, SNMP ifTable) | ✅ Validated: the DSA ports report the switch MIB counters (summed every 2 s), so bridged and offloaded frames are counted; the NP ports (`mgmt`, `dmz`, `wan1`, `wan2`) add the offloaded flows from the session counters (with the accuracy limit above) |
+| SNMP (`snmpd`, not in the profile) | ✅ ifTable/ifXTable of all 26 interfaces with speed and status, HOST-RESOURCES (CPU, memory, file systems), UCD memory and load; hardware sensors only through `extend` entries in `/etc/config/snmpd` (no lm-sensors MIB); no MIB files in the image (`snmp-mibs` or numeric OIDs) |
+| `/dev/hwrng` feeding the kernel pool | ✅ the `hwrng` kernel thread feeds the pool from `fsoc3-trng` (quality 128, `entropy_avail` 256); no `rngd` needed |
+| AF_ALG (`kmod-crypto-user`, `libopenssl-afalg`) | ✅ works through `fsoc3-cp`, and OpenWrt enables the OpenSSL engine for every OpenSSL user; AES-CBC only, faster than software from about 8 KiB per call (16 KiB: 88 MB/s against 36 MB/s), 45 times slower at 16-byte calls. To turn it off: `uci set openssl.afalg.enabled=0; uci commit openssl; /etc/init.d/openssl restart` |
+| Crypto engines (`fsoc3-cp`, `fsoc3-pkce`, `fsoc3-trng`) | ✅ Validated against the software implementations, also under load |
+| IPsec offload in the NP (IPv4 tunnel mode) | ✅ Validated: **outbound** as on the 60E (`kmod-fortinet-np6lite-ipsec`), together with `fsoc3-cp` (inbound ESP of SAs without `offload packet` decrypted in software on `fsoc3-cp`; the `fsoc3-cp` tests pass while the NP encrypts). **Inbound** in the NP for an inbound SA added with `offload packet` (`echo 1 > /sys/module/fortinet_np6lite/parameters/ipsec_outbound_only` keeps inbound SAs in software): the NP checks the ICV and the sequence number, decrypts and hands the frame to the kernel, which checks it against its policies as after a decryption in software; with an external ESP generator 926 Mbit/s of 1400-byte packets at 1 Gbit/s line rate without loss (64 inner flows, forwarded to a LAN port), against 207 Mbit/s in software on `fsoc3-cp`; a single inner flow is processed by one core (about 780 Mbit/s), the flows of the decrypted packets are offloaded too (a flowtable with `flags offload`): 1 Gbit/s line rate with the CPU idle, 128-byte packets at 470 kpps (the limit of our generator) against about 190 kpps forwarded by the CPU; a flow session takes only the packets decrypted through its SA (each inbound SA has a VID the NP looks its decrypted packets up with), never packets in the clear or from another SA, and goes with the SA when it is deleted. Anti-replay in the NP: its window is fixed, 385 to 448 sequence numbers; an SA asking for up to 385 (IKE daemons use 32 or 64) is offloaded with it, a larger one is refused (keep it in software); byte and packet counters of offloaded SAs are not reported. Validated: clear text, a wrong ICV (which does not move the replay window), replayed and reordered sequence numbers, an inner address outside the policy, an unknown SPI, deleting and adding an SA, two SAs at a time. Inbound and forward policies are installed **without** `offload packet` (the driver refuses them with it): for a policy in packet offload the kernel skips its own check of clear frames. **strongSwan** (in the profile): with `hw_offload auto` on the child (`/etc/config/ipsec`, "H/W Offload" in LuCI) both SAs and the outbound policy go to the NP, the inbound and forward policies stay in software (strongSwan retries the inbound policy without offload when the driver refuses it); `yes` asks for crypto offload only and is not tested. Measured with a strongSwan peer on `mgmt` and the inner ends on the device and on the peer, AES-128-CBC + HMAC-SHA256: 846 Mbit/s sent and 780 Mbit/s received, against 285 / 199 Mbit/s without offload (`fsoc3-cp`); child SA rekeys under load without a dip, IKE rekey, the SAs leave the NP when the connection goes. With packet offload the kernel drops an outbound packet larger than the MTU of the tunnel (`XfrmOutError`) where software would encrypt and fragment the ESP packet, for instance a datagram reassembled by conntrack; fragmented ESP received for an offloaded SA is decrypted by the kernel. A port selector does not cover IP fragments, in the NP as in software (the kernel reads no ports from fragments either). Route-based tunnels (XFRM interfaces, `if_id`) are not offloaded: set `hw_offload` to `no` for them (the NP only sees the clear packet at the port and cannot tell what the kernel routed into the interface, and a packet decrypted in the NP would not arrive on the interface) |
+| Traffic sent by the appliance itself | ✅ Paced to 99.5 % of the link rate of each NP port (module parameter `tx_pace`, per mille, 0 = off): the NP takes frames from the host faster than a port sends them and drops the excess without a counter. TCP from the appliance on `mgmt`: 928–931 Mbit/s without retransmissions, against 83 000 in 10 s unpaced; through the switch (`port1`) 875–897 Mbit/s with 0–140, against 11 946 |
+| Hardware monitor, fan profiles (`silent`, `performance`, `default`, `custom`: four points, full speed temperature, hysteresis, fan 2 on the same curve or fixed) | ✅ Validated (`silent`: both fans on the same curve, minimum speed below 40 °C; a refused custom curve puts back the one of power-on) |
+| USB host port | 🧪 USB 2 storage only |
+| Watchdog | ✅ Validated |
+| LEDs of the front ports | ✅ Validated by a visual check |
+| LEDs of the SFP cages | ✅ Validated by a visual check with copper SFP modules: while the SFP side of `port15`/`port16` has the link, the LED of its cage is lit and blinks with traffic, and the LEDs of the RJ45 jack are off (as with the stock firmware); dark again once the port goes down |
+| Reset button | ✅ A short press reboots cleanly (`gpio-button-hotplug`, polled every 100 ms; hold it about 0.3 s); a press of 5 s or more triggers the OpenWrt factory reset (standard OpenWrt behaviour, not tested on this unit) |
+| STATUS, ALARM, HA LEDs | ✅ Validated by a visual check: STATUS green blinking while booting, green once running, red blinking in failsafe and during an upgrade; ALARM red blinks on a kernel panic, STATUS then goes dark; a failed fan (below 1000 rpm, `fan-monitor`) turns ALARM orange and STATUS red, both fans failed turn ALARM red; HA is off, without a trigger (no HA cluster), free for the LED configuration |
+| Installation to the eMMC, persistent storage | 🧪 Partial: `sysupgrade -n` from a RAM boot into partition 2, boot from the eMMC without TFTP, persistence across a power cycle and `sysupgrade` from the installed system (configuration kept) validated once; [B] back to the stock firmware and back to OpenWrt not tested yet |
+| Continuous operation (24 h) | ❓ Not run yet |
+
+### Installation notes
+
+> [!WARNING]
+> As on the 60E, OpenWrt is installed into **partition 2** (firmware image 1) of the internal eMMC, which then
+> becomes the default boot partition. **Before installing, make sure the stock firmware you keep runs from
+> partition 1**: anything in partition 2 is overwritten. Back up partition 2 first if you may want it back
+> (for instance `dd if=/dev/mmcblk0p2 | nc <host> <port>` from OpenWrt booted from RAM).
+
+- Install from OpenWrt booted from RAM with `sysupgrade -n` (see [Getting started](#getting-started)); copy the
+  image to `/tmp` first (`scp`, or `nc` from a host). The installer refuses to write if partition 2 is the default
+  boot and does not hold OpenWrt, or if partition 1 holds no firmware.
+- Once partition 2 holds OpenWrt, an OpenWrt image booted from RAM with [T]/[R] mounts and changes the persistent
+  storage of partition 2 too. Update from the installed OpenWrt with `sysupgrade`.
+- To go back to the stock firmware, choose **[B]** in the boot loader menu (not tested on the 100E yet): OpenWrt
+  and its overlay stay in partition 2, and **[B]** again brings them back.
+
+- The boot loader menu (BIOS `05000008`): press a key at
+  `Please wait for OS to boot, or press any key to display configuration menu.`, then **[C]** to set the TFTP
+  server, the local address and the file name (once), and **[T]** to fetch the image. **TFTP goes through MGMT**
+  (`Please connect TFTP server to Ethernet port 'MGMT'.`). After `Checking image... OK`, answer
+  `Save as Default firmware/Backup firmware/Run image without saving:[D/B/R]?` with **[R]** only:
+  **[D]** and **[B]** write the image to the eMMC.
+- **Never use [F]** (formats the boot device) or the **[I]** sub-menu (persistent boot loader settings). **[B]** in
+  the main menu only switches the default boot partition (see above).
+- `mgmt` stays unconfigured under OpenWrt: after the boot, move your cable to one of `port1`…`port16` to reach
+  `192.168.1.1`.
+- The console prompt comes before the end of the boot: wait for `procd: - init complete -` in the log before
+  changing the network.
+- The fans start in the profile `silent` (System → fgtWRT → Fan in LuCI or `fan-profile` show and change it; `performance` for sustained load). An earlier `/etc/config/fan` is taken over at the first boot.
+- LuCI lists `sw0` and `sw1` among the devices: they are the DSA conduits between the NP and the switch
+  (`port1`…`port16` and `ha1`/`ha2`), the `eth0` of other DSA routers. Their counters add up the traffic of
+  the ports behind them. Leave them as they are: no address, bridge or VLAN device on them (frames without
+  the port tag are dropped, and their VIDs belong to the port tags), and an MTU of at least 1504; DSA brings
+  them up with the ports.
+
+</details>
+
 ---
 
 ## Known limitations
@@ -1260,13 +1517,18 @@ is a loading check only: see [Known limitations](#known-limitations).
 - **Traffic sent by the appliance itself** (not routed) on `wan1` and on a bond of switch ports at the same
   time: `wan1` is limited to about 210 Mbit/s, with many retransmissions, while the CPU core that handles both
   outputs is fully busy. Alone, `wan1` reaches 911–934 Mbit/s. Routed and offloaded traffic is not affected.
+  The transmit pacing of the NP6Lite driver (`tx_pace`, see the 100E) may help here; not tested on a 60E.
 - UDP flows are offloaded by default. **Possible instability**: on the lab unit, offloaded UDP flows stopped
   being forwarded in rare power cycles (all freezes seen within 1 of 11 observed power cycles), on test kernels
   and under OpenWrt alike; the cause is not found yet. If UDP traffic stalls, keep UDP on the CPU:
   `echo 0 > /sys/module/fortinet_np6lite/parameters/ft_udp`.
 - **NAT66**: only flows with **one** translated address (source or destination) are offloaded; a flow with both
   SNAT and DNAT is forwarded in software. Set `ft_nat66` to 0 to keep all NAT66 on the CPU.
-- **IPsec offload is outbound only**: inbound ESP is decrypted in software (one CPU core). The outbound offload
+- **IPsec offload**: inbound decryption in the NP is validated on a 100E only; `ipsec_outbound_only=1` keeps
+  inbound ESP in software (one CPU core). The anti-replay window of the NP is fixed (385 to 448 sequence numbers),
+  SAs asking for more are refused. At most 4094 inbound SAs (one VID each). The SAs and the outbound policy take `offload packet`; the inbound
+  and forward policies are always installed without it (the driver refuses them otherwise, the kernel then checks
+  every inbound frame). The outbound offload
   (about 727 Mbit/s) is below the NP4Lite of the 60D and the 90D; only IPv4 tunnel mode with the AES-CBC / 3DES-CBC
   and HMAC ciphers listed above is offloaded, the rest runs in software.
 - **Bond of `wan1` + `wan2`** (NP trunk): validated on our reference kernel builds, not tested under OpenWrt yet;
@@ -1278,8 +1540,8 @@ is a loading check only: see [Known limitations](#known-limitations).
 - **Watchdog**: the driver is in the image but the watchdog is disabled in the device tree: a frozen appliance
   does not restart by itself.
 - **WAN ports**: 100 and 1000 Mbit/s validated; 10 Mbit/s not tested.
-- **Not supported yet**: the crypto engine (software crypto only), GRE offload (not supported by the NP6Lite),
-  inbound IPsec offload.
+- **Not supported yet**: the crypto engine (software crypto only), GRE offload (not supported by the NP6Lite).
+  Inbound IPsec offload (on by default, `ipsec_outbound_only=1` turns it off) is validated on the 100E only.
 - The behaviour under saturation of the link between the NP6Lite and the switch, described above for the 60D
   and the 90D, has not been measured on the 60E yet.
 - **Boot time**: about 33 s from power-on to the web interface.

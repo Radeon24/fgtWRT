@@ -10,8 +10,9 @@
  * locking its cache line (command register, tunnel operation "lock"),
  * writing the entry word by word through an indirect window, then writing
  * it to the entry and unlocking the line. Received ESP whose SPI has a
- * session entry in the flow engine comes to the host decrypted and without
- * its outer header, the completion word marking it (word 0 bit 30) and
+ * session in the flow engine (fnp6l_ipsec_spi) is checked (ICV) and
+ * decrypted by the engine and comes to the host without its outer header
+ * on a LIF of its own, the completion word marking it (word 0 bit 30) and
  * carrying the SA index (word 1 bits 15:0); a frame the host sends with its
  * descriptor marked (word 2 bits 31:28 = 2, word 3 bits 15:0 = index) goes
  * out encrypted and encapsulated. The engine keeps the sequence numbers and
@@ -21,17 +22,19 @@
  * the "Linux" logic kept, the backend (tables in DDR, register transport,
  * completion decode) replaced.
  *
- * v1 is outbound first (ipsec_outbound_only, default on): an outbound SA is
- * offloaded (the engine encrypts); an inbound SA is left to software until
- * the inbound session entry and the completion decode are confirmed on
- * hardware. Fields of the entry or of the completion word that are not yet
- * confirmed are left inactive by default and named below, with the reading
- * on hardware that lifts each one.
+ * Outbound and inbound SAs are offloaded; inbound ones not with
+ * ipsec_outbound_only set. A decrypted frame goes up with a sec_path
+ * xfrm checks against its policies, as after a decryption in software. The
+ * engine checks the sequence numbers of an inbound SA with a replay window
+ * (fnp6l_sa_replay_window). The flows of the decrypted frames can be
+ * offloaded too (FLOW_ACTION_XFRM_IN): each inbound SA has a VID the engine
+ * looks its decrypted frames up with, a flow session keyed on it takes the
+ * frames of that SA only (fnp6l_ipsec_ft_in); a deleted SA takes its SPI
+ * session and its flows with it at once (fnp6l_sa_teardown).
  *
  * Register layout and values established by observation, for
  * interoperability; what is still to confirm on hardware is marked FIXME
- * and gated by a
- * module parameter.
+ * and gated by a module parameter.
  */
 
 #include <linux/bitfield.h>
@@ -66,15 +69,14 @@
 #include "np6lite.h"
 
 /*
- * v1 is outbound first: an inbound SA is left to software (the engine is
- * not told about it, no completion is decoded), until the inbound session
- * entry and the completion decode are confirmed on hardware. Clearing this
- * exercises the inbound path.
+ * An inbound SA added with "offload packet" is decrypted in the network
+ * processor (see fnp6l_ipsec_spi and fnp6l_ipsec_in_init). Set, inbound SAs
+ * are refused and left to software (the engine is not told about them).
  */
-static bool ipsec_outbound_only = true;
+static bool ipsec_outbound_only;
 module_param(ipsec_outbound_only, bool, 0644);
 MODULE_PARM_DESC(ipsec_outbound_only,
-		 "offload outbound SAs only, leave inbound to software (default on until the inbound path is confirmed on hardware)");
+		 "offload outbound SAs only, leave inbound to software (default off: inbound SAs in packet offload are decrypted in the NP)");
 
 /*
  * FIXME: the anomaly (anti-replay, integrity) of a received frame is
@@ -123,7 +125,7 @@ MODULE_PARM_DESC(ipsec_sa_diag,
  * SA descriptor: the first 128 bytes, the same layout as the NP4Lite
  * (identical for the first 128 bytes), the only ones an
  * outbound entry needs; an inbound entry is 192 bytes, the last 64 the
- * anti-replay window (left zero in v1, ipsec_replay off). Multi-byte fields
+ * anti-replay window state of the engine (written zero). Multi-byte fields
  * as the engine reads them. The key bytes are never logged.
  */
 struct fnp6l_sa_desc {
@@ -146,6 +148,7 @@ struct fnp6l_sa_desc {
 } __packed;
 
 static_assert(sizeof(struct fnp6l_sa_desc) == NP6L_SA_OB_STRIDE);
+static_assert(NP6L_SA_IB_STRIDE >= sizeof(struct fnp6l_sa_desc));
 static_assert(offsetof(struct fnp6l_sa_desc, hmac) == 48);
 static_assert(offsetof(struct fnp6l_sa_desc, saddr) == 88);
 static_assert(offsetof(struct fnp6l_sa_desc, action) == 100);
@@ -162,11 +165,25 @@ static_assert(offsetof(struct fnp6l_sa_desc, hmac2) == 104);
 #define NP6L_SA_AUTH		GENMASK(7, 3)
 /*
  * Byte 1: valid (bit 7); the reports of the byte lifetime and of the
- * sequence numbers (bits 5..3), bit 1 set. Anti-replay (bit 6) and ESN
- * (bit 2) stay clear. FIXME (ipsec_cmd_probe): the exact meaning of bits
- * 5..3/1 is to be confirmed on hardware, one parameter at a time.
+ * sequence numbers (bits 5..3), bit 1 set; anti-replay (bit 6) on an
+ * inbound SA with a replay window. ESN (bit 2) stays clear.
+ * FIXME (ipsec_cmd_probe): the exact meaning of bits 5..3/1 is to be
+ * confirmed on hardware, one parameter at a time.
  */
 #define NP6L_SA_F_VALID		BIT(7)
+#define NP6L_SA_F_REPLAY	BIT(6)
+/*
+ * The anti-replay window of the engine (measured): 448 sequence numbers in
+ * seven blocks of 64, aligned; it accepts a number down to the start of the
+ * block six blocks below the one of the highest number received, so at
+ * least 385 numbers below the highest one. A duplicate in the window and
+ * a number below it are dropped (rx_ipsec_err_replay). The window is not
+ * configurable: an SA asking for a smaller one is offloaded with this one
+ * (receivers choose their window, RFC 4303 3.4.3), a larger one is left to
+ * software. Unlike xfrm the engine takes a first sequence number 0, which
+ * no conforming sender uses; a repeated one is dropped.
+ */
+#define NP6L_SA_REPLAY_WIN	385
 #define NP6L_SA_F_DEFAULT	(BIT(5) | BIT(4) | BIT(3) | BIT(1))
 #define NP6L_SA_VOL_MAX		GENMASK_ULL(46, 0)
 #define NP6L_SA_TTL		64
@@ -204,16 +221,21 @@ static_assert(offsetof(struct fnp6l_sa_desc, hmac2) == 104);
 /* control word 1 of the IPsec block: engine enables, set once at init (0x102) */
 #define NP6L_IPSEC_CTRL1	0x6A40
 #define NP6L_IPSEC_CTRL1_INIT	0x00000102
+/* frames the inbound engine dropped, by cause */
+#define NP6L_IPSEC_IB_SAERR	0x6aa0
+#define NP6L_IPSEC_IB_LENERR	0x6ab0
+#define NP6L_IPSEC_IB_RPLERR	0x6ab8
+#define NP6L_IPSEC_IB_HMACERR	0x6ac0
 #define NP6L_TUN_CMD_US		2000	/* a command clears in a few us */
 #define NP6L_TUN_QWA_US		2000
 
 /*
- * RX completion of a decrypted frame (retained reading): word 0 bit 30 =
- * processed bit, set by the IPsec engine; the SA index is word 1 bits 15:0
- * (SA pointer). Word 0 bit 31 is
- * the L4 checksum result (NP6L_RXW0_L4_CSUM_OK in the core), never an
- * anomaly bit. The anomaly (anti-replay, integrity) is not read from a word
- * bit in v1 (ipsec_rx_anomaly_bit).
+ * RX completion of a decrypted frame (measured): it arrives on
+ * NP6L_LIF_IPSEC_IN with word 0 bit 30 set by the IPsec engine and the SA
+ * index in word 1 bits 15:0. Word 0 bit 31 is the L4 checksum result
+ * (NP6L_RXW0_L4_CSUM_OK in the core), never an anomaly bit. A frame that
+ * fails the ICV check never reaches the host (the engine drops it and
+ * counts it); no anomaly is read from a word bit (ipsec_rx_anomaly_bit).
  */
 #define NP6L_RXW0_IPSEC_DONE	BIT(30)
 #define NP6L_RXW1_SA_IDX	GENMASK(15, 0)
@@ -264,6 +286,10 @@ struct fnp6l_sa {
 	bool hw;			/* in the engine */
 	bool deleted;			/* by xfrm, no longer used */
 	__be32 saddr, daddr, spi;
+	/* Inbound */
+	u16 in_vid;			/* VID of its decrypted frames */
+	bool spi_gone;			/* its SPI session deleted */
+	struct work_struct del_work;	/* fnp6l_sa_del_work */
 	struct u64_stats_sync syncp;
 	u64_stats_t bytes, packets;
 	u32 sn;				/* last sequence number reported */
@@ -293,6 +319,7 @@ struct fnp6l_ipsec {
 	void *ob_mem;			/* outbound SA table (DDR) */
 	struct fnp6l_sa __rcu **sa_by_idx;
 	/* The rest under the flow-engine lock */
+	DECLARE_BITMAP(in_vids, VLAN_N_VID);	/* VIDs of the inbound SAs */
 	bool hw_ok;			/* engine set up since the last reset */
 	bool ctrl_done;			/* ctrl1 set up (once) */
 	unsigned int nr_sa;
@@ -302,7 +329,8 @@ struct fnp6l_ipsec {
 	unsigned int nr_in[NP6L_MAX_LIF];
 	u32 seq;
 	/* RX path */
-	atomic_long_t rx_dec, rx_nosa, rx_anomaly;
+	atomic_long_t rx_dec, rx_nosa, rx_anomaly, rx_sel;
+	atomic64_t rx_icv_err;		/* sum of a clear-on-read counter */
 	/* TX path: outbound policies and SAs per LIF */
 	spinlock_t tx_lock;
 	struct list_head tx_pols[NP6L_MAX_LIF];
@@ -617,6 +645,12 @@ out:
 	memzero_explicit(kb, sizeof(kb));
 }
 
+/* the replay window xfrm keeps for the SA: legacy, or bitmap without ESN */
+static unsigned int fnp6l_sa_replay_window(const struct xfrm_state *x)
+{
+	return x->replay_esn ? x->replay_esn->replay_window : x->props.replay_window;
+}
+
 static void fnp6l_sa_desc_fill(struct fnp6l_sa_desc *desc,
 			       const struct xfrm_state *x, u8 algs, bool in)
 {
@@ -625,6 +659,8 @@ static void fnp6l_sa_desc_fill(struct fnp6l_sa_desc *desc,
 
 	desc->algs = algs;
 	desc->flags = NP6L_SA_F_VALID | NP6L_SA_F_DEFAULT;
+	if (in && fnp6l_sa_replay_window(x))
+		desc->flags |= NP6L_SA_F_REPLAY;
 	desc->vol_lo = cpu_to_le16(lower_16_bits(NP6L_SA_VOL_MAX));
 	desc->vol_hi = cpu_to_le32(NP6L_SA_VOL_MAX >> 16);
 	desc->spi = x->id.spi;
@@ -640,10 +676,11 @@ static void fnp6l_sa_desc_fill(struct fnp6l_sa_desc *desc,
 }
 
 /*
- * What the engine offloads, as the NP4Lite: IPv4 ESP tunnels, without ESN,
- * NAT-T nor anti-replay, AES-CBC or 3DES-CBC with HMAC-MD5-96, HMAC-SHA1-96
- * or HMAC-SHA256-128 (GCM and SHA-384/512 only on the lookaside engine, not
- * here). The local end of the tunnel must be an address of the port.
+ * What the engine offloads, as the NP4Lite: IPv4 ESP tunnels, without ESN
+ * nor NAT-T, an inbound replay window up to NP6L_SA_REPLAY_WIN, AES-CBC or
+ * 3DES-CBC with HMAC-MD5-96, HMAC-SHA1-96 or HMAC-SHA256-128 (GCM and
+ * SHA-384/512 only on the lookaside engine, not here). The local end of the
+ * tunnel must be an address of the port.
  */
 static int fnp6l_sa_check(struct net_device *ndev, struct xfrm_state *x,
 			  struct netlink_ext_ack *extack, u8 *algs)
@@ -678,9 +715,9 @@ static int fnp6l_sa_check(struct net_device *ndev, struct xfrm_state *x,
 		NL_SET_ERR_MSG_MOD(extack, "encapsulation (NAT-T) is not supported");
 		return -EINVAL;
 	}
-	if (in && (x->props.replay_window ||
-		   (x->replay_esn && x->replay_esn->replay_window))) {
-		NL_SET_ERR_MSG_MOD(extack, "anti-replay is not supported, set replay-window 0");
+	if (in && fnp6l_sa_replay_window(x) > NP6L_SA_REPLAY_WIN) {
+		NL_SET_ERR_MSG_FMT_MOD(extack, "replay window above %u is not supported",
+				       NP6L_SA_REPLAY_WIN);
 		return -EINVAL;
 	}
 	if (x->aead || x->calg || !x->ealg || !x->aalg) {
@@ -803,6 +840,63 @@ static void fnp6l_sa_tx_unlink(struct fnp6l_sa *sa)
 
 /* -------------------------------------------------------- xfrm state ops */
 
+/*
+ * Another inbound SA in the engine whose SPI session, with the same key as
+ * the one of @sa, may still be in the engine (an SA deleted and added
+ * again, before the old one was torn down): taken as gone, the session of
+ * @sa replaces it. Under the flow-engine lock.
+ */
+static bool fnp6l_sa_spi_twin(struct fnp6l_ipsec *ips, const struct fnp6l_sa *sa)
+{
+	struct fnp6l_sa *o;
+	bool twin = false;
+
+	list_for_each_entry(o, &ips->sas, node)
+		if (o != sa && o->in && o->hw && !o->spi_gone &&
+		    o->spi == sa->spi && o->saddr == sa->saddr &&
+		    o->daddr == sa->daddr && o->lif == sa->lif) {
+			o->spi_gone = true;
+			twin = true;
+		}
+	return twin;
+}
+
+/*
+ * Tear an inbound SA down in the engine as soon as xfrm deleted it: its SPI
+ * session (the engine would decrypt its frames on) and the flows of its
+ * decrypted frames (the flow engine would forward them past xfrm). xfrm
+ * frees the SA later, from its garbage collector, and calls
+ * xdo_dev_state_delete under the state lock. Under the flow-engine lock.
+ */
+static void fnp6l_sa_teardown(struct fnp6l_sa *sa)
+{
+	struct fnp6l_ipsec *ips = sa->ips;
+	struct fnp6l *np = ips->np;
+	unsigned int n;
+
+	if (!sa->hw || !sa->in)
+		return;
+	if (!sa->spi_gone)
+		fnp6l_ipsec_spi(np, sa->saddr, sa->daddr, sa->spi, sa->lif,
+				sa->idx, 0, false);
+	sa->spi_gone = true;
+	n = fnp6l_ft_flush_ipsec(np, sa->in_vid);
+	if (n) {
+		atomic_long_add(n, &ips->ft_purged);
+		netdev_dbg(sa->ndev, "IPsec SA %u: %u flows no longer offloaded\n",
+			   sa->idx, n);
+	}
+}
+
+static void fnp6l_sa_del_work(struct work_struct *work)
+{
+	struct fnp6l_sa *sa = container_of(work, struct fnp6l_sa, del_work);
+
+	fnp6l_fe_lock(sa->ips->np);
+	fnp6l_sa_teardown(sa);
+	fnp6l_fe_unlock(sa->ips->np);
+}
+
 static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 			       struct netlink_ext_ack *extack)
 {
@@ -829,7 +923,8 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 		return ret;
 
 	sa = kzalloc(sizeof(*sa), GFP_KERNEL);
-	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+	/* an inbound entry is longer than the descriptor: the rest zeroed too */
+	desc = kzalloc(NP6L_SA_IB_STRIDE, GFP_KERNEL);
 	if (!sa || !desc) {
 		ret = -ENOMEM;
 		goto out;
@@ -842,6 +937,7 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 	sa->saddr = x->props.saddr.a4;
 	sa->daddr = x->id.daddr.a4;
 	sa->spi = x->id.spi;
+	INIT_WORK(&sa->del_work, fnp6l_sa_del_work);
 	seqlock_init(&sa->mac_lock);
 	u64_stats_init(&sa->syncp);
 	if (!sa->in) {
@@ -859,6 +955,11 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 		ret = -EIO;
 		goto unlock;
 	}
+	if (sa->in && fnp6l_ipsec_in_init(np)) {
+		NL_SET_ERR_MSG_MOD(extack, "inbound IPsec set up failed");
+		ret = -EIO;
+		goto unlock;
+	}
 	/* next fit: an index freed is taken again as late as possible */
 	idx = find_next_zero_bit(ips->sa_used, NP6L_SA_NR, ips->next_idx);
 	if (idx >= NP6L_SA_NR)
@@ -869,6 +970,15 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 		goto unlock;
 	}
 	sa->idx = idx;
+	if (sa->in) {
+		/* VIDs 1-4094, one per inbound SA */
+		sa->in_vid = find_next_zero_bit(ips->in_vids, VLAN_N_VID - 1, 1);
+		if (sa->in_vid >= VLAN_N_VID - 1) {
+			NL_SET_ERR_MSG_MOD(extack, "no free VID for the inbound SA");
+			ret = -ENOSPC;
+			goto unlock;
+		}
+	}
 
 	ret = fnp6l_tun_write(ips, sa->in, idx, desc,
 			      sa->in ? NP6L_SA_IB_STRIDE : NP6L_SA_OB_STRIDE);
@@ -883,8 +993,12 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 	}
 
 	if (sa->in) {
+		/* the session of a twin (same key) points at its SA: replaced */
+		if (fnp6l_sa_spi_twin(ips, sa))
+			fnp6l_ipsec_spi(np, sa->saddr, sa->daddr, sa->spi, lif,
+					idx, 0, false);
 		ret = fnp6l_ipsec_spi(np, sa->saddr, sa->daddr, sa->spi, lif,
-				      idx, true);
+				      idx, sa->in_vid, true);
 		if (ret) {
 			fnp6l_tun_write(ips, true, idx, NULL, NP6L_SA_IB_STRIDE);
 			NL_SET_ERR_MSG_MOD(extack, "flow engine refused the SPI entry");
@@ -893,6 +1007,8 @@ static int fnp6l_xdo_state_add(struct net_device *ndev, struct xfrm_state *x,
 	}
 
 	__set_bit(idx, ips->sa_used);
+	if (sa->in)
+		__set_bit(sa->in_vid, ips->in_vids);
 	ips->next_idx = idx + 1;
 	WRITE_ONCE(ips->nr_sa, ips->nr_sa + 1);
 	sa->hw = true;
@@ -941,6 +1057,9 @@ static void fnp6l_xdo_state_delete(struct net_device *ndev,
 	WRITE_ONCE(sa->deleted, true);
 	RCU_INIT_POINTER(sa->ips->sa_by_idx[sa->idx], NULL);
 	fnp6l_sa_tx_unlink(sa);
+	/* under the state lock: the SPI session and flows go from a work */
+	if (sa->in)
+		schedule_work(&sa->del_work);
 }
 
 static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
@@ -956,6 +1075,7 @@ static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
 	WRITE_ONCE(x->xso.offload_handle, 0);
 	ips = sa->ips;
 	np = ips->np;
+	cancel_work_sync(&sa->del_work);
 	RCU_INIT_POINTER(ips->sa_by_idx[sa->idx], NULL);
 	fnp6l_sa_tx_unlink(sa);
 	synchronize_net();
@@ -964,9 +1084,8 @@ static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
 	if (sa->hw) {
 		if (fnp6l_tx_drain(np))
 			keep = true;
-		if (sa->in)
-			fnp6l_ipsec_spi(np, sa->saddr, sa->daddr, sa->spi,
-					sa->lif, sa->idx, false);
+		/* if not done at the delete already */
+		fnp6l_sa_teardown(sa);
 		/* whether the engine wrote the entry back to the DDR meanwhile */
 		fnp6l_sa_diag(ips, sa->in, sa->idx, "before clear");
 		ret = fnp6l_tun_write(ips, sa->in, sa->idx, NULL,
@@ -976,6 +1095,8 @@ static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
 			keep = true;
 		if (sa->in && ips->nr_in[sa->lif])
 			ips->nr_in[sa->lif]--;
+		if (sa->in)
+			__clear_bit(sa->in_vid, ips->in_vids);
 	}
 	sa->hw = false;
 	list_del(&sa->node);
@@ -993,25 +1114,25 @@ static void fnp6l_xdo_state_free(struct net_device *ndev, struct xfrm_state *x)
 /* -------------------------------------------------------------- RX path */
 
 /*
- * Whether the completion words of a frame mark it from the IPsec engine
- * (word 0 bit 30), and with which SA (word 1 bits 15:0): the LIF of its
- * port, @x set with a reference, or -ENOENT. RX path (NAPI). Inert while
- * ipsec_outbound_only (no inbound SA is in the engine).
+ * Whether a frame is one the IPsec engine decrypted (on NP6L_LIF_IPSEC_IN,
+ * word 0 bit 30), and with which SA (word 1 bits 15:0): the LIF of its
+ * port, @x set with a reference, or -ENOENT. RX path (NAPI).
  */
-int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1,
-		   struct xfrm_state **x)
+int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1, unsigned int lif,
+		   u16 tci, struct xfrm_state **x)
 {
 	struct fnp6l_sa *sa;
 	unsigned int idx;
 	int ret;
 
-	if (!ips || !(w0 & NP6L_RXW0_IPSEC_DONE))
+	if (!ips || lif != NP6L_LIF_IPSEC_IN || !(w0 & NP6L_RXW0_IPSEC_DONE))
 		return -ENOENT;
 
 	idx = FIELD_GET(NP6L_RXW1_SA_IDX, w1);
 	rcu_read_lock();
 	sa = idx && idx < NP6L_SA_NR ? rcu_dereference(ips->sa_by_idx[idx]) : NULL;
 	if (sa && (!sa->in || !READ_ONCE(sa->hw) || READ_ONCE(sa->deleted) ||
+		   (tci & VLAN_VID_MASK) != sa->in_vid ||
 		   READ_ONCE(ips->stalled)))
 		sa = NULL;
 	if (sa && !refcount_inc_not_zero(&sa->x->refcnt))
@@ -1020,12 +1141,7 @@ int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1,
 		*x = sa->x;
 		ret = sa->lif;
 	} else {
-		/*
-		 * No SA at that index: leave the frame to the host (software
-		 * xfrm), never drop it. A frame with the "processed" bit set and
-		 * no SA is either an SA just gone or, until the completion word
-		 * is confirmed on hardware, a bit read where none was meant.
-		 */
+		/* no SA in service at that index (one just gone): dropped */
 		ret = -ENOENT;
 	}
 	rcu_read_unlock();
@@ -1039,12 +1155,83 @@ int fnp6l_ipsec_rx(struct fnp6l_ipsec *ips, u32 w0, u32 w1,
 	return ret;
 }
 
+static bool fnp6l_sel_match(const struct xfrm_selector *sel,
+			    const struct fnp6l_ipsec_tuple *t);
+
+/*
+ * Whether the selector of SA @x covers the decrypted frame @skb (network
+ * header in front), as xfrm checks it for an SA it decrypts itself. The
+ * ports are those xfrm takes; those of a fragment are not known here and
+ * are not checked. A frame that is not IPv4 is not covered by an IPv4
+ * selector.
+ */
+static bool fnp6l_ipsec_rx_sel(struct sk_buff *skb, const struct xfrm_state *x)
+{
+	const struct xfrm_selector *sel = &x->sel;
+	struct fnp6l_ipsec_tuple t = {};
+	const struct iphdr *iph;
+	__be16 *pp, buf[2];
+
+	if (sel->family != AF_INET)
+		return true;
+	if (skb->protocol != htons(ETH_P_IP) ||
+	    !pskb_may_pull(skb, sizeof(*iph)))
+		return false;
+	iph = (const struct iphdr *)skb->data;
+	if (iph->version != 4 || iph->ihl < 5)
+		return false;
+	t.saddr = iph->saddr;
+	t.daddr = iph->daddr;
+	t.proto = iph->protocol;
+	if (ip_is_fragment(iph)) {
+		t.sport = sel->sport;
+		t.dport = sel->dport;
+		return fnp6l_sel_match(sel, &t);
+	}
+	switch (t.proto) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+	case IPPROTO_UDPLITE:
+	case IPPROTO_SCTP:
+		pp = skb_header_pointer(skb, iph->ihl * 4, sizeof(buf), buf);
+		if (pp) {
+			t.sport = pp[0];
+			t.dport = pp[1];
+		}
+		break;
+	case IPPROTO_ICMP:
+		pp = skb_header_pointer(skb, iph->ihl * 4, sizeof(buf), buf);
+		if (pp) {
+			t.sport = htons(((u8 *)pp)[0]);
+			t.dport = htons(((u8 *)pp)[1]);
+		}
+		break;
+	}
+	return fnp6l_sel_match(sel, &t);
+}
+
+/*
+ * Attach the SA @x to the frame the engine decrypted and checked (its ICV);
+ * the reference goes with it. The sec_path carries no offload marks: for a
+ * frame marked as handled by a packet offload, xfrm skips its policy check
+ * altogether, while unmarked it checks the frame against the inbound and
+ * forward policies as after a decryption in software (the policies are
+ * never offloaded on this port, fnp6l_xdo_policy_add). The selector of the
+ * SA is checked here as well. False if the frame must be dropped (not
+ * covered by the selector, no sec_path, or a full one, counted as xfrm
+ * does): the reference is then dropped too.
+ */
 bool fnp6l_ipsec_rx_skb(struct fnp6l_ipsec *ips, struct sk_buff *skb,
 			struct xfrm_state *x)
 {
-	struct xfrm_offload *xo;
 	struct sec_path *sp;
 
+	if (unlikely(!fnp6l_ipsec_rx_sel(skb, x))) {
+		atomic_long_inc(&ips->rx_sel);
+		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINSTATEMISMATCH);
+		xfrm_state_put(x);
+		return false;
+	}
 	sp = secpath_set(skb);
 	if (unlikely(!sp)) {
 		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINERROR);
@@ -1058,10 +1245,6 @@ bool fnp6l_ipsec_rx_skb(struct fnp6l_ipsec *ips, struct sk_buff *skb,
 		return false;
 	}
 	sp->xvec[sp->len++] = x;
-	sp->olen++;
-	xo = xfrm_offload(skb);
-	xo->flags = CRYPTO_DONE;
-	xo->status = CRYPTO_SUCCESS;
 	if (skb->pkt_type == PACKET_OTHERHOST)
 		skb->pkt_type = PACKET_HOST;
 	return true;
@@ -1095,6 +1278,11 @@ static const char fnp6l_ipsec_stats[][ETH_GSTRING_LEN] = {
 	"ft_refused_ipsec",
 	"flow_purged_ipsec",
 	"ipsec_stalled",
+	"rx_ipsec_sel",
+	"rx_ipsec_err_sa",
+	"rx_ipsec_err_len",
+	"rx_ipsec_err_replay",
+	"rx_ipsec_err_icv",
 };
 
 unsigned int fnp6l_ipsec_nr_stats(const struct fnp6l_ipsec *ips)
@@ -1110,7 +1298,7 @@ void fnp6l_ipsec_get_strings(const struct fnp6l_ipsec *ips, u8 **data)
 		ethtool_puts(data, fnp6l_ipsec_stats[i]);
 }
 
-unsigned int fnp6l_ipsec_get_stats(const struct fnp6l_ipsec *ips, u64 *data)
+unsigned int fnp6l_ipsec_get_stats(struct fnp6l_ipsec *ips, u64 *data)
 {
 	if (!ips)
 		return 0;
@@ -1133,6 +1321,17 @@ unsigned int fnp6l_ipsec_get_stats(const struct fnp6l_ipsec *ips, u64 *data)
 	data[16] = atomic_long_read(&ips->ft_refused);
 	data[17] = atomic_long_read(&ips->ft_purged);
 	data[18] = READ_ONCE(ips->stalled);
+	data[19] = atomic_long_read(&ips->rx_sel);
+	/*
+	 * Drop counters of the inbound engine: the replay one keeps its value
+	 * and stops at 65535, the ICV one clears on read (summed here); SA and
+	 * length errors not seen counting yet, read as they are.
+	 */
+	data[20] = readl(ips->base + NP6L_IPSEC_IB_SAERR);
+	data[21] = readl(ips->base + NP6L_IPSEC_IB_LENERR);
+	data[22] = readl(ips->base + NP6L_IPSEC_IB_RPLERR);
+	data[23] = atomic64_add_return(readl(ips->base + NP6L_IPSEC_IB_HMACERR),
+				       &ips->rx_icv_err);
 	return ARRAY_SIZE(fnp6l_ipsec_stats);
 }
 
@@ -1148,8 +1347,18 @@ static int fnp6l_xdo_policy_add(struct xfrm_policy *xp,
 	unsigned int lif, n;
 
 	xp->xdo.offload_handle = 0;
-	if (xp->xdo.dir != XFRM_DEV_OFFLOAD_OUT)
-		return 0;
+	/*
+	 * Inbound and forward policies stay with xfrm. For a policy in packet
+	 * offload, xfrm takes a frame without sec_path as checked by the
+	 * hardware, and nothing here checks the clear frames received against
+	 * a policy: accepted, such a policy let clear traffic of its selector
+	 * in (measured). Refused, it is installed without offload and xfrm
+	 * checks every frame itself.
+	 */
+	if (xp->xdo.dir != XFRM_DEV_OFFLOAD_OUT) {
+		NL_SET_ERR_MSG_MOD(extack, "only outbound policies are offloaded, install this one without offload");
+		return -EOPNOTSUPP;
+	}
 
 	ips = fnp6l_port_info(ndev, &lif);
 	if (!ips) {
@@ -1233,6 +1442,29 @@ bool fnp6l_ipsec_ft_refuse(struct fnp6l_ipsec *ips, unsigned int in_lif,
 		}
 	}
 	return false;
+}
+
+/*
+ * The VID of the inbound SA in service whose xfrm state is @x, on the port
+ * of LIF @lif: the frames it decrypted are looked up with it. -ENOENT if
+ * there is none (deleted, not offloaded, another port). @x is only
+ * compared. Under the flow-engine lock.
+ */
+int fnp6l_ipsec_ft_in(struct fnp6l_ipsec *ips, const struct xfrm_state *x,
+		      unsigned int lif, u16 *vid)
+{
+	const struct fnp6l_sa *sa;
+
+	if (!ips)
+		return -ENOENT;
+	fnp6l_fe_assert_held(ips->np);
+	list_for_each_entry(sa, &ips->sas, node)
+		if (sa->x == x && sa->in && sa->hw && !sa->spi_gone &&
+		    !READ_ONCE(sa->deleted) && sa->lif == lif) {
+			*vid = sa->in_vid;
+			return 0;
+		}
+	return -ENOENT;
 }
 
 static void fnp6l_pol_unlink(struct fnp6l_pol *pol)
@@ -1554,7 +1786,11 @@ bool fnp6l_ipsec_msg(struct fnp6l_ipsec *ips, const void *buf, unsigned int len)
 		}
 		break;
 	case NP6L_MSG_SA_REPLAY_WIN:
-		if (sa->in)
+		if (!sa->in)
+			break;
+		if (x->replay_esn)
+			x->replay_esn->seq = le32_to_cpu(msg->hi);
+		else
 			x->replay.seq = le32_to_cpu(msg->hi);
 		break;
 	case NP6L_MSG_SA_SEQ_EXHAUSTED:

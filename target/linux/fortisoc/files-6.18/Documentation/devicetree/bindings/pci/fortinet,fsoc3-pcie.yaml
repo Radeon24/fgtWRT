@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pci/fortinet,fsoc3-pcie.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fortinet FortiSOC3 PCIe root port
+
+description: |
+  The single PCIe root port of the Fortinet FortiSOC3, behind a small
+  register block of the SoC through which the link state is read and the
+  configuration accesses are made. The memory window of the link is fixed
+  (16 MiB at 0xf0000000 on the FortiGate 100E). No MSI: the legacy
+  interrupts come on one interrupt of the GIC.
+
+maintainers:
+  - Radeon24 <Radeon24@users.noreply.github.com>
+
+allOf:
+  - $ref: /schemas/pci/pci-host-bridge.yaml#
+
+properties:
+  compatible:
+    const: fortinet,fsoc3-pcie
+
+  reg:
+    maxItems: 1
+
+  ranges:
+    maxItems: 1
+
+  interrupt-map: true
+
+  interrupt-map-mask: true
+
+  "#interrupt-cells":
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - ranges
+  - interrupt-map
+  - interrupt-map-mask
+  - "#interrupt-cells"
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    pcie@f3000000 {
+        compatible = "fortinet,fsoc3-pcie";
+        reg = <0xf3000000 0x100>;
+        device_type = "pci";
+        #address-cells = <3>;
+        #size-cells = <2>;
+        #interrupt-cells = <1>;
+        bus-range = <0x00 0x01>;
+        ranges = <0x02000000 0 0xf0000000 0xf0000000 0 0x01000000>;
+        interrupt-map-mask = <0 0 0 7>;
+        interrupt-map = <0 0 0 1 &gic GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>,
+                        <0 0 0 2 &gic GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>,
+                        <0 0 0 3 &gic GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>,
+                        <0 0 0 4 &gic GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>;
+    };

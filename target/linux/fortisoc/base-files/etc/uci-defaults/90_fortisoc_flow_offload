@@ -1,0 +1,18 @@
+#!/bin/sh
+# FortiGate 100E: with many flows routing and NAT only hold line rate through
+# the NP6Lite, at no CPU load, so hardware flow offloading is on by default
+# there. The firewall still decides: only flows it accepted are offloaded.
+
+. /lib/functions.sh
+
+case "$(board_name)" in
+fortinet,fg100e)
+	uci -q batch <<-EOT
+		set firewall.@defaults[0].flow_offloading='1'
+		set firewall.@defaults[0].flow_offloading_hw='1'
+		commit firewall
+	EOT
+	;;
+esac
+
+exit 0

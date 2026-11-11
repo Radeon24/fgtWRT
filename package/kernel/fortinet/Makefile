@@ -130,10 +130,11 @@ define KernelPackage/fortinet-np6lite-ipsec
 endef
 
 define KernelPackage/fortinet-np6lite-ipsec/description
- IPsec ESP offload of the NP6Lite network processor (FortiSOC3): outbound
- IPv4 ESP states added with "offload packet" on a port of the network
- processor are handled by its in-line IPsec engine (AES-CBC or 3DES-CBC
- with HMAC-MD5, HMAC-SHA1 or HMAC-SHA256); inbound states stay in software.
+ IPsec ESP offload of the NP6Lite network processor (FortiSOC3): IPv4 ESP
+ states added with "offload packet" on a port of the network processor are
+ handled by its in-line IPsec engine (AES-CBC or 3DES-CBC with HMAC-MD5,
+ HMAC-SHA1 or HMAC-SHA256; inbound with anti-replay); the module parameter
+ ipsec_outbound_only=1 leaves inbound states to software.
  Selecting this package builds the offload into kmod-fortinet-np6lite and
  turns on the kernel options it needs (INET_ESP_OFFLOAD, XFRM_OFFLOAD,
  NF_FLOW_TABLE_XFRM_OFFLOAD).

@@ -51,9 +51,14 @@ fortisoc_disk_node() {
 fortisoc_dt_string_matches() {
 	local want got
 
-	want="$(tr -d '\0' < "$1/$2" 2>/dev/null)"
+	# tested first: the shell reports a failed "<" redirection before a
+	# "2>/dev/null" after it applies (the eMMC boards have neither
+	# property, an eMMC no vendor attribute)
+	[ -e "$1/$2" ] || return 0
+	want="$(tr -d '\0' < "$1/$2")"
 	[ -n "$want" ] || return 0
-	read -r got < "$3" 2>/dev/null || return 1
+	[ -r "$3" ] || return 1
+	read -r got < "$3" || return 1
 	[ "$got" = "$want" ]
 }
 

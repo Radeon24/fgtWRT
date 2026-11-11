@@ -50,10 +50,12 @@
 #include <linux/udp.h>
 #include <linux/hash.h>
 #include <linux/hex.h>
+#include <linux/hrtimer.h>
 #include <linux/if_bridge.h>
 #include <linux/iopoll.h>
 #include <linux/jhash.h>
 #include <linux/log2.h>
+#include <linux/math64.h>
 #include <linux/ioport.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
@@ -71,6 +73,7 @@
 #include <linux/ipv6.h>
 #include <net/bonding.h>
 #include <net/dsa.h>
+#include <linux/dsa/8021q.h>
 #include <net/flow_offload.h>
 #include <net/ip.h>
 #include <net/netfilter/nf_flow_table.h>
@@ -336,6 +339,10 @@ struct fnp6l_port {
 	 */
 	unsigned int sw_nports;
 	u8 sw_lif[NP6L_SW_PORTS];
+	/* transmit pacing (fnp6l_tx_pace), under the transmit lock of ndev */
+	u64 tx_next;		/* ns: what was sent is on the wire by then */
+	bool tx_paced;		/* queue stopped by the pacing, tx_pace_timer wakes it */
+	struct hrtimer tx_pace_timer;
 };
 
 struct fnp6l_mdio {
@@ -449,6 +456,7 @@ struct fnp6l {
 	u64 tx_csum_hw, tx_csum_hw6, tx_csum_sw, tx_sg;
 	bool htx_l4_parse_done;
 	bool sse_done;
+	bool ipsec_in_done;	/* fnp6l_ipsec_in_init (fnp6l_sse_lock) */
 	/* ingress classification: each port to its own LIF via class table */
 	bool ic_on;
 	u8 ic_idx[NP6L_MAX_LIF];	/* class table indices to clear on failure */
@@ -522,6 +530,13 @@ struct fnp6l {
 	/* flow table offload: see its section */
 	bool ft_on;			/* the offload state is applied */
 	struct list_head ft_flows;	/* offloaded flows */
+	struct list_head ft_hot;	/* fast flows, queried by ft_cnt_work (fnp6l_sse_lock) */
+	unsigned int ft_nhot;
+	/* flows a query reply found fast: to ft_hot at the next pass (ft_sess_lock) */
+	struct list_head ft_warm;
+	/* windows of the session counters: restarts seen, of them by age, windows estimated */
+	unsigned long ft_wrest, ft_wage, ft_west;
+	struct delayed_work ft_cnt_work;
 	struct hlist_head *ft_chash;	/* the same, by cookie (1 << ft_hbits) */
 	unsigned int ft_hbits;		/* both indexes, fixed at probe */
 	unsigned int ft_nflows;
@@ -529,6 +544,9 @@ struct fnp6l {
 	struct list_head ft_dead;
 	unsigned int ft_ndead;
 	unsigned long ft_delfail, ft_dfree, ft_lagfail;
+	u32 ft_aw_gen;			/* VLAN-aware bridge seen (fnp6l_ft_aw_check) */
+	unsigned long ft_aw_quiet;	/* jiffies: until then aware flows are refused */
+	unsigned long ft_aw_purged;
 	struct delayed_work ft_dead_work;
 	/* DESTROY and STATS of a cookie we do not track (ft_sess_lock) */
 	unsigned long ft_unk_destroy, ft_unk_stats;
@@ -562,7 +580,7 @@ struct fnp6l {
 	unsigned int ft_fdb_n;
 	bool ft_fdb_lost;			/* ring full: every bridged LIF */
 	unsigned long ft_fdb_moves;		/* LIFs whose flows were torn down */
-	struct fnp6l_ft_save ft_save[32];
+	struct fnp6l_ft_save ft_save[64];	/* 20 host-queue entries + 3 per port */
 	unsigned int ft_nsave;
 	/* switch-port classification: see its section */
 	bool sw_on;
@@ -732,8 +750,13 @@ static int fnp6l_pcs_access(struct fnp6l *np, unsigned int blk, unsigned int lan
 	return FIELD_GET(NP6L_QSGMII_PCS_DATA, v);
 }
 
-/* SGMII set-up of the PCS lane of one port: reset, then SGMII and autonegotiation */
-static int fnp6l_pcs_init(struct fnp6l *np, unsigned int port)
+/*
+ * Set-up of the PCS lane of one port: reset, then SGMII and autonegotiation;
+ * or, for a 1000BASE-X link (the uplinks to the switch of the 100E), the
+ * lane forced to 1000/full without autonegotiation
+ */
+static int fnp6l_pcs_init(struct fnp6l *np, unsigned int port,
+			  phy_interface_t mode)
 {
 	unsigned int blk, lane, i;
 
@@ -751,6 +774,10 @@ static int fnp6l_pcs_init(struct fnp6l *np, unsigned int port)
 	}
 	if (i == 1000)
 		dev_warn(np->dev, "PCS %u.%u: reset does not complete\n", blk, lane);
+	if (mode == PHY_INTERFACE_MODE_1000BASEX) {
+		fnp6l_pcs_access(np, blk, lane, 0x00, true, 0x0140);	/* 1000/FD */
+		return 0;
+	}
 	fnp6l_pcs_access(np, blk, lane, 0x12, true, 0x0d40);
 	fnp6l_pcs_access(np, blk, lane, 0x13, true, 0x0003);
 	fnp6l_pcs_access(np, blk, lane, 0x14, true, 0x0053);
@@ -1101,6 +1128,13 @@ static void fnp6l_lif_tables(struct fnp6l *np, struct fnp6l_port *p)
 	if (p->lif == NP6L_LIF_LOADER || p->lif == NP6L_LIF_HOST)
 		return;
 	fnp6l_tbl_op(np, NP6L_TBL_EGR_TAG, p->lif, d, true);
+	/*
+	 * lif_mac as the loader sets it for LIF 0 and the flow offload for
+	 * its host LIFs (w1 bit 16): left as an SRAM residue, a LIF without
+	 * that bit loses its received IPv4 unicast (seen on the 100E, LIF 7)
+	 */
+	d[1] = 0x00010000;
+	fnp6l_tbl_op(np, NP6L_TBL_LIF_MAC, p->lif, d, true);
 	d[1] = FIELD_PREP(GENMASK(22, 16), port << 2 | 1);
 	fnp6l_tbl_op(np, NP6L_TBL_LIF_CFG, p->lif, d, true);
 	d[1] = 0;
@@ -1282,14 +1316,20 @@ static void fnp6l_rx_deliver(struct fnp6l *np, struct fnp6l_vec *v,
 	       get_unaligned_be16(skb->data + 12) == NP6L_PORT_TAG_TPID;
 
 	/*
-	 * A frame the IPsec engine decrypted (completion word 0 bit 30): its
-	 * SA gives the port and the sec_path; delivered to the stack without
-	 * GRO. Inert while no inbound SA is in the engine.
+	 * A frame the IPsec engine decrypted (on NP6L_LIF_IPSEC_IN, completion
+	 * word 0 bit 30): its SA gives the port and the sec_path; delivered to
+	 * the stack without GRO. Anything else on that LIF (no mark, an SA
+	 * gone) is dropped: it is decrypted already, software cannot take it.
 	 */
 	if (np->ipsec) {
 		struct xfrm_state *x = NULL;
-		int il = fnp6l_ipsec_rx(np->ipsec, w0, w1, &x);
+		int il = fnp6l_ipsec_rx(np->ipsec, w0, w1, lif, tci, &x);
 
+		if (il < 0 && lif == NP6L_LIF_IPSEC_IN) {
+			v->rx_unknown_lif++;
+			dev_kfree_skb_any(skb);
+			return;
+		}
 		if (il >= 0) {
 			struct fnp6l_port *ip = il < NP6L_MAX_LIF ?
 						np->port[il] : NULL;
@@ -1499,7 +1539,8 @@ out:
 	spin_unlock(&np->tx_lock);
 	if (woke)
 		for (i = 0; i < NP6L_MAX_LIF; i++)
-			if (np->port[i] && netif_queue_stopped(np->port[i]->ndev))
+			if (np->port[i] && !READ_ONCE(np->port[i]->tx_paced) &&
+			    netif_queue_stopped(np->port[i]->ndev))
 				netif_wake_queue(np->port[i]->ndev);
 }
 
@@ -1857,6 +1898,67 @@ static const struct ethtool_ops fnp6l_ethtool_ops = {
 	.get_ethtool_stats	= fnp6l_get_ethtool_stats,
 };
 
+/*
+ * Transmit pacing. The NP fetches transmit descriptors as soon as they are
+ * posted and writes the frames into the queue of the output port at bus
+ * speed; the queue holds about 30-60 KB, and what does not fit is dropped,
+ * without a counter (frames never written to the queue). Completions come
+ * at the fetch, so the ring gives no back pressure: a TCP sender on the
+ * host offered about 1.09 Gbit/s to a gigabit port and lost 10 % of its
+ * frames. Keep what a port is given at most tx_pace per mille of its link
+ * rate, counted on the wire (preamble, FCS, inter-frame gap: 24 bytes a
+ * frame; an IPsec frame grows by its encapsulation in the NP), with a
+ * burst under that queue: the queue is stopped once 40 KB are ahead of the
+ * wire, and woken when a fifth of it went out (the wake-up takes tens of
+ * microseconds; woken later, the port idles). Measured on a FortiGate 100E,
+ * TCP from the host: mgmt 922 Mbit/s with 83000 retransmissions in 10 s
+ * unpaced, 928-931 Mbit/s with none paced; port1 (through the switch)
+ * 849 Mbit/s with 11946, 875-897 Mbit/s with 0-140.
+ */
+static unsigned int tx_pace = 995;
+module_param(tx_pace, uint, 0644);
+MODULE_PARM_DESC(tx_pace,
+		 "pace what the host sends to a port to this per mille of its link rate (default 995; 0: off)");
+
+#define NP6L_TX_PACE_BURST		(40 * 1024)	/* bytes on the wire */
+#define NP6L_TX_PACE_WAKE		4	/* woken with 4/5 of the burst left */
+#define NP6L_TX_PACE_OVERHEAD		24	/* preamble, FCS, gap */
+#define NP6L_TX_PACE_IPSEC		80	/* outer IPv4, ESP, IV, pad, ICV */
+
+static enum hrtimer_restart fnp6l_tx_pace_timer(struct hrtimer *t)
+{
+	struct fnp6l_port *p = container_of(t, struct fnp6l_port, tx_pace_timer);
+
+	WRITE_ONCE(p->tx_paced, false);
+	netif_wake_queue(p->ndev);
+	return HRTIMER_NORESTART;
+}
+
+/* after a frame of @len bytes (no FCS) went to the ring for port @p */
+static void fnp6l_tx_pace(struct fnp6l_port *p, unsigned int len, bool ipsec)
+{
+	u32 pm = READ_ONCE(tx_pace);
+	int speed = READ_ONCE(p->speed);
+	u64 now, rate, burst;
+
+	if (!pm || speed <= 0)
+		return;
+	pm = min(pm, 1000U);
+	rate = (u64)speed * pm;		/* kbit/s: wire bytes * 8e6 / rate = ns */
+	len = max(len, (unsigned int)ETH_ZLEN) + NP6L_TX_PACE_OVERHEAD +
+	      (ipsec ? NP6L_TX_PACE_IPSEC : 0);
+	now = ktime_get_ns();
+	p->tx_next = max(p->tx_next, now) + div64_u64((u64)len * 8000000, rate);
+	burst = div64_u64((u64)NP6L_TX_PACE_BURST * 8000000, rate);
+	if (p->tx_next - now <= burst)
+		return;
+	WRITE_ONCE(p->tx_paced, true);
+	netif_stop_queue(p->ndev);
+	hrtimer_start(&p->tx_pace_timer,
+		      ns_to_ktime(p->tx_next - div_u64(burst * NP6L_TX_PACE_WAKE, 5)),
+		      HRTIMER_MODE_ABS_SOFT);
+}
+
 static netdev_tx_t fnp6l_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct fnp6l_port *p = netdev_priv(ndev);
@@ -1889,6 +1991,12 @@ static netdev_tx_t fnp6l_xmit(struct sk_buff *skb, struct net_device *ndev)
 		if (r < 0)
 			goto drop;
 		sa_idx = r;
+	}
+	/* a shared skb (pktgen with clone_skb) is written to below */
+	skb = skb_share_check(skb, GFP_ATOMIC);
+	if (!skb) {
+		ndev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
 	}
 	if (skb_put_padto(skb, ETH_ZLEN))
 		goto dropped;
@@ -1992,6 +2100,7 @@ static netdev_tx_t fnp6l_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	ndev->stats.tx_packets++;
 	ndev->stats.tx_bytes += len - NP6L_HTAG_LEN;
+	fnp6l_tx_pace(p, len - NP6L_HTAG_LEN, sa_idx);
 	return NETDEV_TX_OK;
 
 unmap:
@@ -2025,7 +2134,7 @@ static int fnp6l_open(struct net_device *ndev)
 	}
 	p->speed = 0;
 	p->duplex = DUPLEX_UNKNOWN;
-	fnp6l_pcs_init(p->np, p->link - 1);
+	fnp6l_pcs_init(p->np, p->link - 1, p->phy_mode);
 	fnp6l_mac_init(p->np, p->link - 1);
 	phy_start(phy);
 	netif_start_queue(ndev);
@@ -2037,6 +2146,8 @@ static int fnp6l_stop(struct net_device *ndev)
 	struct fnp6l_port *p = netdev_priv(ndev);
 
 	netif_stop_queue(ndev);
+	hrtimer_cancel(&p->tx_pace_timer);
+	WRITE_ONCE(p->tx_paced, false);
 	if (ndev->phydev) {
 		phy_stop(ndev->phydev);
 		phy_disconnect(ndev->phydev);
@@ -2129,8 +2240,12 @@ static int fnp6l_add_port(struct fnp6l *np, struct device_node *dn)
 	u32 lif, link;
 	int ret;
 
+	/*
+	 * LIFs 4-6 are the host trunk LIFs the flow offload posts
+	 * (fnp6l_ft_host_residues): a port there sends to a host queue
+	 */
 	if (of_property_read_u32(dn, "reg", &lif) || lif >= NP6L_MAX_LIF ||
-	    lif == NP6L_LIF_HOST || np->port[lif] ||
+	    lif == NP6L_LIF_HOST || (lif >= 4 && lif <= 6) || np->port[lif] ||
 	    of_property_read_u32(dn, "fortinet,np-link", &link) ||
 	    link < 1 || link > NP6L_NR_MACS) {
 		dev_err(np->dev, "%pOF: bad reg or fortinet,np-link\n", dn);
@@ -2146,6 +2261,8 @@ static int fnp6l_add_port(struct fnp6l *np, struct device_node *dn)
 	p->dn = dn;
 	p->lif = lif;
 	p->link = link;
+	hrtimer_setup(&p->tx_pace_timer, fnp6l_tx_pace_timer, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_ABS_SOFT);
 	p->conduit = fnp6l_dt_is_conduit(dn);
 	fnp6l_dt_switch_lifs(np, p);
 	ret = of_get_phy_mode(dn, &p->phy_mode);
@@ -2532,6 +2649,13 @@ static int fnp6l_sse_init(struct fnp6l *np)
 #define NP6L_SSE_DEL_ROOM(n)		((n) / 8)	/* kept for deletes */
 #define NP6L_SSE_TXQ			1	/* host transmit queue of the commands */
 
+/*
+ * Byte 125 of a full IPv4 session entry of a UDP flow, TCP flows being 0x0b.
+ * On the FortiGate 100E, 0x0c stops all delivery to the host at the first hit
+ * of the session until the next power cycle (fortinet,sse-udp-tail).
+ */
+static u8 fnp6l_sse_udp_tail = 0x0c;
+
 struct fnp6l_sse_opt {
 	u32 out, mtu;
 	u8 dmac[ETH_ALEN];
@@ -2605,7 +2729,7 @@ static void fnp6l_sse_entry4(u8 *e, u8 proto, __be32 sip, __be16 sport,
 		memcpy(e + 80, &dip, 4);	/* nat_daddr */
 		memset(e + 104, 0xff, 18);
 		e[122] = 0x0f;
-		e[125] = proto == IPPROTO_TCP ? 0x0b : 0x0c;
+		e[125] = proto == IPPROTO_TCP ? 0x0b : fnp6l_sse_udp_tail;
 	} else {
 		memset(e + 110, 0xff, NP6L_SSE_ENTRY_LEN - 110);	/* reserved, all ones */
 		if (o->has_mtu)
@@ -2873,13 +2997,16 @@ static int fnp6l_dbg_sse_show(struct seq_file *m, void *unused)
 	seq_printf(m, "ft flows %u qsent %lu qreply %lu qmatch %lu qchange %lu qdrop %lu qoff %d\n",
 		   np->ft_nflows, np->ft_qsent, np->ft_qreply, np->ft_qmatch,
 		   np->ft_qchange, np->ft_qdrop, np->ft_qoff);
+	seq_printf(m, "ft counters: fast %u restarts %lu aged %lu estimated %lu\n",
+		   np->ft_nhot, np->ft_wrest, np->ft_wage, np->ft_west);
 	seq_printf(m, "sse cmds %lu waits %lu wait_us %llu max_us %u sleeps %lu full %lu tmo %lu spin_us %u stall_ms %u qskip %lu slots %u\n",
 		   np->sse_cmds, np->sse_waits, np->sse_wait_us,
 		   np->sse_wait_max_us, np->sse_sleeps, np->sse_full,
 		   np->sse_tmo, READ_ONCE(sse_spin_us), np->sse_stall_max_ms,
 		   np->sse_qskip, np->cmdq.size);
-	seq_printf(m, "ft dead %u delfail %lu dfree %lu lagfail %lu\n",
-		   np->ft_ndead, np->ft_delfail, np->ft_dfree, np->ft_lagfail);
+	seq_printf(m, "ft dead %u delfail %lu dfree %lu lagfail %lu aware_purged %lu\n",
+		   np->ft_ndead, np->ft_delfail, np->ft_dfree, np->ft_lagfail,
+		   np->ft_aw_purged);
 	/* messages by header byte 0 (3:0); the last one no query matched */
 	seq_printf(m, "ft msg nomatch %lu", np->ft_qnomatch);
 	for (t = 0; t < NP6L_FT_MSGTYPES; t++)
@@ -3157,6 +3284,9 @@ static void fnp6l_dbg_cap_show(struct seq_file *m, struct fnp6l *np)
 static unsigned int ft_stats_ms = 2000;
 module_param(ft_stats_ms, uint, 0644);
 MODULE_PARM_DESC(ft_stats_ms, "least interval (ms) between two activity queries of a flow (default 2000)");
+static unsigned int ft_cnt_ms = 50;
+module_param(ft_cnt_ms, uint, 0644);
+MODULE_PARM_DESC(ft_cnt_ms, "interval (ms) between two counter queries of the fast flows (default 50, 0: none, counters of flows above 8 Mbit/s then estimated)");
 /*
  * UDP flows: offloaded by default; 0 leaves new UDP flows to the software
  * flow table (fallback kept for a stall of the host delivery once seen
@@ -3181,6 +3311,32 @@ MODULE_PARM_DESC(ft_nat66, "offload IPv6 address NAT (default 1: yes; 0: no; 2: 
 #define NP6L_FT_MSG_QUERY		1	/* header byte 1 of a query reply */
 #define NP6L_FT_STATS_OFF		24	/* activity counters: what a hit moves */
 #define NP6L_FT_STATS_LEN		32
+/*
+ * Counters of a session, in the service bytes (measured): a window of bytes
+ * (frames without FCS) and packets, the time it started on a clock of the
+ * NP and the time of its last packet since then, both in ticks of 20 ms. A
+ * read does not clear them. A packet that finds the window at 0xffc000 bytes
+ * or 0xffc0 packets or more, or older than the timeout of the entry (2000
+ * ticks), starts a new window with itself; idle time alone ends none, and
+ * nothing keeps count of the windows. The sums are therefore kept here, from
+ * the query replies: a new start time tells a restart, and a fast flow is
+ * queried often enough to see each of them (a window lasts 134 ms at
+ * 1 Gbit/s of full frames, 44 ms at the line rate of 64-byte frames).
+ */
+#define NP6L_FT_CNT_TICKS		0
+#define NP6L_FT_CNT_AGE			2
+#define NP6L_FT_CNT_START		4
+#define NP6L_FT_CNT_BYTES		15
+#define NP6L_FT_CNT_PKTS		18
+#define NP6L_FT_CNT_WINDOW		0xffc000
+#define NP6L_FT_CNT_WINDOW_PKTS		0xffc0
+#define NP6L_FT_CNT_TICK_MS		20
+#define NP6L_FT_CNT_MIN_TICKS		2	/* least length of a window */
+#define NP6L_FT_CNT_ACTIVE_TICKS	3	/* last frame seen this close to a reply: active */
+#define NP6L_FT_CNT_RATE_SHIFT		10	/* rates: packets per 1024 ticks */
+#define NP6L_FT_HOT_MAX			64
+#define NP6L_FT_HOT_LIFE		4	/* queries of a new flow, whatever its rate */
+#define NP6L_FT_HOT_BPMS		1000	/* bytes per ms: 8 Mbit/s */
 #define NP6L_FT_KEYS			(BIT_ULL(FLOW_DISSECTOR_KEY_META) |		\
 			 BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |		\
 			 BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |		\
@@ -3206,8 +3362,22 @@ struct fnp6l_ft_flow {
 	u8 a6o[24];		/* the same after NAT (output headers) */
 	u8 n_in_lif;		/* sessions: one per ingress LIF (bond members) */
 	u8 in_lif[NP6L_SW_PORTS];	/* ingress LIFs of the keys (a port or bond members) */
+	/* in_vid of each session: vid, or the VID of a member of a bond of
+	 * tagged switch ports (all on the conduit's LIF) */
+	u16 in_vid[NP6L_SW_PORTS];
+	/*
+	 * Decrypted by this inbound SA (FLOW_ACTION_XFRM_IN), parse only:
+	 * compared with the SAs in service under the flow-engine lock, never
+	 * followed (fnp6l_ipsec_ft_in).
+	 */
+	const struct xfrm_state *xin;
+	/* an end in the VLAN-aware bridge: changes of the bridge after
+	 * aw_gen take the flow off (fnp6l_ft_aw_check) */
+	bool aw;
+	u32 aw_gen;
 	/* output to a bond, member pinned: re-picked on member changes */
 	struct net_device *obond;
+	bool qbond;		/* obond of tagged switch ports: out_vid follows */
 	/* a bond at one end: trunk generation at the parse (fnp6l_ft_replace) */
 	bool tbond;
 	unsigned int tgen;
@@ -3215,6 +3385,12 @@ struct fnp6l_ft_flow {
 	u8 eth[2 * ETH_ALEN], l3[8], l4[4];	/* output headers (after NAT) */
 	/* activity from the query replies of each session */
 	unsigned long lastused, qtime;
+	/* counters: on np->ft_hot, sum at the last pass, sums reported */
+	struct list_head hot;
+	struct list_head warm;		/* np->ft_warm (ft_sess_lock) */
+	unsigned int hlife;
+	u64 hbytes, rep_bytes, rep_pkts;
+	u8 l2len;		/* bytes of a frame in front of the IP header */
 	struct fnp6l_ft_sess {
 		struct hlist_node hn;		/* np->ft_hash, by key */
 		struct fnp6l_ft_flow *flow;
@@ -3223,6 +3399,12 @@ struct fnp6l_ft_flow {
 		bool snap_ok;
 		bool missing;		/* a query found no such session */
 		bool refused;		/* missing, matched to a refusal: never deleted */
+		u32 wbytes, wpkts;	/* window at the last reply */
+		u32 wstart, wticks;	/* its start and the time of its last packet */
+		u32 rate;		/* packets per 1024 ticks up to the last reply */
+		unsigned long rtime;	/* time of the last reply */
+		u64 bytes, pkts;	/* sums, frames without FCS */
+		u64 acc_bytes, acc_pkts;	/* of them, in the netdev stats */
 	} s[NP6L_SW_PORTS];
 	unsigned int nback;	/* times given back before (fnp6l_ft_back_take) */
 };
@@ -3434,6 +3616,7 @@ static int fnp6l_ft_apply(struct fnp6l *np)
 	vlan_tpid = fnp6l_rd(np, NP6L_IGR_VLAN_TPID);
 	fnp6l_wr(np, NP6L_IGR_VLAN_TPID, NP6L_IGR_VLAN_TPID_8021Q);
 	np->ft_on = true;
+	schedule_delayed_work(&np->ft_cnt_work, HZ);
 	dev_info(np->dev,
 		 "ft: offload state applied (host queues + port_action, %u entries saved, VLAN TPID %#x -> %#x)\n",
 		 np->ft_nsave, vlan_tpid, NP6L_IGR_VLAN_TPID_8021Q);
@@ -3515,7 +3698,7 @@ static int fnp6l_ft_fcmd(struct fnp6l *np, bool insert, struct fnp6l_ft_flow *f,
 			 unsigned int i, const struct fnp6l_sse_opt *opt)
 {
 	return fnp6l_ft_cmd6(np, insert, f->proto, f->sip, f->sport, f->dip,
-			     f->dport, f->in_lif[i], f->vid, opt,
+			     f->dport, f->in_lif[i], f->in_vid[i], opt,
 			     f->v6 ? f->a6 : NULL);
 }
 
@@ -3619,8 +3802,8 @@ static void fnp6l_ft_keys(struct fnp6l_ft_flow *flow)
 
 		memset(s->key, 0, sizeof(s->key));
 		fnp6l_sse_entry4(s->key, flow->proto, flow->sip, flow->sport,
-				 flow->dip, flow->dport, flow->in_lif[i], flow->vid,
-				 0, 0, NULL);
+				 flow->dip, flow->dport, flow->in_lif[i],
+				 flow->in_vid[i], 0, 0, NULL);
 		if (flow->v6)
 			s->key[15] |= 0x40;	/* KEY_TAGGED: IPv6 session */
 	}
@@ -3641,17 +3824,25 @@ static void fnp6l_ft_hash_add(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 
 		s->flow = flow;
 		s->snap_ok = false;
+		s->wbytes = 0;
+		s->wpkts = 0;
+		s->rate = 0;
+		s->rtime = 0;
 		hlist_add_head(&s->hn, &np->ft_hash[fnp6l_ft_khash(np, s->key)]);
 	}
 	spin_unlock_bh(&np->ft_sess_lock);
 }
 
 /* off the key and cookie indexes; its session keys kept as deleted */
+static void fnp6l_ft_account(struct fnp6l *np, struct fnp6l_ft_flow *flow);
+
 static void fnp6l_ft_unhash(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 {
 	unsigned int i;
 
 	spin_lock_bh(&np->ft_sess_lock);
+	fnp6l_ft_account(np, flow);	/* what the last report left */
+	list_del_init(&flow->warm);
 	hlist_del_init(&flow->cnode);
 	for (i = 0; i < NP6L_SW_PORTS; i++) {
 		if (hlist_unhashed(&flow->s[i].hn))
@@ -3668,6 +3859,10 @@ static void fnp6l_ft_unlink(struct fnp6l *np, struct fnp6l_ft_flow *flow)
 {
 	list_del(&flow->node);
 	np->ft_nflows--;
+	if (!list_empty(&flow->hot)) {
+		list_del_init(&flow->hot);
+		np->ft_nhot--;
+	}
 	fnp6l_ft_unhash(np, flow);
 }
 
@@ -4204,6 +4399,292 @@ static bool fnp6l_ft_deleted_key(struct fnp6l *np, const u8 *k)
 }
 
 /*
+ * The counters of a query reply (ft_sess_lock). A new start time: the window
+ * of the last reply ended and frames went uncounted, in it and in windows
+ * that filled since, if any.
+ *
+ * The old window: the next window having started before the old one came of
+ * age, it was filled, and what it lacked is counted exactly, as frames of
+ * the mean size of the new window. Otherwise its age may have ended it: it
+ * is given the frames the rate before the gap makes of the gap, less those
+ * of the new window, up to what it lacked.
+ *
+ * Windows filled unseen only happen to a flow not queried often enough (one
+ * that turned fast since its last reply, or the list of the fast flows
+ * full). Their number is estimated from the frames the gap had room for: at
+ * the rate of the new window if the flow was sending at the last reply,
+ * else at the mean of the rate before the gap and the rate of the new
+ * window. The gap is bounded by the time since the last reply and by the
+ * time between the last frame seen then and the start of the new window. A
+ * flow found fast joins the fast flows at their next pass, which leaves the
+ * estimate to its first gap.
+ */
+static void fnp6l_ft_count(struct fnp6l *np, struct fnp6l_ft_sess *s,
+			   const u8 *st)
+{
+	u32 bytes = get_unaligned_le24(st + NP6L_FT_CNT_BYTES);
+	u32 pkts = get_unaligned_le16(st + NP6L_FT_CNT_PKTS);
+	u32 ticks = get_unaligned_le16(st + NP6L_FT_CNT_TICKS);
+	u32 start = get_unaligned_le32(st + NP6L_FT_CNT_START);
+	unsigned long now = jiffies;
+	u32 ms = s->rtime ? jiffies_to_msecs(now - s->rtime) : 0;
+	bool restart = false;
+	u64 db, dp;
+
+	if (!s->snap_ok ||
+	    (start == s->wstart && bytes >= s->wbytes && pkts >= s->wpkts)) {
+		db = bytes - s->wbytes;
+		dp = pkts - s->wpkts;
+	} else {
+		u32 size = pkts ? bytes / pkts :
+			   s->wpkts ? s->wbytes / s->wpkts : 0;
+		u32 cap = NP6L_FT_CNT_WINDOW_PKTS, rest, room, span, a, b, rate = 0;
+		u32 age = get_unaligned_le16(st + NP6L_FT_CNT_AGE);
+		u32 gap = DIV_ROUND_UP(ms, NP6L_FT_CNT_TICK_MS);
+		u32 moved = start - s->wstart;
+		u64 fit, old, full = 0;
+
+		rest = cap - min(s->wpkts, cap);
+		if (size) {
+			room = NP6L_FT_CNT_WINDOW -
+			       min_t(u32, s->wbytes, NP6L_FT_CNT_WINDOW);
+			rest = min(rest, DIV_ROUND_UP(room, size));
+			cap = min(cap, DIV_ROUND_UP(NP6L_FT_CNT_WINDOW, size));
+		}
+		/* the new window, from its first to its last packet */
+		if (pkts)
+			rate = ((pkts - 1) << (NP6L_FT_CNT_RATE_SHIFT + 1)) /
+			       max(2 * ticks, 1U);
+		/*
+		 * From the last frame seen to the new window (a), and from
+		 * the last reply to the new window (b), its last frame taken
+		 * as now. a no longer than b: the flow was sending at the last
+		 * reply, at the rate of the new window ever since (a burst);
+		 * otherwise it started in between, at a rate between the two.
+		 */
+		a = moved > s->wticks ? moved - s->wticks : 0;
+		b = gap > ticks ? gap - ticks : 0;
+		span = min(a, b);
+		if (a <= b + NP6L_FT_CNT_ACTIVE_TICKS)
+			fit = ((u64)span * rate + BIT(NP6L_FT_CNT_RATE_SHIFT - 1)) >>
+			      NP6L_FT_CNT_RATE_SHIFT;
+		else
+			fit = ((u64)span * ((u64)s->rate + rate) +
+			       BIT(NP6L_FT_CNT_RATE_SHIFT)) >>
+			      (NP6L_FT_CNT_RATE_SHIFT + 1);
+		old = rest;
+		if (age && moved >= age) {
+			/* frames of the whole gap, less those of the new window */
+			old = ((u64)gap * s->rate +
+			       BIT(NP6L_FT_CNT_RATE_SHIFT - 1)) >>
+			      NP6L_FT_CNT_RATE_SHIFT;
+			old = min_t(u64, rest, old > pkts ? old - pkts : 0);
+			np->ft_wage++;
+		}
+		if (fit > old)
+			full = min_t(u64, div_u64(fit - old + cap / 2, cap),
+				     span / NP6L_FT_CNT_MIN_TICKS);
+		dp = old + full * cap;
+		db = dp * size + bytes;
+		dp += pkts;
+		np->ft_wrest++;
+		np->ft_west += full;
+		restart = true;
+	}
+	s->bytes += db;
+	s->pkts += dp;
+	if (ms)
+		s->rate = min_t(u64, U32_MAX,
+				div_u64((dp * NP6L_FT_CNT_TICK_MS) <<
+					NP6L_FT_CNT_RATE_SHIFT, ms));
+	/* fast: to the flows queried each ft_cnt_ms (fnp6l_ft_cnt_work) */
+	if (ms && ((restart && dp > pkts) ||
+		   db >= (u64)ms * NP6L_FT_HOT_BPMS) &&
+	    list_empty(&s->flow->warm))
+		list_add_tail(&s->flow->warm, &np->ft_warm);
+	s->wbytes = bytes;
+	s->wpkts = pkts;
+	s->wstart = start;
+	s->wticks = ticks;
+	s->rtime = now;
+}
+
+/*
+ * Offloaded frames into the netdev statistics of the ports of the NP, which
+ * otherwise count the host path only: received on the port of the session's
+ * ingress LIF, sent on the port of the output LIF. A switch port (conduit
+ * LIF) counts in the switch, the output trunk of a bond has no port.
+ */
+static void fnp6l_ft_account(struct fnp6l *np, struct fnp6l_ft_flow *flow)
+{
+	struct fnp6l_port *in, *out = NULL;
+	u64 b, p;
+	unsigned int i, lif = flow->opt.out;
+
+	if (lif < NP6L_MAX_LIF && np->port[lif] && !np->port[lif]->conduit)
+		out = np->port[lif];
+	for (i = 0; i < flow->n_in_lif; i++) {
+		struct fnp6l_ft_sess *s = &flow->s[i];
+
+		b = s->bytes - s->acc_bytes;
+		p = s->pkts - s->acc_pkts;
+		if (!p)
+			continue;
+		s->acc_bytes = s->bytes;
+		s->acc_pkts = s->pkts;
+		lif = flow->in_lif[i];
+		in = lif < NP6L_MAX_LIF ? np->port[lif] : NULL;
+		if (in && !in->conduit) {
+			DEV_STATS_ADD(in->ndev, rx_packets, p);
+			DEV_STATS_ADD(in->ndev, rx_bytes, b);
+		}
+		if (out) {
+			DEV_STATS_ADD(out->ndev, tx_packets, p);
+			DEV_STATS_ADD(out->ndev, tx_bytes, b);
+		}
+	}
+}
+
+/* what a flow counted since its last report, in IP bytes (ft_sess_lock) */
+static void fnp6l_ft_take(struct fnp6l *np, struct fnp6l_ft_flow *flow,
+			  u64 *bytes, u64 *pkts)
+{
+	u64 b = 0, p = 0, db, dp;
+	unsigned int i;
+
+	fnp6l_ft_account(np, flow);
+	for (i = 0; i < flow->n_in_lif; i++) {
+		b += flow->s[i].bytes;
+		p += flow->s[i].pkts;
+	}
+	db = b - flow->rep_bytes;
+	dp = p - flow->rep_pkts;
+	flow->rep_bytes = b;
+	flow->rep_pkts = p;
+	*bytes += db - min_t(u64, db, dp * flow->l2len);
+	*pkts += dp;
+}
+
+/* to the list of the fast flows (fnp6l_sse_lock) */
+static void fnp6l_ft_hot(struct fnp6l *np, struct fnp6l_ft_flow *flow,
+			 unsigned int life)
+{
+	if (!list_empty(&flow->hot) || np->ft_nhot >= NP6L_FT_HOT_MAX)
+		return;
+	flow->hlife = life;
+	list_add_tail(&flow->hot, &np->ft_hot);
+	np->ft_nhot++;
+}
+
+/* the fast flows: a query each ft_cnt_ms, off the list once slow */
+static u32 fnp6l_ft_aw_gen(void);
+
+#define NP6L_FT_AW_QUIET		(5 * HZ)
+
+/*
+ * Tear the flow of the flow table down whose direction @cookie is (the
+ * cookie is its tuple): the next packet sets a new flow up, its path taken
+ * from the configuration as it is then. Only while the flow is known to be
+ * there: in its REPLACE, or tracked (its DESTROY waits for the flow-engine
+ * lock).
+ */
+static void fnp6l_ft_kernel_teardown(unsigned long cookie)
+{
+	struct flow_offload_tuple *t = (struct flow_offload_tuple *)cookie;
+	struct flow_offload_tuple_rhash *th;
+
+	th = container_of(t, struct flow_offload_tuple_rhash, tuple);
+	flow_offload_teardown(container_of(th - t->dir, struct flow_offload,
+					   tuplehash[0]));
+}
+
+/*
+ * Flows with an end in the VLAN-aware bridge set up before its last change
+ * (a VLAN, a PVID, a port in or out): their VID may no longer be the one of
+ * the end, and the flow table would offer them again with the path it took
+ * before the change (it does not follow bridge VLANs). Their sessions go,
+ * and their flows in the flow table, set up again by the next packet with
+ * the path as it is now. For a while after a change, aware flows are
+ * refused and torn down too (fnp6l_ft_parse): their path may predate it.
+ * Flow-engine lock.
+ */
+static void fnp6l_ft_aw_check(struct fnp6l *np)
+{
+	struct fnp6l_ft_flow *flow, *tmp;
+	unsigned int n = 0;
+	u32 gen = fnp6l_ft_aw_gen();
+
+	if (gen == np->ft_aw_gen)
+		return;
+	WRITE_ONCE(np->ft_aw_quiet, jiffies + NP6L_FT_AW_QUIET);
+	list_for_each_entry_safe(flow, tmp, &np->ft_flows, node) {
+		if (!flow->aw || flow->aw_gen == gen)
+			continue;
+		fnp6l_ft_kernel_teardown(flow->cookie);
+		fnp6l_ft_unlink(np, flow);
+		fnp6l_ft_drop(np, flow);
+		n++;
+	}
+	WRITE_ONCE(np->ft_aw_gen, gen);
+	np->ft_aw_purged += n;
+}
+
+static void fnp6l_ft_cnt_work(struct work_struct *work)
+{
+	struct fnp6l *np = container_of(to_delayed_work(work), struct fnp6l,
+					ft_cnt_work);
+	unsigned int ms = READ_ONCE(ft_cnt_ms);
+	struct fnp6l_ft_flow *flow, *tmp;
+	unsigned int i;
+
+	mutex_lock(&fnp6l_sse_lock);
+	if (READ_ONCE(np->ft_on) && np->sse_done)
+		fnp6l_ft_aw_check(np);
+	mutex_unlock(&fnp6l_sse_lock);
+	if (!ms)
+		goto out;
+	mutex_lock(&fnp6l_sse_lock);
+	if (!READ_ONCE(np->ft_on) || !np->sse_done)
+		goto unlock;
+	/* the flows the query replies found fast since the last pass */
+	spin_lock_bh(&np->ft_sess_lock);
+	list_for_each_entry_safe(flow, tmp, &np->ft_warm, warm) {
+		list_del_init(&flow->warm);
+		fnp6l_ft_hot(np, flow, NP6L_FT_HOT_LIFE);
+	}
+	spin_unlock_bh(&np->ft_sess_lock);
+	list_for_each_entry_safe(flow, tmp, &np->ft_hot, hot) {
+		u64 sum = 0;
+
+		if (fnp6l_cmdq_room(np) <
+		    NP6L_SSE_QUERY_ROOM(np->cmdq.size) + flow->n_in_lif) {
+			np->sse_qskip++;
+			break;
+		}
+		spin_lock_bh(&np->ft_sess_lock);
+		for (i = 0; i < flow->n_in_lif; i++)
+			sum += flow->s[i].bytes;
+		spin_unlock_bh(&np->ft_sess_lock);
+		if (flow->hlife) {
+			flow->hlife--;
+		} else if (sum - flow->hbytes < ms * NP6L_FT_HOT_BPMS) {
+			list_del_init(&flow->hot);
+			np->ft_nhot--;
+			continue;
+		}
+		flow->hbytes = sum;
+		WRITE_ONCE(flow->qtime, jiffies);
+		for (i = 0; i < flow->n_in_lif; i++)
+			fnp6l_ft_query(np, &flow->s[i]);
+	}
+unlock:
+	mutex_unlock(&fnp6l_sse_lock);
+out:
+	schedule_delayed_work(&np->ft_cnt_work,
+			      msecs_to_jiffies(ms ?: 1000));
+}
+
+/*
  * An NP message (NP6L_WB_MSG), in NAPI context. A query reply carries the
  * stored entry; where it starts in the message is found by its key, searched
  * until a first match (ft_qoff), then only there. A session whose service
@@ -4256,6 +4737,7 @@ static void fnp6l_rx_msg(struct fnp6l *np, const u8 *buf, unsigned int len)
 			WRITE_ONCE(s->flow->lastused, jiffies);
 			np->ft_qchange++;
 		}
+		fnp6l_ft_count(np, s, buf + off + NP6L_FT_STATS_OFF);
 		memcpy(s->snap, buf + off + NP6L_FT_STATS_OFF, NP6L_FT_STATS_LEN);
 		s->snap_ok = true;
 		WRITE_ONCE(s->missing, false);
@@ -4415,6 +4897,10 @@ static int fnp6l_sw_map(struct fnp6l *np)
 	for (i = 0; i < NP6L_MAX_LIF; i++) {
 		c = np->port[i];
 		if (!c || !c->conduit)
+			continue;
+		/* no LIF of its own (tag_8021q ports): nothing to classify */
+		if (!c->sw_nports &&
+		    !of_property_present(c->dn, "fortinet,switch-logical-interfaces"))
 			continue;
 		if (!c->sw_nports) {
 			netdev_warn(c->ndev, "sw_class: conduit without switch-port LIFs\n");
@@ -4892,6 +5378,330 @@ static unsigned int fnp6l_ft_bare_lif(struct fnp6l *np, struct net_device *dev)
 }
 
 /*
+ * Switch ports with a VLAN tagger (FortiGate 100E: BCM53344, tagger
+ * bcm53344-8021q): the switch puts every frame from a user port on its
+ * conduit with a tag_8021q VLAN, and takes back on that VLAN only the
+ * frames for that port (standalone VID) or for the ports of its bridge
+ * (bridge VID, the switch looks the destination up). Its front ports never
+ * take a VID from a frame (the switch driver sets that up), so the VID is
+ * the source port or bridge. Such a user port is a flow end on the
+ * conduit's LIF with that VID: matched on ingress, pushed on output. No
+ * classification of switch ports (sw_on) is needed.
+ */
+/* tag_8021q is part of the DSA core */
+#if IS_REACHABLE(CONFIG_NET_DSA) && defined(DSA_TAG_PROTO_BCM53344_8021Q_VALUE)
+#if __has_include(<linux/dsa/bcm53344.h>)
+#include <linux/dsa/bcm53344.h>
+
+/*
+ * Internal VID of the 802.1Q device @vid on tagged switch port @dev, which
+ * the switch translates (switch driver): matched and pushed in place of
+ * the standalone VID and the 802.1Q tag. 0 when not translated.
+ */
+static u16 fnp6l_ft_q_xlt(struct net_device *dev, u16 vid)
+{
+	struct dsa_port *dp = fnp6l_dsa_port(dev);
+
+	if (IS_ERR_OR_NULL(dp))
+		return 0;
+	return bcm53344_xlt_ivid(dp->ds, dp->index, vid);
+}
+
+/*
+ * VID a flow end on port @dev of the VLAN-aware bridge has on the conduit:
+ * @vid of a tagged end, the PVID of an untagged one (@vid 0), as the switch
+ * applies them; 0 when it cannot be told (bcm53344_aware_vid).
+ */
+static u16 fnp6l_ft_aw_vid(struct net_device *dev, u16 vid)
+{
+	struct dsa_port *dp = fnp6l_dsa_port(dev);
+
+	if (IS_ERR_OR_NULL(dp))
+		return 0;
+	return bcm53344_aware_vid(dp->ds, dp->index, vid);
+}
+
+/* changes of the VLAN-aware bridge so far: a flow set up before goes */
+static u32 fnp6l_ft_aw_gen(void)
+{
+	return atomic_read(&bcm53344_aware_gen);
+}
+#else
+static u16 fnp6l_ft_q_xlt(struct net_device *dev, u16 vid)
+{
+	return 0;
+}
+
+static u16 fnp6l_ft_aw_vid(struct net_device *dev, u16 vid)
+{
+	return 0;
+}
+
+static u32 fnp6l_ft_aw_gen(void)
+{
+	return 0;
+}
+#endif
+
+static bool fnp6l_conduit_q(const struct fnp6l_port *c)
+{
+	const struct dsa_port *cpu;
+
+	if (!c || !c->conduit)
+		return false;
+	cpu = c->ndev->dsa_ptr;
+	return cpu && cpu->dst && cpu->dst->tag_ops &&
+	       cpu->dst->tag_ops->proto == DSA_TAG_PROTO_BCM53344_8021Q;
+}
+
+/* every port below the bridge a user port of tree @priv offloading it */
+static int fnp6l_ft_q_br_lower(struct net_device *lower,
+			       struct netdev_nested_priv *priv)
+{
+	const struct fnp6l_ft_br *b = priv->data;
+	struct dsa_port *dp;
+
+	if (netdev_uses_dsa(lower))
+		return 0;
+	dp = fnp6l_dsa_port(lower);
+	if (IS_ERR_OR_NULL(dp) || dp->ds->dst != b->dst ||
+	    !dsa_port_offloads_bridge_dev(dp, b->br))
+		return 1;
+	return 0;
+}
+
+/*
+ * LIF and VID of @dev as a flow end: a user port behind one of our
+ * conduits with the bcm53344-8021q tagger, bare (bare_ports: its
+ * standalone VID) or in a VLAN-unaware bridge offloaded to the switch
+ * whose every port is a user port of the same tree (bridge_offload: the
+ * bridge VID). 0 for any other device (a bond, a bridge with other
+ * members: left to the host). RCU taken for the master.
+ */
+static unsigned int fnp6l_ft_q_end(struct fnp6l *np, struct net_device *dev,
+				   u16 *vid)
+{
+	struct net_device *master;
+	struct fnp6l_port *c;
+	struct dsa_port *dp;
+	unsigned int lif = 0;
+
+	if (!dev)
+		return 0;
+	dp = fnp6l_dsa_port(dev);
+	if (IS_ERR_OR_NULL(dp) || !dp->cpu_dp)
+		return 0;
+	c = fnp6l_ft_port(np, dp->cpu_dp->conduit);
+	if (!fnp6l_conduit_q(c))
+		return 0;
+	rcu_read_lock();
+	master = netdev_master_upper_dev_get_rcu(dev);
+	if (!master) {
+		if (READ_ONCE(bare_ports)) {
+			*vid = dsa_tag_8021q_standalone_vid(dp);
+			lif = c->lif;
+		}
+	} else if (IS_REACHABLE(CONFIG_BRIDGE) && READ_ONCE(bridge_offload) &&
+		   netif_is_bridge_master(master) && !br_vlan_enabled(master) &&
+		   dsa_port_offloads_bridge_dev(dp, master) &&
+		   dsa_port_bridge_num_get(dp)) {
+		struct fnp6l_ft_br b = { .np = np, .br = master,
+					 .dst = dp->ds->dst };
+		struct netdev_nested_priv priv = { .data = &b };
+
+		if (!netdev_walk_all_lower_dev_rcu(master, fnp6l_ft_q_br_lower,
+						   &priv)) {
+			*vid = dsa_tag_8021q_bridge_vid(dsa_port_bridge_num_get(dp));
+			lif = c->lif;
+		}
+	}
+	rcu_read_unlock();
+	return lif;
+}
+
+/*
+ * The conduit's LIF for a user port in the VLAN-aware bridge, offloaded to
+ * the switch with every port of the bridge a user port of the same tree
+ * (bridge_offload): its frames reach the conduit with the VID of their
+ * VLAN (fnp6l_ft_aw_vid). 0 for any other device. RCU taken for the master.
+ */
+static unsigned int fnp6l_ft_aw_end(struct fnp6l *np, struct net_device *dev)
+{
+	struct net_device *master;
+	struct fnp6l_port *c;
+	struct dsa_port *dp;
+	unsigned int lif = 0;
+
+	if (!dev || !IS_REACHABLE(CONFIG_BRIDGE) || !READ_ONCE(bridge_offload))
+		return 0;
+	dp = fnp6l_dsa_port(dev);
+	if (IS_ERR_OR_NULL(dp) || !dp->cpu_dp)
+		return 0;
+	c = fnp6l_ft_port(np, dp->cpu_dp->conduit);
+	if (!fnp6l_conduit_q(c))
+		return 0;
+	rcu_read_lock();
+	master = netdev_master_upper_dev_get_rcu(dev);
+	if (master && netif_is_bridge_master(master) && br_vlan_enabled(master) &&
+	    dsa_port_offloads_bridge_dev(dp, master)) {
+		struct fnp6l_ft_br b = { .np = np, .br = master,
+					 .dst = dp->ds->dst };
+		struct netdev_nested_priv priv = { .data = &b };
+
+		if (!netdev_walk_all_lower_dev_rcu(master, fnp6l_ft_q_br_lower,
+						   &priv))
+			lif = c->lif;
+	}
+	rcu_read_unlock();
+	return lif;
+}
+
+/* a user port behind a conduit with the bcm53344-8021q tagger */
+static bool fnp6l_ft_q_port(struct fnp6l *np, struct net_device *dev)
+{
+	struct dsa_port *dp = fnp6l_dsa_port(dev);
+
+	return !IS_ERR_OR_NULL(dp) && dp->cpu_dp &&
+	       fnp6l_conduit_q(fnp6l_ft_port(np, dp->cpu_dp->conduit));
+}
+
+/*
+ * A bond of tagged switch ports: every member a user port behind the same
+ * conduit with the bcm53344-8021q tagger. The switch does not offload the
+ * bond, so each member stays on its standalone VLAN: a frame comes in on
+ * the conduit with the VID of the member it entered by, and goes out by a
+ * member when sent with that member's VID.
+ */
+struct fnp6l_ft_qb {
+	struct fnp6l *np;
+	struct fnp6l_port *c;	/* the conduit of the members */
+	u8 *lifs;
+	u16 *vids;
+	unsigned int n;
+	bool all, bad;
+};
+
+static int fnp6l_ft_qb_lower(struct net_device *ldev,
+			     struct netdev_nested_priv *priv)
+{
+	struct fnp6l_ft_qb *q = priv->data;
+	struct fnp6l_port *c;
+	struct dsa_port *dp;
+	unsigned int i;
+	u16 vid;
+
+	if (netdev_uses_dsa(ldev))	/* the conduit below each member */
+		return 0;
+	dp = fnp6l_dsa_port(ldev);
+	if (IS_ERR_OR_NULL(dp) || !dp->cpu_dp) {
+		q->bad = true;
+		return 1;
+	}
+	c = fnp6l_ft_port(q->np, dp->cpu_dp->conduit);
+	if (!fnp6l_conduit_q(c) || (q->c && q->c != c)) {
+		q->bad = true;
+		return 1;
+	}
+	q->c = c;
+	/* output: the first running member (fnp6l_ft_bond_out follows the hash) */
+	if (!q->all && (q->n || !netif_running(ldev) || !netif_carrier_ok(ldev)))
+		return 0;
+	vid = dsa_tag_8021q_standalone_vid(dp);
+	for (i = 0; i < q->n; i++)
+		if (q->vids[i] == vid)
+			return 0;
+	if (q->n >= NP6L_SW_PORTS) {
+		q->bad = true;
+		return 1;
+	}
+	q->lifs[q->n] = c->lif;
+	q->vids[q->n++] = vid;
+	return 0;
+}
+
+/*
+ * The conduit's LIF and the VID of every member of @bond (@all, the
+ * ingress: one session per member) or of the first running one (output).
+ * False when @bond is not a bond of tagged switch ports; *n is 0 then, or
+ * when no member runs.
+ */
+static bool fnp6l_ft_q_bond(struct fnp6l *np, struct net_device *bond,
+			    u8 *lifs, u16 *vids, bool all, unsigned int *n)
+{
+	struct fnp6l_ft_qb q = { .np = np, .lifs = lifs, .vids = vids,
+				 .all = all };
+	struct netdev_nested_priv priv = { .data = &q };
+
+	*n = 0;
+	if (!bond || !netif_is_bond_master(bond))
+		return false;
+	rcu_read_lock();
+	netdev_walk_all_lower_dev_rcu(bond, fnp6l_ft_qb_lower, &priv);
+	rcu_read_unlock();
+	if (q.bad || !q.c)
+		return false;
+	*n = q.n;
+	return true;
+}
+
+/* conduit's LIF and standalone VID of a tagged switch user port */
+static bool fnp6l_ft_q_member(struct fnp6l *np, struct net_device *dev,
+			      unsigned int *lif, u16 *vid)
+{
+	struct dsa_port *dp = fnp6l_dsa_port(dev);
+	struct fnp6l_port *c;
+
+	if (IS_ERR_OR_NULL(dp) || !dp->cpu_dp)
+		return false;
+	c = fnp6l_ft_port(np, dp->cpu_dp->conduit);
+	if (!fnp6l_conduit_q(c))
+		return false;
+	*lif = c->lif;
+	*vid = dsa_tag_8021q_standalone_vid(dp);
+	return true;
+}
+#else
+static bool fnp6l_conduit_q(const struct fnp6l_port *c)
+{
+	return false;
+}
+
+static unsigned int fnp6l_ft_q_end(struct fnp6l *np, struct net_device *dev,
+				   u16 *vid)
+{
+	return 0;
+}
+
+static unsigned int fnp6l_ft_aw_end(struct fnp6l *np, struct net_device *dev)
+{
+	return 0;
+}
+
+static bool fnp6l_ft_q_port(struct fnp6l *np, struct net_device *dev)
+{
+	return false;
+}
+
+static bool fnp6l_ft_q_bond(struct fnp6l *np, struct net_device *bond,
+			    u8 *lifs, u16 *vids, bool all, unsigned int *n)
+{
+	*n = 0;
+	return false;
+}
+
+static bool fnp6l_ft_q_member(struct fnp6l *np, struct net_device *dev,
+			      unsigned int *lif, u16 *vid)
+{
+	return false;
+}
+
+static u16 fnp6l_ft_q_xlt(struct net_device *dev, u16 vid)
+{
+	return 0;
+}
+#endif
+
+/*
  * LIFs of one end of a flow: a port that is not a DSA conduit -> its port
  * LIF (60E: wan1 0, wan2 2); with the switch ports classified, a bare or
  * bridged switch port -> its LIF (fnp6l_ft_bare_lif), a bond of switch ports -> the LIF of
@@ -4953,15 +5763,17 @@ static unsigned int fnp6l_ft_end(struct fnp6l *np, struct net_device *dev,
  */
 static bool fnp6l_ft_bond_out(struct fnp6l *np, struct net_device *bond,
 			      const u8 *eth, const u8 *l3, const u8 *l4,
-			      u8 proto, const u8 *a6, unsigned int *out)
+			      u8 proto, const u8 *a6, unsigned int *out,
+			      u16 *out_vid)
 {
 	struct net_device *slave;
 	struct sk_buff *skb;
 	struct ipv6hdr *ip6h;
 	struct iphdr *iph;
 	struct ethhdr *eh;
-	unsigned int lif = 0, nh;
+	unsigned int lif = 0, nh, n;
 	u8 lifs[NP6L_SW_PORTS];
+	u16 vids[NP6L_SW_PORTS], vid = 0;
 	bool found = false, nport;
 
 	/* a header like the flow's first frame, for the bond's own hash */
@@ -5005,7 +5817,8 @@ static bool fnp6l_ft_bond_out(struct fnp6l *np, struct net_device *bond,
 		rcu_read_lock();
 		slave = netdev_get_xmit_slave(bond, skb, false);
 		if (slave && netif_running(slave) && netif_carrier_ok(slave))
-			found = fnp6l_ft_member_lif(np, slave, &lif, &nport);
+			found = fnp6l_ft_member_lif(np, slave, &lif, &nport) ||
+				fnp6l_ft_q_member(np, slave, &lif, &vid);
 		rcu_read_unlock();
 		kfree_skb(skb);
 	}
@@ -5014,7 +5827,13 @@ static bool fnp6l_ft_bond_out(struct fnp6l *np, struct net_device *bond,
 		lif = lifs[0];
 		found = true;
 	}
+	if (!found && fnp6l_ft_q_bond(np, bond, lifs, vids, false, &n) && n) {
+		lif = lifs[0];
+		vid = vids[0];
+		found = true;
+	}
 	*out = lif;
+	*out_vid = vid;
 	return found;
 }
 
@@ -5055,11 +5874,13 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	/* IPv6: source then destination address, before and after NAT */
 	u8 o6[32] = { }, n6[32] = { }, a6o[24] = { };
 	u8 nat6_sel = 0;
-	unsigned int nout = 0, i, j;
+	unsigned int nout = 0, i, j, nq;
 	struct net_device *odev = NULL;
-	bool redirect = false, pop = false;
+	bool redirect = false, pop = false, qbond_in = false, qbond_out = false;
+	bool aw_in = false, aw_out = false;
 	__be32 osip, odip;
-	u16 push = 0;
+	u16 push = 0, qvid_in = 0, qvid_out = 0;
+	u16 qvids[NP6L_SW_PORTS], ovids[NP6L_SW_PORTS];
 	u64 used;
 	int k;
 
@@ -5069,8 +5890,27 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	 * fnp6l_trunk_sync).
 	 */
 	fl->tgen = READ_ONCE(np->tr.gen);
+	/* read before the VLAN-aware bridge: a later change takes the flow off */
+	fl->aw_gen = fnp6l_ft_aw_gen();
 	smp_rmb();
 	fl->n_in_lif = fnp6l_ft_end(np, idev, fl->in_lif, true);
+	if (!fl->n_in_lif && np->ic_on) {
+		fl->in_lif[0] = fnp6l_ft_q_end(np, idev, &qvid_in);
+		fl->n_in_lif = fl->in_lif[0] ? 1 : 0;
+	}
+	/* a bond of tagged switch ports: one session per member VID */
+	if (!fl->n_in_lif && np->ic_on &&
+	    fnp6l_ft_q_bond(np, idev, fl->in_lif, qvids, true, &nq) && nq) {
+		fl->n_in_lif = nq;
+		qvid_in = qvids[0];
+		qbond_in = true;
+	}
+	/* a port of the VLAN-aware bridge: its VID once the VLAN match is read */
+	if (!fl->n_in_lif && np->ic_on) {
+		fl->in_lif[0] = fnp6l_ft_aw_end(np, idev);
+		fl->n_in_lif = fl->in_lif[0] ? 1 : 0;
+		aw_in = fl->n_in_lif;
+	}
 	if (!fl->n_in_lif)
 		return fnp6l_ft_refuse_dev(idev, extack, "ingress is not an NP end");
 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
@@ -5186,6 +6026,24 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 			odev = act->dev;
 			if (np->ic_on) {
 				nout = fnp6l_ft_end(np, act->dev, olif, false);
+				if (!nout) {
+					olif[0] = fnp6l_ft_q_end(np, act->dev,
+								 &qvid_out);
+					nout = olif[0] ? 1 : 0;
+				}
+				/* member and VID picked below (fnp6l_ft_bond_out) */
+				if (!nout &&
+				    fnp6l_ft_q_bond(np, act->dev, olif, ovids,
+						    false, &nq) && nq) {
+					nout = 1;
+					qbond_out = true;
+				}
+				/* a port of the VLAN-aware bridge: VID below */
+				if (!nout) {
+					olif[0] = fnp6l_ft_aw_end(np, act->dev);
+					nout = olif[0] ? 1 : 0;
+					aw_out = nout;
+				}
 				break;
 			}
 			/* unclassified, the ingress is the loader's LIF */
@@ -5193,11 +6051,28 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 			if (op && !op->conduit && op->lif != NP6L_LIF_LOADER)
 				nout = 1, olif[0] = op->lif;
 			break;
+#if IS_ENABLED(CONFIG_NF_FLOW_TABLE_XFRM_OFFLOAD) && \
+    IS_ENABLED(CONFIG_FORTINET_NP6LITE_IPSEC)
+		case FLOW_ACTION_XFRM_IN:
+			if (fl->xin || !act->xfrm)
+				return -EOPNOTSUPP;
+			fl->xin = act->xfrm;
+			break;
+#endif
 		default:
 			return fnp6l_ft_refuse_dev(idev, extack,
 						   "unsupported action");
 		}
 	}
+	/*
+	 * Decrypted by an inbound SA of the ingress port: keyed on the LIF and
+	 * VID the engine looks those frames up with (fnp6l_ft_replace), so a
+	 * port of the NP, untagged, one session.
+	 */
+	if (fl->xin && (fl->v6 || fl->n_in_lif != 1 || qvid_in || pop ||
+			qbond_in || netif_is_bond_master(idev)))
+		return fnp6l_ft_refuse_dev(idev, extack,
+					   "decrypted flow not from a plain NP port");
 	if (nout != 1)
 		return fnp6l_ft_refuse_dev(idev, extack, "output is not an NP end");
 	if (fl->v6) {
@@ -5260,6 +6135,91 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 		fl->vid = vlan.key->vlan_id;
 	}
 	/*
+	 * Ends in the VLAN-aware bridge: the frames of its VLANs reach the
+	 * conduit with their own VID and leave it with it, the switch looking
+	 * the destination up in that VLAN. The VID is the VLAN of the tagged
+	 * end (pop or push), or the PVID of an untagged one when it is the
+	 * only VLAN the port leaves untagged: otherwise the VLAN of the end is
+	 * not known for sure, and a session could take or send frames of
+	 * another VLAN. Refused then.
+	 */
+	if ((aw_in || aw_out) &&
+	    (fl->aw_gen != READ_ONCE(np->ft_aw_gen) ||
+	     time_before(jiffies, READ_ONCE(np->ft_aw_quiet)))) {
+		/* the path of the flow may predate a change of the bridge */
+		fnp6l_ft_kernel_teardown(cls->cookie);
+		return fnp6l_ft_refuse_dev(idev, extack,
+					   "VLAN-aware bridge changed");
+	}
+	if (aw_in) {
+		u16 v = fnp6l_ft_aw_vid(idev, pop ? fl->vid : 0);
+
+		if (!v) {
+			/* a later offer could find a VID: not the flow's own */
+			fnp6l_ft_kernel_teardown(cls->cookie);
+			return fnp6l_ft_refuse_dev(idev, extack,
+						   "VLAN of the VLAN-aware bridge not known");
+		}
+		fl->vid = v;
+	}
+	if (aw_out) {
+		struct fnp6l_port *oc = fnp6l_ft_port(np, odev);
+		struct dsa_port *odp = fnp6l_dsa_port(odev);
+		u16 v = fnp6l_ft_aw_vid(odev, push);
+
+		if (!v) {
+			fnp6l_ft_kernel_teardown(cls->cookie);
+			return fnp6l_ft_refuse_dev(idev, extack,
+						   "VLAN of the VLAN-aware bridge not known");
+		}
+		if (!oc && !IS_ERR_OR_NULL(odp) && odp->cpu_dp)
+			oc = fnp6l_ft_port(np, odp->cpu_dp->conduit);
+		if (!oc || !ether_addr_equal(eth + ETH_ALEN, oc->ndev->dev_addr))
+			return fnp6l_ft_refuse_dev(idev, extack,
+						   "source MAC is not the conduit's");
+		push = v;
+	}
+	fl->aw = aw_in || aw_out;
+	/*
+	 * Ends on a VLAN-tagged switch port: its VID on the conduit, matched
+	 * on ingress, pushed on output (never stacked on another VLAN). The
+	 * conduit's LIF sends with the conduit's source MAC (lif_cfg): a flow
+	 * routed with another one stays with the host.
+	 */
+	if (qvid_in) {
+		u16 ivid = 0;
+
+		/* 802.1Q device on the port: its internal VID if translated */
+		if (pop && (qbond_in || !(ivid = fnp6l_ft_q_xlt(idev, fl->vid))))
+			return fnp6l_ft_refuse_dev(idev, extack, "VLAN on a switch port");
+		fl->vid = ivid ?: qvid_in;
+	}
+	if (qvid_out) {
+		struct fnp6l_port *oc = fnp6l_ft_port(np, odev ? odev : idev);
+		struct dsa_port *odp = fnp6l_dsa_port(odev);
+
+		u16 ivid = 0;
+
+		if (push && !(ivid = fnp6l_ft_q_xlt(odev, push)))
+			return fnp6l_ft_refuse_dev(idev, extack, "VLAN on a switch port");
+		if (!oc && !IS_ERR_OR_NULL(odp) && odp->cpu_dp)
+			oc = fnp6l_ft_port(np, odp->cpu_dp->conduit);
+		if (!oc || !ether_addr_equal(eth + ETH_ALEN, oc->ndev->dev_addr))
+			return fnp6l_ft_refuse_dev(idev, extack,
+						   "source MAC is not the conduit's");
+		push = ivid ?: qvid_out;
+	}
+	/* to a bond of tagged switch ports: as to one of its members */
+	if (qbond_out) {
+		struct fnp6l_port *oc = np->port[olif[0]];
+
+		if (push)
+			return fnp6l_ft_refuse_dev(idev, extack, "VLAN on a switch port");
+		if (!oc || !ether_addr_equal(eth + ETH_ALEN, oc->ndev->dev_addr))
+			return fnp6l_ft_refuse_dev(idev, extack,
+						   "source MAC is not the conduit's");
+	}
+	/*
 	 * Same LIF both ways: refused, except through the trunk between two
 	 * VLANs of the bond (bond.X <-> bond.Y, the NP sends back by the
 	 * member its hash picks).
@@ -5282,19 +6242,29 @@ static int fnp6l_ft_parse(struct fnp6l *np, struct net_device *idev,
 	if (!is_valid_ether_addr(eth))
 		return fnp6l_ft_refuse_dev(idev, extack, "no destination MAC");
 	fl->obond = NULL;
+	fl->qbond = false;
 	fl->tbond = netif_is_bond_master(idev) ||
 		    (odev && netif_is_bond_master(odev));
 	if (olif[0] != NP6L_LIF_TRUNK && odev && netif_is_bond_master(odev)) {
 		unsigned int lif;
+		u16 vid;
 
 		if (!fnp6l_ft_bond_out(np, odev, eth, l3, l4,
 				       basic.key->ip_proto,
-				       fl->v6 ? a6o : NULL, &lif))
+				       fl->v6 ? a6o : NULL, &lif, &vid) ||
+		    (qbond_out && (!vid || lif != olif[0])))
 			return fnp6l_ft_refuse_dev(idev, extack,
 						   "no usable bond member");
 		olif[0] = lif;
 		fl->obond = odev;
+		if (qbond_out) {
+			push = vid;
+			fl->qbond = true;
+		}
 	}
+	/* the VID of each session */
+	for (i = 0; i < fl->n_in_lif; i++)
+		fl->in_vid[i] = qbond_in ? qvids[i] : fl->vid;
 	memcpy(fl->eth, eth, sizeof(fl->eth));
 	memcpy(fl->l3, l3, sizeof(fl->l3));
 	memcpy(fl->l4, l4, sizeof(fl->l4));
@@ -5331,7 +6301,7 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 			    const struct flow_block *table,
 			    struct flow_cls_offload *cls)
 {
-	struct fnp6l_ft_flow fl = { }, *flow;
+	struct fnp6l_ft_flow *fl, *flow;
 	struct fnp6l_sse_opt opt;
 	u8 smac[ETH_ALEN];
 	unsigned int i;
@@ -5347,9 +6317,14 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 		ret = fnp6l_ft_back_check(np, cls->cookie, true);
 	if (ret)
 		return ret;
-	ret = fnp6l_ft_parse(np, idev, cls, &fl, &opt, smac);
-	if (ret)
+	fl = kzalloc(sizeof(*fl), GFP_KERNEL);
+	if (!fl)
+		return -ENOMEM;
+	ret = fnp6l_ft_parse(np, idev, cls, fl, &opt, smac);
+	if (ret) {
+		kfree(fl);
 		return ret;
+	}
 
 	mutex_lock(&fnp6l_sse_lock);
 	if (!np->ft_on) {
@@ -5361,22 +6336,42 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 		goto out;
 	}
 	/* a bond end parsed before a trunk change: offered again later */
-	if (fl.tbond && fl.tgen != np->tr.gen) {
+	if (fl->tbond && fl->tgen != np->tr.gen) {
 		ret = -EBUSY;
 		goto out;
+	}
+	/*
+	 * Decrypted by an inbound SA in service on the ingress port: the
+	 * session is keyed on the LIF the engine hands the decrypted frames
+	 * back on and on the VID of that SA, so frames received in the clear,
+	 * or decrypted through another SA, never match it. The SA gone
+	 * (fnp6l_ft_flush_ipsec) takes its flows with it.
+	 */
+	if (fl->xin) {
+		u16 vid;
+
+		if (fnp6l_ipsec_ft_in(np->ipsec, fl->xin, fl->in_lif[0], &vid)) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		fl->in_lif[0] = NP6L_LIF_IPSEC_IN;
+		fl->in_vid[0] = vid;
+		fl->vid = vid;
 	}
 	/*
 	 * A flow through a port with an offloaded IPsec policy, or that may be
 	 * the traffic of a tunnel once decapsulated, must not be forwarded in
 	 * the clear by the flow engine (IPv4 only; v6 is never IPsec here).
+	 * A decrypted flow (in_lif NP6L_LIF_IPSEC_IN) is checked for the
+	 * output only.
 	 */
-	if (!fl.v6) {
+	if (!fl->v6) {
 		struct fnp6l_ipsec_tuple k = {
-			.saddr = fl.sip, .daddr = fl.dip,
-			.sport = fl.sport, .dport = fl.dport, .proto = fl.proto,
+			.saddr = fl->sip, .daddr = fl->dip,
+			.sport = fl->sport, .dport = fl->dport, .proto = fl->proto,
 		};
 
-		if (fnp6l_ipsec_ft_refuse(np->ipsec, fl.in_lif[0],
+		if (fnp6l_ipsec_ft_refuse(np->ipsec, fl->in_lif[0],
 					  opt.has_out ? opt.out : NP6L_MAX_LIF,
 					  &k)) {
 			ret = -EOPNOTSUPP;
@@ -5385,15 +6380,15 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 	}
 	if (np->ft_ndead)
 		fnp6l_ft_dead_retry(np);
-	ret = fnp6l_ft_admit(np, fl.n_in_lif, false);
+	ret = fnp6l_ft_admit(np, fl->n_in_lif, false);
 	if (!ret)
 		ret = fnp6l_ft_back_check(np, cls->cookie, false);
 	if (ret)
 		goto out;
-	fnp6l_ft_keys(&fl);
+	fnp6l_ft_keys(fl);
 	/* a dead flow still holds this key: inserting it now, the retried
 	 * delete would remove the new session */
-	if (np->ft_ndead && fnp6l_ft_dead_key(np, &fl)) {
+	if (np->ft_ndead && fnp6l_ft_dead_key(np, fl)) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -5410,7 +6405,7 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 	 * refused later (as measured). Refused until the old flow is
 	 * gone; the flow table offers it again at its next refresh.
 	 */
-	if (fnp6l_ft_key_busy(np, &fl)) {
+	if (fnp6l_ft_key_busy(np, fl)) {
 		np->ft_keybusy++;
 		ret = -EBUSY;
 		goto out;
@@ -5421,13 +6416,13 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 	 * kept on ft_dead). Offered again at the next refresh.
 	 */
 	if (np->cmdq_on &&
-	    fnp6l_cmdq_room(np) < fl.n_in_lif + NP6L_SSE_DEL_ROOM(np->cmdq.size)) {
+	    fnp6l_cmdq_room(np) < fl->n_in_lif + NP6L_SSE_DEL_ROOM(np->cmdq.size)) {
 		np->sse_iskip++;
 		ret = -EBUSY;
 		goto out;
 	}
-	fl.opt = opt;
-	flow = kmemdup(&fl, sizeof(fl), GFP_KERNEL);
+	fl->opt = opt;
+	flow = kmemdup(fl, sizeof(*fl), GFP_KERNEL);
 	if (!flow) {
 		ret = -ENOMEM;
 		goto out;
@@ -5436,32 +6431,37 @@ static int fnp6l_ft_replace(struct fnp6l *np, struct net_device *idev,
 	if (fnp6l_lif_is_sw(np, opt.out) && is_valid_ether_addr(smac))
 		fnp6l_ft_set_smac(np, opt.out, smac);
 	/* post the inserts, never waited for (see fnp6l_ft_del) */
-	for (i = 0; i < fl.n_in_lif; i++) {
-		ret = fnp6l_ft_fcmd(np, true, &fl, i, &opt);
+	for (i = 0; i < fl->n_in_lif; i++) {
+		ret = fnp6l_ft_fcmd(np, true, fl, i, &opt);
 		if (ret)
 			break;
 	}
 	if (ret) {
 		/* posted sessions may be in the engine: delete them, or keep
 		 * the flow until they are */
-		flow->n_in_lif = i < fl.n_in_lif ? i : fl.n_in_lif;
+		flow->n_in_lif = i < fl->n_in_lif ? i : fl->n_in_lif;
 		fnp6l_ft_drop(np, flow);
 		goto out;
 	}
-	WRITE_ONCE(np->oft_posted, np->oft_posted + fl.n_in_lif);
+	WRITE_ONCE(np->oft_posted, np->oft_posted + fl->n_in_lif);
 	flow->cookie = cls->cookie;
 	flow->table = table;
 	flow->lastused = jiffies;
 	flow->qtime = jiffies;
+	flow->l2len = ETH_HLEN + (fl->vid ? VLAN_HLEN : 0);
+	INIT_LIST_HEAD(&flow->hot);
+	INIT_LIST_HEAD(&flow->warm);
 	fnp6l_ft_hash_add(np, flow);
 	fnp6l_ft_link(np, flow);
+	fnp6l_ft_hot(np, flow, NP6L_FT_HOT_LIFE);
 	fnp6l_ft_back_take(np, flow);
 	dev_dbg(np->dev,
 		"offloaded %u %pI4:%u > %pI4:%u (%u session(s), in_lif %u vid %u -> %u vid %u, nat %d)\n",
-		fl.proto, &fl.sip, ntohs(fl.sport), &fl.dip, ntohs(fl.dport),
-		fl.n_in_lif, fl.in_lif[0], fl.vid, opt.out, opt.out_vid, opt.has_nat);
+		fl->proto, &fl->sip, ntohs(fl->sport), &fl->dip, ntohs(fl->dport),
+		fl->n_in_lif, fl->in_lif[0], fl->vid, opt.out, opt.out_vid, opt.has_nat);
 out:
 	mutex_unlock(&fnp6l_sse_lock);
+	kfree(fl);
 	return ret;
 }
 
@@ -5511,6 +6511,7 @@ static int fnp6l_ft_stats(struct fnp6l *np, struct flow_cls_offload *cls)
 {
 	struct fnp6l_ft_flow *flow;
 	unsigned long lastused;
+	u64 bytes = 0, pkts = 0;
 	unsigned int i;
 	bool due;
 
@@ -5521,6 +6522,7 @@ static int fnp6l_ft_stats(struct fnp6l *np, struct flow_cls_offload *cls)
 		spin_unlock_bh(&np->ft_sess_lock);
 		return -ENOENT;
 	}
+	fnp6l_ft_take(np, flow, &bytes, &pkts);
 	due = fnp6l_ft_missing(flow) ||
 	      (READ_ONCE(np->sse_done) &&
 	       time_after_eq(jiffies, READ_ONCE(flow->qtime) +
@@ -5576,7 +6578,7 @@ static int fnp6l_ft_stats(struct fnp6l *np, struct flow_cls_offload *cls)
 report:
 	if (time_after(lastused, jiffies))
 		lastused = jiffies;
-	flow_stats_update(&cls->stats, 0, 0, 0, lastused,
+	flow_stats_update(&cls->stats, bytes, pkts, 0, lastused,
 			  FLOW_ACTION_HW_STATS_DELAYED);
 	return 0;
 }
@@ -5597,12 +6599,18 @@ static unsigned int fnp6l_ft_lag_rebalance(struct fnp6l *np, unsigned int *faile
 	int ret;
 
 	list_for_each_entry(flow, &np->ft_flows, node) {
+		u16 vid;
+
 		if (!flow->obond)
 			continue;
+		/* a bond of tagged switch ports: the member is the VID */
 		if (!fnp6l_ft_bond_out(np, flow->obond, flow->eth, flow->l3,
 				       flow->l4, flow->proto,
-				       flow->v6 ? flow->a6o : NULL, &lif) ||
-		    (lif == flow->opt.out && !flow->hw_bad))
+				       flow->v6 ? flow->a6o : NULL, &lif, &vid) ||
+		    (flow->qbond && (!vid || lif != flow->opt.out)) ||
+		    (lif == flow->opt.out &&
+		     (!flow->qbond || vid == flow->opt.out_vid) &&
+		     !flow->hw_bad))
 			continue;
 		if (fnp6l_ft_del(np, flow)) {
 			flow->hw_bad = true;
@@ -5610,7 +6618,10 @@ static unsigned int fnp6l_ft_lag_rebalance(struct fnp6l *np, unsigned int *faile
 			continue;
 		}
 		flow->opt.out = lif;
-		fnp6l_ft_set_smac(np, lif, flow->eth + ETH_ALEN);
+		if (flow->qbond)
+			flow->opt.out_vid = vid;
+		else
+			fnp6l_ft_set_smac(np, lif, flow->eth + ETH_ALEN);
 		for (ret = 0, i = 0; i < flow->n_in_lif && !ret; i++) {
 			ret = fnp6l_ft_fcmd(np, true, flow, i, &flow->opt);
 			/* inserted again: an earlier miss no longer holds */
@@ -6160,7 +7171,8 @@ static int fnp6l_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 
 	struct fnp6l_port *p = fnp6l_ft_port(np, dev);
 	bool nport = p && !p->conduit;	/* a port of the NP, a flow end */
-	bool sw = READ_ONCE(np->sw_on) && fnp6l_ft_sw_lif(np, dev);
+	bool sw = (READ_ONCE(np->sw_on) && fnp6l_ft_sw_lif(np, dev)) ||
+		  fnp6l_ft_q_port(np, dev);
 
 	if (!READ_ONCE(np->ft_on))
 		return NOTIFY_DONE;
@@ -6183,8 +7195,18 @@ static int fnp6l_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 		 * RTNL, as the flow table does itself on NETDEV_DOWN. A port
 		 * of the NP: the trunk follows (fnp6l_trunk_sync).
 		 */
-		if (IS_ENABLED(CONFIG_NF_FLOW_TABLE) && (sw || nport))
+		if (IS_ENABLED(CONFIG_NF_FLOW_TABLE) && (sw || nport)) {
+			struct netdev_notifier_changeupper_info *info = ptr;
+
 			nf_flow_table_cleanup(dev);
+			/*
+			 * The flows of a bond of tagged switch ports have a
+			 * session per member: torn down with a member change.
+			 */
+			if (sw && info->upper_dev &&
+			    netif_is_bond_master(info->upper_dev))
+				nf_flow_table_cleanup(info->upper_dev);
+		}
 		if (!nport)
 			return NOTIFY_DONE;
 		break;
@@ -6473,7 +7495,7 @@ static int fnp6l_setup_ft_conduit(struct fnp6l_port *port,
 			return 0;
 		}
 		if (!READ_ONCE(bare_ports) || !READ_ONCE(np->ft_on) ||
-		    !READ_ONCE(np->sw_on)) {
+		    (!READ_ONCE(np->sw_on) && !fnp6l_conduit_q(port))) {
 			NL_SET_ERR_MSG_MOD(f->extack, "flow offload not enabled");
 			return -EOPNOTSUPP;
 		}
@@ -6611,6 +7633,8 @@ static int fnp6l_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 	struct flow_block_cb *block_cb;
 	struct fnp6l_ft_bond *b;
 	u8 lifs[NP6L_SW_PORTS];
+	u16 vids[NP6L_SW_PORTS];
+	unsigned int n;
 
 	if (!dev || type != TC_SETUP_FT || !netif_is_bond_master(dev) ||
 	    f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
@@ -6621,7 +7645,8 @@ static int fnp6l_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 	case FLOW_BLOCK_BIND:
 		mutex_lock(&fnp6l_sse_lock);
 		if (!np->ft_on || !np->ic_on ||
-		    !fnp6l_ft_end(np, dev, lifs, true)) {
+		    (!fnp6l_ft_end(np, dev, lifs, true) &&
+		     !(fnp6l_ft_q_bond(np, dev, lifs, vids, true, &n) && n))) {
 			mutex_unlock(&fnp6l_sse_lock);
 			NL_SET_ERR_MSG_MOD(f->extack,
 					   "bond offload needs the flow offload and members all switch ports or all NP ports");
@@ -6822,6 +7847,33 @@ static void fnp6l_flow_offload_init(struct fnp6l *np)
 			 ret);
 }
 
+/* the service bytes of each session as of its last query reply */
+static int fnp6l_dbg_snap_show(struct seq_file *m, void *unused)
+{
+	struct fnp6l *np = m->private;
+	struct fnp6l_ft_flow *flow;
+	unsigned int i;
+
+	mutex_lock(&fnp6l_sse_lock);
+	spin_lock_bh(&np->ft_sess_lock);
+	list_for_each_entry(flow, &np->ft_flows, node) {
+		if (flow->v6)
+			continue;
+		for (i = 0; i < flow->n_in_lif; i++)
+			seq_printf(m, "%pI4:%u %pI4:%u p%u lif%u pkts %llu bytes %llu hot %d %*phN\n",
+				   &flow->sip, be16_to_cpu(flow->sport),
+				   &flow->dip, be16_to_cpu(flow->dport),
+				   flow->proto, flow->in_lif[i],
+				   flow->s[i].pkts, flow->s[i].bytes,
+				   !list_empty(&flow->hot),
+				   NP6L_FT_STATS_LEN, flow->s[i].snap);
+	}
+	spin_unlock_bh(&np->ft_sess_lock);
+	mutex_unlock(&fnp6l_sse_lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(fnp6l_dbg_snap);
+
 static void fnp6l_debugfs_init(struct fnp6l *np)
 {
 	struct dentry *dir = debugfs_create_dir(DRV_NAME, NULL);
@@ -6830,6 +7882,7 @@ static void fnp6l_debugfs_init(struct fnp6l *np)
 	debugfs_create_file("class_table", 0400, dir, np, &fnp6l_dbg_class_fops);
 	debugfs_create_file("sw_class", 0400, dir, np, &fnp6l_dbg_sw_fops);
 	debugfs_create_file("trunk", 0400, dir, np, &fnp6l_dbg_trunk_fops);
+	debugfs_create_file("ft_snap", 0400, dir, np, &fnp6l_dbg_snap_fops);
 }
 
 /*
@@ -7073,12 +8126,15 @@ static int fnp6l_setup_net(struct platform_device *pdev, struct fnp6l *np)
 		 np->use_irq ? "interrupts" : "polled", np->nvec);
 	fnp6l_debugfs_init(np);
 	INIT_LIST_HEAD(&np->ft_flows);
+	INIT_LIST_HEAD(&np->ft_hot);
+	INIT_LIST_HEAD(&np->ft_warm);
 	INIT_LIST_HEAD(&np->ft_dead);
 	INIT_LIST_HEAD(&np->ft_backl);
 	for (q = 0; q < ARRAY_SIZE(np->ft_bhash); q++)
 		INIT_HLIST_HEAD(&np->ft_bhash[q]);
 	spin_lock_init(&np->ft_sess_lock);
 	INIT_DELAYED_WORK(&np->ft_dead_work, fnp6l_ft_dead_work);
+	INIT_DELAYED_WORK(&np->ft_cnt_work, fnp6l_ft_cnt_work);
 	np->ft_qoff = -1;
 	INIT_DELAYED_WORK(&np->ft_lag_work, fnp6l_ft_lag_work);
 	atomic_long_set(&np->tr.rx_lif, 0);
@@ -7229,17 +8285,20 @@ int fnp6l_tx_drain(struct fnp6l *np)
 }
 
 /*
- * Inbound SPI session entry: the key is {destination address, SPI in
- * place of the L4 ports, protocol 50}; the action carries the SA index at
- * byte 0x40, so the engine loads the right tunnel-table entry on a hit, and
- * the output-valid bit (byte 19 bit 3) marks it a tunnel session. Delete by
- * the key. Under the flow-engine lock. FIXME: the exact action encoding and
- * the delete key length are to be confirmed on hardware before inbound is
- * enabled
- * (ipsec_outbound_only); not exercised while it is on.
+ * Inbound SPI session (the format the engine takes, established on
+ * hardware): the key is {source and destination address, SPI in place of
+ * the L4 ports, protocol 50, in_lif of the port}, without the source
+ * address the lookup never hits. The action sends the frame to the inbound
+ * IPsec engine (bit 163, with bit 162) with the SA index at bytes 64-65,
+ * and the decrypted frame on to NP6L_LIF_IPSEC_IN (output valid, bit 155,
+ * out_lif at bytes 60-61) with the VID @vid (bytes 62-63, big endian: the
+ * frame is looked up again with it as its in_vid, and reaches the host with
+ * it in the TCI of its tag); mtu 0xffff, bytes 104-127 all ones, no timeout
+ * (the session stays until deleted). Delete by the same key. Under the
+ * flow-engine lock.
  */
 int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
-		    u32 in_lif, u16 sa, bool add)
+		    u32 in_lif, u16 sa, u16 vid, bool add)
 {
 	u8 msg[8 + NP6L_SSE_ENTRY_LEN] = { };
 	u8 *e = msg + 8;
@@ -7247,15 +8306,21 @@ int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
 
 	if (ret)
 		return ret;
+	memcpy(e, &saddr, 4);			/* source address (key) */
 	memcpy(e + 4, &daddr, 4);		/* destination address (key) */
 	memcpy(e + 8, &spi, 4);			/* SPI in place of the L4 ports */
 	put_unaligned_le32(IPPROTO_ESP | FIELD_PREP(GENMASK(29, 20), in_lif) |
 			   BIT(31), e + 12);	/* protocol 50, in_lif, KEY_VALID */
 	msg[3] = NP6L_SSE_TXQ;
 	if (add) {
-		e[19] |= BIT(3);		/* output valid: tunnel session */
-		e[0x40] = sa & 0xff;		/* SA index at byte 0x40 */
-		e[0x41] = (sa >> 8) & 0xff;
+		e[19] |= BIT(3);		/* ACT_OUT_VALID */
+		e[20] |= BIT(2) | BIT(3);	/* bits 162-163: inbound IPsec */
+		put_unaligned_le16(0xffff, e + 58);	/* mtu */
+		e[60] = NP6L_LIF_IPSEC_IN & 0xff;	/* out_lif 489:480 */
+		e[61] = (NP6L_LIF_IPSEC_IN >> 8) & 3;
+		put_unaligned_be16(vid & VLAN_VID_MASK, e + 62);	/* out_vid */
+		put_unaligned_le16(sa, e + 64);	/* SA index */
+		memset(e + 104, 0xff, NP6L_SSE_ENTRY_LEN - 104);
 		msg[0] = 0x80 | NP6L_SSE_CMD_INSERT;
 		msg[1] = (8 + NP6L_SSE_ENTRY_LEN) / 8;
 		return fnp6l_sse_post(np, msg, 8 + NP6L_SSE_ENTRY_LEN);
@@ -7263,6 +8328,110 @@ int fnp6l_ipsec_spi(struct fnp6l *np, __be32 saddr, __be32 daddr, __be32 spi,
 	msg[0] = 0x80 | NP6L_SSE_CMD_DELETE;
 	msg[1] = (8 + NP6L_SSE_KEY4_LEN) / 8;
 	return fnp6l_sse_post(np, msg, 8 + NP6L_SSE_KEY4_LEN);
+}
+
+/*
+ * What inbound decryption needs besides the SAs and their SPI sessions
+ * (established on hardware, as the vendor firmware sets it up). The engine
+ * hands a decrypted frame to a second header parser ("xhp"), whose checks,
+ * class types and L4 parse table the loader leaves uninitialised (random
+ * class types; an ICMP frame then fails its length check and is dropped).
+ * Then the frame is looked up again, its input LIF taken from the output of
+ * the SPI session: NP6L_LIF_IPSEC_IN, which needs the tables of any LIF
+ * (source/target action: look up, host target; port to trunk: itself; MAC
+ * entry; trunk config). A decrypted frame no session matches reaches the
+ * host on that LIF, its completion words marked (fnp6l_ipsec_rx). Once per
+ * boot, under the flow-engine lock, each value read back.
+ */
+#define NP6L_XHP_PKEY			0x6d00	/* xhp L4 parse table, by IP protocol */
+
+static const u32 fnp6l_xhp_regs[][2] = {
+	{ 0x6b90, 0x0000ffdf },	/* ihp_ctrl/ctrl */
+	{ 0x6c28, 0xffff073f },	/* ihp_chk/tcpchk_ctrl */
+	{ 0x6d80, 0xfffffff6 },	/* ihp_parser/ihp_ctype_0..7 */
+	{ 0x6d88, 0xffffffff }, { 0x6d90, 0xffffffff }, { 0x6d98, 0xffffffff },
+	{ 0x6da0, 0xffffffff }, { 0x6da8, 0xffffffff }, { 0x6db0, 0xffffffff },
+	{ 0x6db8, 0xffffffff },
+	{ 0x6f90, 0x0000fdff },	/* ihp_chkx/l4aps_ctrl */
+	{ 0x6f98, 0xffff03bf },	/* ihp_chkx/l3v4chk_ctrl */
+	{ 0x6fa8, 0xf8ff0007 },	/* ihp_chkx/tcpchk_ctrl */
+	{ 0x6fb0, 0xfcff0007 },	/* ihp_chkx/udpchk_ctrl */
+};
+
+int fnp6l_ipsec_in_init(struct fnp6l *np)
+{
+	static const struct { u32 tbl; u32 d[4]; } lif_tbl[] = {
+		{ NP6L_TBL_PORT_ACTION, { 0x0ff00000, 0x00020840, 0, 0 } },
+		{ NP6L_TBL_PORT_TRUNK, { NP6L_LIF_IPSEC_IN, 0, 0, 0 } },
+		{ NP6L_TBL_LIF_MAC, { 0x00000001, 0x00070000, 0, 0 } },
+		{ NP6L_TBL_TRUNK_CFG, { 0xf03f703f, 0x7fc10000, 0x1ff0, 0 } },
+	};
+	unsigned int i, k, bad = 0;
+	u32 d[4], rb[4];
+
+	lockdep_assert_held(&fnp6l_sse_lock);
+	if (np->ipsec_in_done)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(fnp6l_xhp_regs); i++) {
+		fnp6l_wr(np, fnp6l_xhp_regs[i][0], fnp6l_xhp_regs[i][1]);
+		bad += fnp6l_rd(np, fnp6l_xhp_regs[i][0]) != fnp6l_xhp_regs[i][1];
+	}
+	/* the L4 parse entries of the xhp as those of the host transmit side */
+	for (i = 0; i < 256; i++) {
+		memset(d, 0, sizeof(d));
+		for (k = 0; k < ARRAY_SIZE(fnp6l_l4_parse_tbl); k++)
+			if (fnp6l_l4_parse_tbl[k].proto == i) {
+				d[0] = fnp6l_l4_parse_tbl[k].l;
+				d[1] = fnp6l_l4_parse_tbl[k].h;
+			}
+		if (fnp6l_tbl_op(np, NP6L_XHP_PKEY, i, d, true) ||
+		    fnp6l_tbl_op(np, NP6L_XHP_PKEY, i, rb, false) ||
+		    rb[0] != d[0] || rb[1] != d[1])
+			bad++;
+	}
+	for (i = 0; i < ARRAY_SIZE(lif_tbl); i++) {
+		memcpy(d, lif_tbl[i].d, sizeof(d));
+		if (fnp6l_tbl_op(np, lif_tbl[i].tbl, NP6L_LIF_IPSEC_IN, d, true) ||
+		    fnp6l_tbl_op(np, lif_tbl[i].tbl, NP6L_LIF_IPSEC_IN, rb, false) ||
+		    memcmp(rb, lif_tbl[i].d, sizeof(rb)))
+			bad++;
+	}
+	if (bad) {
+		dev_err(np->dev, "IPsec: inbound set up failed (%u values not taken)\n",
+			bad);
+		return -EIO;
+	}
+	np->ipsec_in_done = true;
+	dev_info(np->dev, "IPsec: inbound decryption set up (LIF %u)\n",
+		 NP6L_LIF_IPSEC_IN);
+	return 0;
+}
+
+/*
+ * Delete the offloaded flows of the frames an inbound SA decrypted (keyed
+ * on NP6L_LIF_IPSEC_IN and the VID of the SA): the SA is gone. Under the
+ * flow-engine lock; how many were deleted.
+ */
+unsigned int fnp6l_ft_flush_ipsec(struct fnp6l *np, u16 vid)
+{
+	struct fnp6l_ft_flow *flow, *tmp;
+	unsigned int n = 0, i;
+	bool hit;
+
+	lockdep_assert_held(&fnp6l_sse_lock);
+	if (!np->ft_on)
+		return 0;
+	list_for_each_entry_safe(flow, tmp, &np->ft_flows, node) {
+		for (i = 0, hit = false; i < flow->n_in_lif && !hit; i++)
+			hit = flow->in_lif[i] == NP6L_LIF_IPSEC_IN &&
+			      flow->in_vid[i] == vid;
+		if (!hit)
+			continue;
+		fnp6l_ft_unlink(np, flow);
+		fnp6l_ft_drop(np, flow);
+		n++;
+	}
+	return n;
 }
 
 /*
@@ -7307,6 +8476,8 @@ static int fnp6l_probe(struct platform_device *pdev)
 	spin_lock_init(&np->mdio_lock);
 	spin_lock_init(&np->tx_lock);
 	platform_set_drvdata(pdev, np);
+	if (!of_property_read_u32(np->dev->of_node, "fortinet,sse-udp-tail", &v))
+		fnp6l_sse_udp_tail = v;
 	ret = fnp6l_ft_index_alloc(np);
 	if (ret)
 		return ret;

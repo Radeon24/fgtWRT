@@ -1,0 +1,32 @@
+From: Evil.2000 <evil.2000@web.de>
+Subject: [PATCH] net: broadcom: hook up the BCM53344 pass-through fabric driver
+
+---
+--- a/drivers/net/ethernet/broadcom/Kconfig
++++ b/drivers/net/ethernet/broadcom/Kconfig
+@@ -275,4 +275,18 @@ config BCMASP
+ 	  This configuration enables the Broadcom ASP 2.0 Ethernet controller
+ 	  driver which is present in Broadcom STB SoCs such as 72165.
+ 
++config BCM53344_FABRIC
++	tristate "Broadcom BCM53344 pass-through fabric"
++	depends on PCI && NET_DSA && OF
++	depends on ARCH_FSOC3 || COMPILE_TEST
++	select NET_DSA_TAG_BCM53344_8021Q
++	select OF_MDIO
++	help
++	  Brings up the Broadcom BCM53344 (Hurricane 2) switch on the PCIe
++	  bus of the Fortinet FortiGate 100E: front ports bridged to fixed
++	  uplink ports towards the NP6Lite of the SoC, or DSA user ports
++	  with tag_8021q over such an uplink.
++
++	  If unsure, say N.
++
+ endif # NET_VENDOR_BROADCOM
+--- a/drivers/net/ethernet/broadcom/Makefile
++++ b/drivers/net/ethernet/broadcom/Makefile
+@@ -19,3 +19,4 @@ obj-$(CONFIG_SYSTEMPORT) += bcmsysport.o
+ obj-$(CONFIG_BNXT) += bnxt/
+ obj-$(CONFIG_BCMASP) += asp2/
+ obj-$(CONFIG_BNGE) += bnge/
++obj-$(CONFIG_BCM53344_FABRIC) += bcm53344.o

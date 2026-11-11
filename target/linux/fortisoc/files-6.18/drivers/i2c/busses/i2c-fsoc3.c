@@ -31,6 +31,8 @@
  * zero-length messages (no SMBus quick command): the bus can
  * be scanned with "i2cdetect -r" and registers read with i2cget, nothing
  * can be written to a device (module parameter "allow_write" to lift it).
+ * The device tree can name one device that may be written regardless
+ * ("fortinet,writable-address"): the fan controller of a board.
  */
 
 #include <linux/bits.h>
@@ -82,6 +84,7 @@ struct fsoc3_i2c {
 	struct i2c_adapter adap;
 	struct completion xfer_done;
 	struct completion stop_done;
+	u32 writable;		/* 7-bit address exempt from the guard, 0: none */
 };
 
 static void fsoc3_i2c_set8(struct fsoc3_i2c *priv, unsigned int reg, u8 clr, u8 set)
@@ -226,6 +229,8 @@ static int fsoc3_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 	for (i = 0; i < num && !allow_write; i++) {
 		if (msgs[i].flags & I2C_M_RD)
 			continue;
+		if (priv->writable && msgs[i].addr == priv->writable)
+			continue;
 		if (msgs[i].len != 1 || i + 1 >= num ||
 		    !(msgs[i + 1].flags & I2C_M_RD) ||
 		    msgs[i + 1].addr != msgs[i].addr) {
@@ -337,6 +342,9 @@ static int fsoc3_i2c_probe(struct platform_device *pdev)
 	priv->adap.dev.of_node = dev->of_node;
 	i2c_set_adapdata(&priv->adap, priv);
 	platform_set_drvdata(pdev, priv);
+
+	of_property_read_u32(pdev->dev.of_node, "fortinet,writable-address",
+			     &priv->writable);
 
 	ret = i2c_add_adapter(&priv->adap);
 	if (ret)

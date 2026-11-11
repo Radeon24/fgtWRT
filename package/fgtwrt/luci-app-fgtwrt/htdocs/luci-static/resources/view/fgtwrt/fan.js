@@ -36,11 +36,54 @@ function customPoints(fan, sid, source) {
 	return l.map((pt) => (pt ?? '').split(':'));
 }
 
+function liveTable(rows) {
+	return E('table', { 'class': 'table' }, rows.map((r) =>
+		E('tr', { 'class': 'tr' }, [
+			E('td', { 'class': 'td left', 'width': '33%' }, r[0]),
+			E('td', { 'class': 'td left' }, r[1])
+		])));
+}
+
+function duty(pwm, rpm) {
+	return (pwm == null) ? '-' : '%d / 255 (%d %%)%s'.format(pwm, Math.round(pwm * 100 / 255),
+		(rpm == null) ? '' : ', %d RPM'.format(rpm));
+}
+
+// NCT7802Y (FortiGate 100E): the chip follows its own curve on temp1.
+function renderLiveNct(st) {
+	const f = st.fan;
+	const pts = f.points ?? [];
+	const [ curve, fan2, hyst ] = (f.applied ?? '').split('|');
+	const rows = [
+		[ _('Mode'), { 1: _('manual'), 2: _('automatic (curve of the chip)') }[f.enable] ?? String(f.enable) ],
+		[ _('Fan 1'), duty(f.pwm, f.rpm) ],
+		[ _('Fan 2'), duty(f.pwm2, f.rpm2) + (fan2 ? ' (%s)'.format(fan2 == 'follow'
+			? _('same curve') : _('fixed duty cycle %s').format(fan2.replace(/^fixed:/, ''))) : '') ]
+	];
+
+	if (pts.length == 5 && pts.every((pt) => pt.mdeg != null))
+		rows.push([ _('Curve in the chip'), pts.slice(0, 4).map((pt) =>
+			'%s → %d'.format(degrees(pt.mdeg), pt.pwm)).join(', ') +
+			', ' + _('full speed from %s').format(degrees(pts[4].mdeg)) ]);
+	if (hyst != null && hyst !== '')
+		rows.push([ _('Hysteresis'), '%s °C'.format(hyst) ]);
+	if (!curve)
+		rows.push([ _('Set by'), _('nobody since the boot: the curve the board comes up with') ]);
+
+	for (const t of f.temps ?? [])
+		rows.push([ t.label, degrees(t.mdeg) ]);
+
+	return liveTable(rows);
+}
+
 function renderLive(st) {
 	const f = st.fan;
 
 	if (!f || !f.present)
 		return E('em', _('The fan controller is not available (driver not loaded?).'));
+
+	if (st.caps?.fan?.strategy == 'nct7802')
+		return renderLiveNct(st);
 
 	const rows = [
 		[ _('Mode'), MODES[f.enable] ?? String(f.enable) ],
@@ -147,6 +190,78 @@ return view.extend({
 		o.depends({ profile: 'custom', source: 'cputin' });
 	},
 
+	// Profile "custom" of the NCT7802Y: four points and the temperature of
+	// full speed (UCI "curve"), fan 2 on the same curve or at a fixed duty
+	// cycle, hysteresis; fan-profile checks the same bounds again, and on any
+	// refusal the curve the board comes up with is put back.
+	renderCustomNct: function(s, fan) {
+		const c = fan.custom ?? {};
+		const tmax = +(c.t_max ?? 70);
+		const curveOf = (sid) => (uci.get('fgtwrt', sid, 'curve') ?? c.default_curve ?? '').split(' ');
+		let o;
+
+		const fields = [];
+		for (let i = 0; i < 4; i++)
+			fields.push([ 't', i ], [ 'p', i ]);
+		fields.push([ 't', 4 ]);
+
+		for (const [ k, i ] of fields) {
+			o = s.option(form.Value, '_%s%d'.format(k, i + 1),
+				(k == 't')
+					? ((i == 4) ? _('Full speed from (°C)') : _('Point %d temperature (°C)').format(i + 1))
+					: _('Point %d duty cycle (0-255)').format(i + 1),
+				(k == 'p' && i == 0) ? _('Duty cycle 0 is the lowest speed: the fans cannot be stopped.') : null);
+			o.datatype = (k == 't') ? 'range(1,%d)'.format(tmax) : 'range(0,255)';
+			o.depends('profile', 'custom');
+			o.cfgvalue = function(sid) {
+				const pt = (curveOf(sid)[i] ?? '').split(':');
+				return (k == 't') ? pt[0] : pt[1];
+			};
+			o.validate = function(sid, value) {
+				const v = +value;
+				const fv = (n) => +this.section.formvalue(sid, n);
+				if (k == 't' && i > 0 && v <= fv('_t%d'.format(i)))
+					return _('Temperatures must be strictly ascending.');
+				return true;
+			};
+			// Each field writes the whole curve from the form.
+			o.write = function(sid) {
+				const fv = (n) => this.section.formvalue(sid, n);
+				uci.set('fgtwrt', sid, 'curve', [ 1, 2, 3, 4 ].map((n) =>
+					'%s:%s'.format(fv('_t%d'.format(n)), fv('_p%d'.format(n)))).join(' ') +
+					' ' + fv('_t5'));
+			};
+			o.remove = function() {};
+		}
+
+		o = s.option(form.ListValue, '_fan2mode', _('Fan 2'));
+		o.value('follow', _('same curve as fan 1'));
+		o.value('fixed', _('fixed duty cycle'));
+		o.depends('profile', 'custom');
+		o.cfgvalue = (sid) => ((uci.get('fgtwrt', sid, 'fan2') ?? c.default_fan2 ?? 'follow') == 'follow') ? 'follow' : 'fixed';
+		o.write = function(sid, value) {
+			uci.set('fgtwrt', sid, 'fan2', (value == 'follow') ? 'follow'
+				: 'fixed:' + this.section.formvalue(sid, '_fan2duty'));
+		};
+		o.remove = function() {};
+
+		o = s.option(form.Value, '_fan2duty', _('Fan 2 duty cycle (0-255)'));
+		o.datatype = 'range(0,255)';
+		o.depends({ profile: 'custom', _fan2mode: 'fixed' });
+		o.cfgvalue = (sid) => {
+			const v = uci.get('fgtwrt', sid, 'fan2') ?? '';
+			return v.startsWith('fixed:') ? v.substring(6) : '48';
+		};
+		o.write = function() {};
+		o.remove = function() {};
+
+		o = s.option(form.Value, 'hysteresis', _('Hysteresis (°C)'),
+			_('How far the temperature must fall before the duty cycle goes down again.'));
+		o.datatype = 'range(0,%d)'.format(+(c.hysteresis_max ?? 7));
+		o.placeholder = String(c.default_hysteresis ?? 4);
+		o.depends('profile', 'custom');
+	},
+
 	// Calibration of the CPU sensor: shown only, set from the command line.
 	renderCalibration: function(m, fan) {
 		const cal = fan.calibration;
@@ -185,21 +300,27 @@ return view.extend({
 			s.description = (s.description ? s.description + ' ' : '') +
 				_('There is no critical temperature guard on this model until its temperature sensors are calibrated; a stalled fan still restores the firmware settings.');
 
+		if (fan?.strategy == 'nct7802')
+			s.description = (s.description ? s.description + ' ' : '') +
+				_('The profiles program the curve of the hardware monitor (four points and the temperature of full speed, on the board sensor), which then drives the fans by itself, also if the system hangs. <em>default</em> is the curve the board comes up with.');
+
 		o = s.option(form.ListValue, 'profile', _('Profile'));
-		o.value('default', _('default (firmware)'));
-		for (const p of [ 'quiet', 'medium', 'full' ])
+		o.value('default', (fan?.strategy == 'nct7802') ? _('default (curve at power-on)') : _('default (firmware)'));
+		for (const p of [ 'quiet', 'silent', 'medium', 'performance', 'full' ])
 			if (fan?.profiles?.[p])
 				o.value(p, {
 					quiet: _('quiet'),
+					silent: _('silent'),
 					medium: _('medium'),
+					performance: _('performance'),
 					full: _('full speed')
 				}[p]);
 		if (fan?.custom)
-			o.value('custom', _('custom (three points)'));
-		o.default = 'default';
+			o.value('custom', (fan.strategy == 'nct7802') ? _('custom (curve)') : _('custom (three points)'));
+		o.default = fan?.default_profile ?? 'default';
 
 		if (fan?.custom)
-			this.renderCustom(s, fan, st);
+			(fan.strategy == 'nct7802') ? this.renderCustomNct(s, fan) : this.renderCustom(s, fan, st);
 
 		if (fan?.calibration)
 			this.renderCalibration(m, fan);
