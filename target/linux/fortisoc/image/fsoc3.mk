@@ -66,6 +66,7 @@ define Device/fortinet_fg-100e
 	ethtool ip-full ip-bridge kmod-fortinet-np6lite kmod-fortinet-np6lite-ipsec \
 	fortigate-dualslot e2fsprogs \
 	kmod-fortinet-fsoc3-trng kmod-fortinet-fsoc3-pkce kmod-fortinet-fsoc3-cp \
+	kmod-crypto-user libopenssl-afalg \
 	kmod-ipsec kmod-ipsec4 kmod-ipsec6 kmod-crypto-seqiv \
 	kmod-crypto-chacha20poly1305 kmod-crypto-sha256 \
 	luci kmod-wireguard wireguard-tools openvpn-openssl \
