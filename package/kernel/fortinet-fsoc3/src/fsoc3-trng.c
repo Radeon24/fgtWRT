@@ -29,6 +29,10 @@
  * says nothing of its entropy: whether it is raw or conditioned is unknown,
  * so it is credited as 1 bit per 8 (quality 128), which
  * /sys/class/misc/hw_random/rng_quality can change.
+ *
+ * A stuck generator or latch must not feed the pool: three equal words in a
+ * row (a chance of 2^-64 for a good source) fail the read with -EIO, as a
+ * repetition count test, and the hwrng core retries 10 s later.
  */
 
 #include <linux/delay.h>
@@ -51,10 +55,15 @@
 #define FSOC3_TRNG_TIMEOUT_US	20000
 /* Longest wait for the first words after the trng_cfg write (seen: < 100 ms) */
 #define FSOC3_TRNG_START_US	1000000
+/* Equal words in a row that fail a read (repetition count test) */
+#define FSOC3_TRNG_RCT_CUTOFF	3
 
 struct fsoc3_trng {
+	struct device *dev;
 	void __iomem *base;
 	struct hwrng rng;
+	u32 last;		/* last word read, and how often in a row */
+	unsigned int reps;
 };
 
 static int fsoc3_trng_read(struct hwrng *rng, void *buf, size_t max, bool wait)
@@ -84,6 +93,18 @@ static int fsoc3_trng_read(struct hwrng *rng, void *buf, size_t max, bool wait)
 		udelay(1);
 		word = readl(t->base + FSOC3_TRNG_WR_TO_RD);
 
+		if (t->reps && word == t->last) {
+			if (++t->reps >= FSOC3_TRNG_RCT_CUTOFF) {
+				dev_err_ratelimited(t->dev,
+					"%u equal words in a row: generator stuck\n",
+					t->reps);
+				return -EIO;
+			}
+		} else {
+			t->last = word;
+			t->reps = 1;
+		}
+
 		n = min(max - done, sizeof(word));
 		memcpy(buf + done, &word, n);
 		done += n;
@@ -103,6 +124,7 @@ static int fsoc3_trng_probe(struct platform_device *pdev)
 	t = devm_kzalloc(dev, sizeof(*t), GFP_KERNEL);
 	if (!t)
 		return -ENOMEM;
+	t->dev = dev;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res || resource_size(res) < FSOC3_TRNG_SIZE)
